@@ -96,6 +96,21 @@ pub async fn update_rule(
     Json(req): Json<UpdateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
     let scope = user.resource_scope();
+    match state.db.find_rule_by_id(id, &scope).await {
+        Ok(Some(_)) => match state.db.find_socks5_rule_config(id).await {
+            Ok(Some(_)) => return Json(err(400, "请通过 SOCKS5 中转规则接口修改此规则")),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("update_rule: SOCKS5 type lookup failed: {e}");
+                return Json(err(500, "数据库错误"));
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("update_rule: visibility lookup failed: {e}");
+            return Json(err(500, "数据库错误"));
+        }
+    }
     // v1.0.4: restricted non-admin users can only switch to authorized device
     // groups. Legacy/allow-all users skip this. DB error → 500.
     if !user.admin {
@@ -185,6 +200,21 @@ pub async fn delete_rule(
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
     let scope = user.resource_scope();
+    match state.db.find_rule_by_id(id, &scope).await {
+        Ok(Some(_)) => match state.db.find_socks5_rule_config(id).await {
+            Ok(Some(_)) => return Json(err(400, "请通过 SOCKS5 中转规则接口删除此规则")),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("delete_rule: SOCKS5 type lookup failed: {e}");
+                return Json(err(500, "数据库错误"));
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("delete_rule: visibility lookup failed: {e}");
+            return Json(err(500, "数据库错误"));
+        }
+    }
     // Snapshot the name before the delete — afterwards there is no row to read
     // it from, and "rule 12" alone doesn't answer "who deleted my rule".
     let rule_name = match state.db.find_rule_by_id(id, &scope).await {

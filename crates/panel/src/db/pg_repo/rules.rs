@@ -10,10 +10,15 @@ use relay_shared::models::ForwardRule;
 impl RuleRepository for PgRepository {
     async fn list_rules(&self, scope: &ResourceScope) -> Result<Vec<ForwardRule>, DbError> {
         let mut rules: Vec<ForwardRule> = match scope.owner_id() {
-            None => sqlx::query_as("SELECT * FROM forward_rules ORDER BY id"),
-            Some(uid) => {
-                sqlx::query_as("SELECT * FROM forward_rules WHERE uid = $1 ORDER BY id").bind(uid)
-            }
+            None => sqlx::query_as(
+                "SELECT * FROM forward_rules f WHERE NOT EXISTS
+                 (SELECT 1 FROM socks5_rule_bindings b WHERE b.rule_id=f.id) ORDER BY id",
+            ),
+            Some(uid) => sqlx::query_as(
+                "SELECT * FROM forward_rules f WHERE uid = $1 AND NOT EXISTS
+                     (SELECT 1 FROM socks5_rule_bindings b WHERE b.rule_id=f.id) ORDER BY id",
+            )
+            .bind(uid),
         }
         .fetch_all(&self.pool)
         .await?;

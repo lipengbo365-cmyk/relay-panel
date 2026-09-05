@@ -1,8 +1,8 @@
 # ============================================================================
-# RelayPanel deployment — pre-built images (no local build)
+# RelayPanel SOCKS5 deployment — project-owned, explicitly versioned images
 #
-# Pulls images from GitHub Container Registry instead of building from source.
-# Use this for fast production deployments:
+# Uses prebuilt project-owned images instead of building from source. Override
+# the image environment variables with full registry references when needed:
 #   docker compose -f docker-compose.release.yaml up -d
 #
 # By default ONLY the panel starts. The node container is opt-in via a
@@ -17,11 +17,7 @@
 
 services:
   panel:
-    # v1.2: panel and node release on INDEPENDENT version tracks. The panel tag
-    # (RELAYPANEL_PANEL_TAG) and node tag (RELAYPANEL_NODE_TAG) may differ — a
-    # panel upgrade does NOT require pulling a new node image. Override either
-    # in .env to pin a specific version.
-    image: ghcr.io/moeshinx/relay-panel-panel:${RELAYPANEL_PANEL_TAG:-1.2.8}
+    image: ${RELAYPANEL_PANEL_IMAGE:-relay-panel-socks5:v1.0.0-alpha1}
     ports:
       # RELAYPANEL_WEB_MODE controls how the panel port is published:
       #   direct         → 0.0.0.0:18888:18888  (public, default)
@@ -36,8 +32,10 @@ services:
       - PUBLIC_DIR=/app/public
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set (see header comment in docker-compose.yaml)}
       - PANEL_KEY=${PANEL_KEY:?PANEL_KEY must be set (see header comment in docker-compose.yaml)}
+      - SOCKS5_CREDENTIAL_KEY=${SOCKS5_CREDENTIAL_KEY:?SOCKS5_CREDENTIAL_KEY must be set (see header comment in docker-compose.yaml)}
+      - ALLOW_INSECURE_SOCKS5_CONFIG=${ALLOW_INSECURE_SOCKS5_CONFIG:-0}
       # OPTIONAL — the public URL nodes should use to reach the panel.
-      - PUBLIC_PANEL_URL=${PUBLIC_PANEL_URL:-}
+      - PUBLIC_PANEL_URL=${PUBLIC_PANEL_URL:?PUBLIC_PANEL_URL must be the public HTTPS panel URL}
       # v0.4.19 — node-level GeoIP is now ON by default. The panel resolves
       # each node's public IP to a country flag via built-in providers
       # (primary ipinfo.io Lite → fallback ipwho.is). Failures degrade to
@@ -48,16 +46,19 @@ services:
       - GEOIP_CACHE_TTL=${GEOIP_CACHE_TTL:-604800}
     volumes:
       - panel_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18888/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
     restart: unless-stopped
 
   # The node container is OPTIONAL. Most deployments run relay-node on a
   # separate forwarding server. To enable it on this host, use --profile node
   # and set NODE_TOKEN to a real inbound-group token from the panel UI.
   node:
-    # v1.2: the node image tag is INDEPENDENT of the panel tag. Override
-    # RELAYPANEL_NODE_TAG in .env to pin a node version that differs from the
-    # panel version.
-    image: ghcr.io/moeshinx/relay-panel-node:${RELAYPANEL_NODE_TAG:-1.2.3}
+    image: ${RELAYPANEL_NODE_IMAGE:-relay-node-socks5:v1.0.0-alpha1}
     profiles:
       - node
     network_mode: host
@@ -69,12 +70,14 @@ services:
         soft: 65536
         hard: 65536
     environment:
-      - PANEL_URL=http://127.0.0.1:18888
+      - PANEL_URL=${PANEL_URL:?PANEL_URL must be the public HTTPS panel URL}
       # NODE_TOKEN has no default: the node refuses to start with an unset or
       # "default-token" value. Set NODE_TOKEN to a real inbound-group token
       # from the panel UI before enabling the node profile.
       - NODE_TOKEN=${NODE_TOKEN:?NODE_TOKEN must be set to a real inbound-group token from the panel UI}
       - POLL_INTERVAL=10
+      # Development-only override; production nodes must use HTTPS/WSS.
+      - ALLOW_INSECURE_SOCKS5_CONFIG=${ALLOW_INSECURE_SOCKS5_CONFIG:-0}
       # v1.0.5: dual-stack listen + outbound source binding. All optional —
       # the defaults already enable IPv4+IPv6 listening with system routing.
       # LISTEN_IPV4 / LISTEN_IPV6 set the inbound listen addresses. An empty
@@ -88,7 +91,8 @@ services:
       #   - OUTBOUND_BIND_IPV4=10.0.2.61
     restart: unless-stopped
     depends_on:
-      - panel
+      panel:
+        condition: service_healthy
 
   # Optional: Caddy reverse proxy for TLS + custom domain.
   # Enable with --profile caddy and set RELAYPANEL_DOMAIN in .env.

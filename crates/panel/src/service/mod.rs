@@ -1,6 +1,7 @@
 pub mod announcements;
 pub mod audit;
 pub mod auto_restart;
+pub mod credentials;
 pub mod groups;
 pub mod history_prune;
 pub mod node_config;
@@ -12,5 +13,6 @@ pub mod redeem;
 pub mod rules;
 pub mod settings;
 pub mod site;
+pub mod socks5;
 pub mod traffic;
 pub mod users;

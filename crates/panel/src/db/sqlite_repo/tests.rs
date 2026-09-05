@@ -5079,6 +5079,34 @@ async fn traffic_history_splits_by_line() {
     );
 }
 
+#[tokio::test]
+async fn traffic_report_receipt_makes_ack_loss_retry_idempotent() {
+    let db = repo().await;
+    let alice = seed_history_fixture(&db, "idempotent", 170, 1300, 1.0).await;
+    let entries = [relay_shared::protocol::TrafficEntry {
+        rule_id: 1300,
+        upload: 123,
+        download: 456,
+    }];
+
+    for _ in 0..2 {
+        db.apply_traffic_batch_once(170, Some("same-report-id"), &entries)
+            .await
+            .unwrap();
+    }
+    let rule_used: i64 = sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id=1300")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_used: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_used, 579);
+    assert_eq!(user_used, 579);
+}
+
 /// THE reason group_id is a stored snapshot rather than a query-time join:
 /// deleting the group (or the rule) must NOT make that history vanish from the
 /// chart. A join would drop the row entirely and "last 7 days" would silently
@@ -5632,4 +5660,169 @@ async fn admin_order_list_pages_without_overlap() {
         3,
         "the two pages must cover all three rows exactly once"
     );
+}
+
+// ── v2.0: SOCKS5 resources and relay-rule extension ──
+
+#[tokio::test]
+async fn socks5_resource_and_rule_creation_is_atomic_and_port_safe() {
+    let db = repo().await;
+    seed_group_typed(&db, 50, 1, "in").await;
+
+    let resource_id = db
+        .insert_socks5_resource(
+            "edge-us",
+            "127.0.0.1",
+            1080,
+            Some("up-user"),
+            Some("ciphertext"),
+            Some("nonce"),
+            1,
+            "United States",
+            "US",
+            "California",
+            "Los Angeles",
+            "Example ISP",
+            "test",
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(resource_id > 0);
+
+    let rule_id = db
+        .create_socks5_rule_full(
+            "us-relay",
+            1,
+            18080,
+            50,
+            resource_id,
+            true,
+            Some("relay-user"),
+            Some("relay-ciphertext"),
+            Some("relay-nonce"),
+            1,
+            false,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("rule is within the admin quota");
+
+    let binding = db.find_socks5_rule_config(rule_id).await.unwrap().unwrap();
+    assert_eq!(binding.socks5_resource_id, resource_id);
+    assert_eq!(binding.resource_host, "127.0.0.1");
+    assert_eq!(binding.relay_username.as_deref(), Some("relay-user"));
+    let view = db.list_socks5_rule_views().await.unwrap();
+    assert_eq!(view.len(), 1);
+    assert_eq!(view[0].connect_host, "1.2.3.4");
+    assert!(
+        db.list_rules(&ResourceScope::All).await.unwrap().is_empty(),
+        "SOCKS5 extensions must not leak into the native forward-rule list"
+    );
+
+    assert_eq!(
+        db.update_socks5_rule_full(
+            rule_id,
+            "us-relay-updated",
+            18082,
+            50,
+            resource_id,
+            false,
+            false,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let updated = db.find_socks5_rule_config(rule_id).await.unwrap().unwrap();
+    assert_eq!(updated.relay_username.as_deref(), Some("relay-user"));
+    assert_eq!(
+        updated.relay_password_ciphertext.as_deref(),
+        Some("relay-ciphertext")
+    );
+    let updated_view = db.list_socks5_rule_views().await.unwrap().remove(0);
+    assert_eq!(updated_view.name, "us-relay-updated");
+    assert_eq!(updated_view.listen_port, 18082);
+    assert!(updated_view.paused);
+
+    let conflict = db
+        .create_socks5_rule_full(
+            "conflict",
+            1,
+            18082,
+            50,
+            resource_id,
+            true,
+            Some("other"),
+            Some("ciphertext"),
+            Some("nonce"),
+            1,
+            false,
+            true,
+        )
+        .await;
+    assert!(matches!(conflict, Err(DbError::PortConflict)));
+
+    assert_eq!(
+        db.delete_rule(rule_id, &ResourceScope::All).await.unwrap(),
+        1
+    );
+    assert!(db.find_socks5_rule_config(rule_id).await.unwrap().is_none());
+    assert_eq!(
+        db.count_socks5_resource_bindings(resource_id)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn disabled_socks5_resource_cannot_be_bound_to_a_new_rule() {
+    let db = repo().await;
+    seed_group_typed(&db, 51, 1, "in").await;
+    let resource_id = db
+        .insert_socks5_resource(
+            "disabled",
+            "127.0.0.1",
+            1081,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            false,
+        )
+        .await
+        .unwrap();
+
+    let result = db
+        .create_socks5_rule_full(
+            "must-not-exist",
+            1,
+            18081,
+            51,
+            resource_id,
+            true,
+            Some("relay-user"),
+            Some("ciphertext"),
+            Some("nonce"),
+            1,
+            false,
+            true,
+        )
+        .await;
+    assert!(matches!(result, Err(DbError::NotFound)));
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE name='must-not-exist'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "failed binding must roll back the rule row");
 }

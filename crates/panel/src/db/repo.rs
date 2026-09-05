@@ -32,6 +32,72 @@ use serde::Serialize;
 
 use super::error::DbError;
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5ResourceRecord {
+    pub id: i64,
+    pub name: String,
+    pub host: String,
+    pub port: i32,
+    pub username: Option<String>,
+    pub password_ciphertext: Option<String>,
+    pub password_nonce: Option<String>,
+    pub password_key_version: i32,
+    pub country: String,
+    pub country_code: String,
+    pub region: String,
+    pub city: String,
+    pub isp: String,
+    pub remark: String,
+    pub status: String,
+    pub enabled: bool,
+    pub detected_exit_ip: Option<String>,
+    pub detected_country: Option<String>,
+    pub latency_ms: Option<i32>,
+    pub consecutive_failures: i32,
+    pub last_check_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5RuleConfigRecord {
+    pub rule_id: i64,
+    pub socks5_resource_id: i64,
+    pub remote_dns: bool,
+    pub relay_username: Option<String>,
+    pub relay_password_ciphertext: Option<String>,
+    pub relay_password_nonce: Option<String>,
+    pub relay_password_key_version: i32,
+    pub allow_no_auth: bool,
+    pub resource_name: String,
+    pub resource_host: String,
+    pub resource_port: i32,
+    pub resource_username: Option<String>,
+    pub resource_password_ciphertext: Option<String>,
+    pub resource_password_nonce: Option<String>,
+    pub resource_password_key_version: i32,
+    pub resource_enabled: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5RuleViewRecord {
+    pub rule_id: i64,
+    pub name: String,
+    pub listen_port: i32,
+    pub device_group_in: i64,
+    pub connect_host: String,
+    pub paused: bool,
+    pub traffic_used: i64,
+    pub socks5_resource_id: i64,
+    pub resource_name: String,
+    pub detected_exit_ip: Option<String>,
+    pub relay_username: Option<String>,
+    pub allow_no_auth: bool,
+    pub remote_dns: bool,
+    pub created_at: String,
+}
+
 // ── Resource scoping (v0.4.10 multi-user isolation) ──
 
 /// The ownership scope a resource query is restricted to.
@@ -431,6 +497,103 @@ pub trait RuleRepository: Send + Sync {
     async fn list_active_for_config(&self, group_id: i64) -> Result<Vec<ForwardRule>, DbError>;
 }
 
+// ── SOCKS5 resources + rule extensions ──
+
+#[async_trait]
+pub trait Socks5Repository: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_socks5_resource(
+        &self,
+        name: &str,
+        host: &str,
+        port: i32,
+        username: Option<&str>,
+        password_ciphertext: Option<&str>,
+        password_nonce: Option<&str>,
+        password_key_version: i32,
+        country: &str,
+        country_code: &str,
+        region: &str,
+        city: &str,
+        isp: &str,
+        remark: &str,
+        enabled: bool,
+    ) -> Result<i64, DbError>;
+
+    async fn list_socks5_resources(&self) -> Result<Vec<Socks5ResourceRecord>, DbError>;
+    async fn find_socks5_resource(&self, id: i64) -> Result<Option<Socks5ResourceRecord>, DbError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_socks5_resource_full(
+        &self,
+        id: i64,
+        name: &str,
+        host: &str,
+        port: i32,
+        username: Option<&str>,
+        password_ciphertext: Option<&str>,
+        password_nonce: Option<&str>,
+        password_key_version: i32,
+        country: &str,
+        country_code: &str,
+        region: &str,
+        city: &str,
+        isp: &str,
+        remark: &str,
+        enabled: bool,
+    ) -> Result<u64, DbError>;
+
+    async fn set_socks5_resource_enabled(&self, id: i64, enabled: bool) -> Result<u64, DbError>;
+    async fn delete_socks5_resource(&self, id: i64) -> Result<u64, DbError>;
+    async fn count_socks5_resource_bindings(&self, id: i64) -> Result<i64, DbError>;
+    async fn find_socks5_rule_config(
+        &self,
+        rule_id: i64,
+    ) -> Result<Option<Socks5RuleConfigRecord>, DbError>;
+    async fn list_socks5_rule_views(&self) -> Result<Vec<Socks5RuleViewRecord>, DbError>;
+
+    /// Atomically create the forward_rules row and its SOCKS5 extension.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_socks5_rule_full(
+        &self,
+        name: &str,
+        uid: i64,
+        listen_port: i32,
+        device_group_in: i64,
+        socks5_resource_id: i64,
+        remote_dns: bool,
+        relay_username: Option<&str>,
+        relay_password_ciphertext: Option<&str>,
+        relay_password_nonce: Option<&str>,
+        relay_password_key_version: i32,
+        allow_no_auth: bool,
+        enabled: bool,
+    ) -> Result<Option<i64>, DbError>;
+
+    /// Atomically update the generic rule row and its SOCKS5 binding while
+    /// preserving the separately-managed inbound credential.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_socks5_rule_full(
+        &self,
+        rule_id: i64,
+        name: &str,
+        listen_port: i32,
+        device_group_in: i64,
+        socks5_resource_id: i64,
+        remote_dns: bool,
+        enabled: bool,
+    ) -> Result<u64, DbError>;
+
+    async fn reset_socks5_rule_credential(
+        &self,
+        rule_id: i64,
+        relay_username: &str,
+        relay_password_ciphertext: &str,
+        relay_password_nonce: &str,
+        relay_password_key_version: i32,
+    ) -> Result<u64, DbError>;
+}
+
 // ── Group (device_groups) ──
 
 #[async_trait]
@@ -680,6 +843,18 @@ pub trait TrafficRepository: Send + Sync {
     async fn apply_traffic_batch(
         &self,
         group_id: i64,
+        entries: &[TrafficEntry],
+    ) -> Result<Vec<TrafficEntryResult>, DbError> {
+        self.apply_traffic_batch_once(group_id, None, entries).await
+    }
+
+    /// Apply one node report exactly once. A repeated `(group_id, report_id)`
+    /// succeeds without applying the delta again. The idempotency marker and
+    /// all accounting writes share one transaction.
+    async fn apply_traffic_batch_once(
+        &self,
+        group_id: i64,
+        report_id: Option<&str>,
         entries: &[TrafficEntry],
     ) -> Result<Vec<TrafficEntryResult>, DbError>;
 
@@ -1261,6 +1436,7 @@ pub trait Repository:
     + OrderRepository
     + RedeemRepository
     + AnnouncementRepository
+    + Socks5Repository
     + Send
     + Sync
 {

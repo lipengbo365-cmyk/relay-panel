@@ -246,9 +246,19 @@ pub async fn node_ws_handler(
     // Clone the Arc<dyn Repository> so the WS task can keep using it after the
     // upgrade handler returns. The pool snapshot is shared read-only.
     let db = state.db.clone();
+    let socks5_credential_key = crate::api::node::sensitive_config_allowed(&state, &headers)
+        .then(|| state.config.socks5_credential_key.clone())
+        .flatten();
 
     ws.on_upgrade(move |socket| {
-        handle_node_ws(socket, group_id, node_id, db, state.node_connections)
+        handle_node_ws(
+            socket,
+            group_id,
+            node_id,
+            db,
+            state.node_connections,
+            socks5_credential_key,
+        )
     })
 }
 
@@ -258,6 +268,7 @@ async fn handle_node_ws(
     node_id: Option<String>,
     db: std::sync::Arc<dyn crate::db::Repository>,
     node_connections: NodeConnections,
+    socks5_credential_key: Option<String>,
 ) {
     tracing::info!(
         "websocket connected: group_id={} node_id={:?}",
@@ -273,7 +284,9 @@ async fn handle_node_ws(
     // Send initial config snapshot so a freshly-connected node has its config
     // immediately, without waiting for the first HTTP poll. None (DB error) →
     // skip the push; the node will get its config on the next HTTP poll.
-    if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {
+    if let Some(config) =
+        build_config_snapshot(db.as_ref(), group_id, socks5_credential_key.as_deref()).await
+    {
         if let Ok(config_json) = serde_json::to_string(&config) {
             let _ = sender.send(Message::Text(config_json.into())).await;
         }
@@ -337,6 +350,7 @@ async fn handle_node_ws(
 async fn build_config_snapshot(
     db: &dyn crate::db::Repository,
     group_id: i64,
+    socks5_credential_key: Option<&str>,
 ) -> Option<NodeConfigResponse> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
@@ -348,7 +362,13 @@ async fn build_config_snapshot(
     // Returns None on DB error so the caller skips the snapshot push (rather
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
-    match crate::service::node_config::build_node_config(db, group_id).await {
+    match crate::service::node_config::build_node_config_with_key(
+        db,
+        group_id,
+        socks5_credential_key,
+    )
+    .await
+    {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             tracing::error!(

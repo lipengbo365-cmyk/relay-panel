@@ -72,6 +72,24 @@ pub async fn run_ws_loop(
                 backoff = (backoff * 2).min(30);
                 last_permanent_msg = None;
             }
+            WsExit::ProtocolMismatch(msg) => {
+                {
+                    let mut mgr = manager.lock().await;
+                    mgr.apply_config(&relay_shared::protocol::NodeConfigResponse {
+                        listeners: Vec::new(),
+                    })
+                    .await;
+                }
+                if last_permanent_msg.as_deref() != Some(msg.as_str()) {
+                    tracing::warn!(
+                        "websocket protocol mismatch: {} — all listeners stopped; backing off {}s",
+                        msg,
+                        PERMANENT_BACKOFF_SECS
+                    );
+                    last_permanent_msg = Some(msg);
+                }
+                tokio::time::sleep(Duration::from_secs(PERMANENT_BACKOFF_SECS)).await;
+            }
             WsExit::PermanentError(msg) => {
                 // 426 / 401 / 403: configuration or version problem that won't
                 // fix itself. Back off 5 minutes. Dedup the log so it doesn't
@@ -104,6 +122,9 @@ pub async fn run_ws_loop(
 enum WsExit {
     ConfigChanged,
     Disconnected,
+    /// A config protocol mismatch invalidates every active listener. Keeping a
+    /// v5 SOCKS listener after a panel downgrade would bypass the gate.
+    ProtocolMismatch(String),
     /// A permanent error (426 protocol mismatch, 401/403 auth). The node backs
     /// off 5 minutes — the only fix is an upgrade or reconfiguration.
     PermanentError(String),
@@ -132,7 +153,7 @@ fn classify_ws_connect_error(e: tokio_tungstenite::tungstenite::Error) -> WsExit
                     .as_ref()
                     .and_then(|d| d.get("required"))
                     .and_then(|v| v.as_u64());
-                WsExit::PermanentError(format!(
+                WsExit::ProtocolMismatch(format!(
                     "config protocol mismatch (panel requires v{:?}, node has v{}) — upgrade relay-node",
                     required,
                     relay_shared::protocol::CONFIG_PROTOCOL_VERSION
@@ -188,6 +209,14 @@ async fn connect_and_run(
     {
         request.headers_mut().insert("X-Config-Protocol-Version", v);
     }
+    request.headers_mut().insert(
+        "X-Accept-Sensitive-Config",
+        if crate::poller::secure_control_channel_allowed(&config.panel_url) {
+            "1".parse().unwrap()
+        } else {
+            "0".parse().unwrap()
+        },
+    );
     if let Ok(v) = "relay-node-ws".parse() {
         request.headers_mut().insert("User-Agent", v);
     }
@@ -243,6 +272,7 @@ async fn connect_and_run(
                         if let Ok(resp) =
                             serde_json::from_str::<relay_shared::protocol::NodeConfigResponse>(&text)
                         {
+                            let resp = poller::enforce_secure_transport(resp, &config.panel_url);
                             tracing::info!(
                                 "websocket: received config ({} listeners), applying",
                                 resp.listeners.len()
@@ -259,7 +289,12 @@ async fn connect_and_run(
                                     tracing::info!("websocket: config applied after config_changed");
                                 }
                                 poller::FetchResult::ProtocolMismatch => {
-                                    tracing::warn!("websocket: config fetch returned protocol mismatch; keeping cached config");
+                                    let mut mgr = manager.lock().await;
+                                    mgr.apply_config(&relay_shared::protocol::NodeConfigResponse {
+                                        listeners: Vec::new(),
+                                    })
+                                    .await;
+                                    tracing::warn!("websocket: config protocol mismatch; all listeners stopped");
                                 }
                                 poller::FetchResult::Transient => {
                                     tracing::warn!("websocket: config fetch failed transiently; keeping cached config");

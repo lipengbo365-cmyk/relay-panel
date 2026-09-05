@@ -1,5 +1,7 @@
 use crate::config::NodeConfig;
-use relay_shared::protocol::{NodeConfigResponse, CONFIG_PROTOCOL_VERSION};
+use relay_shared::protocol::{
+    IngressConfig, NodeConfigResponse, UpstreamConfig, CONFIG_PROTOCOL_VERSION,
+};
 use std::path::PathBuf;
 
 /// Path for the config cache file. Used when the panel is unreachable.
@@ -34,6 +36,14 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
     let resp = match client
         .get(&url)
         .header("Authorization", format!("Bearer {}", config.token))
+        .header(
+            "X-Accept-Sensitive-Config",
+            if secure_control_channel_allowed(&config.panel_url) {
+                "1"
+            } else {
+                "0"
+            },
+        )
         // v0.4.0: send our config-protocol version so the panel can refuse to
         // send config we can't deserialize (keeps old nodes on their cached
         // config instead of crashing on unknown fields/enum variants).
@@ -71,6 +81,7 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
 
     match resp.json::<NodeConfigResponse>().await {
         Ok(cfg) => {
+            let cfg = enforce_secure_transport(cfg, &config.panel_url);
             save_cache(&cfg);
             FetchResult::Ok(cfg)
         }
@@ -86,7 +97,10 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
 pub fn load_cache() -> Option<NodeConfigResponse> {
     let path = cache_path();
     let data = std::fs::read_to_string(&path).ok()?;
-    let resp: NodeConfigResponse = serde_json::from_str(&data).ok()?;
+    let mut resp: NodeConfigResponse = serde_json::from_str(&data).ok()?;
+    // SOCKS5 credentials are intentionally never restored from disk. Legacy or
+    // manually-written caches containing such listeners are stripped as well.
+    resp.listeners.retain(cache_safe_listener);
     tracing::info!(
         "Loaded cached config from {} ({} listeners)",
         path.display(),
@@ -98,7 +112,8 @@ pub fn load_cache() -> Option<NodeConfigResponse> {
 /// Save config to config-cache.json (next to the binary or in working dir).
 fn save_cache(config: &NodeConfigResponse) {
     let path = cache_path();
-    match serde_json::to_string_pretty(config) {
+    let cache_safe = cache_safe_config(config);
+    match serde_json::to_string_pretty(&cache_safe) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, json) {
                 tracing::warn!("Failed to write config cache to {}: {}", path.display(), e);
@@ -108,6 +123,49 @@ fn save_cache(config: &NodeConfigResponse) {
             tracing::warn!("Failed to serialize config cache: {}", e);
         }
     }
+}
+
+fn cache_safe_config(config: &NodeConfigResponse) -> NodeConfigResponse {
+    NodeConfigResponse {
+        listeners: config
+            .listeners
+            .iter()
+            .filter(|listener| cache_safe_listener(listener))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn cache_safe_listener(listener: &relay_shared::protocol::ListenerConfig) -> bool {
+    !matches!(listener.ingress, IngressConfig::Socks5 { .. })
+        && !matches!(listener.upstream, UpstreamConfig::Socks5 { .. })
+}
+
+/// SOCKS5 credentials may cross the control channel only over TLS. Local test
+/// environments can explicitly opt in with ALLOW_INSECURE_SOCKS5_CONFIG=1.
+pub fn enforce_secure_transport(
+    mut config: NodeConfigResponse,
+    panel_url: &str,
+) -> NodeConfigResponse {
+    if !secure_control_channel_allowed(panel_url) {
+        let before = config.listeners.len();
+        config.listeners.retain(cache_safe_listener);
+        let removed = before - config.listeners.len();
+        if removed > 0 {
+            tracing::error!(
+                removed,
+                "refusing SOCKS5 listener config over insecure panel transport; use HTTPS or set ALLOW_INSECURE_SOCKS5_CONFIG=1 for local testing"
+            );
+        }
+    }
+    config
+}
+
+pub fn secure_control_channel_allowed(panel_url: &str) -> bool {
+    panel_url.trim_start().starts_with("https://")
+        || std::env::var("ALLOW_INSECURE_SOCKS5_CONFIG")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
 }
 
 fn cache_path() -> PathBuf {
@@ -200,6 +258,148 @@ fn fallback_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use relay_shared::protocol::{
+        IngressConfig, ListenerConfig, LoadBalanceStrategy, NodeTransport, Protocol, SecretString,
+        Socks5InboundAuth, UpstreamConfig,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn test_node_config(panel_url: String) -> NodeConfig {
+        NodeConfig {
+            panel_url,
+            token: "test-token".into(),
+            poll_interval: 10,
+            tls_cert_path: None,
+            tls_key_path: None,
+            network_interface: "auto".into(),
+            listen_ipv4: "127.0.0.1".into(),
+            listen_ipv6: "::1".into(),
+            outbound_interface: "auto".into(),
+            outbound_bind_ipv4: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn v5_node_treats_v4_panel_response_as_permanent_protocol_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let size = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(
+                request.contains("X-Config-Protocol-Version: 5")
+                    || request.contains("x-config-protocol-version: 5")
+            );
+            let body = r#"{"code":"CONFIG_PROTOCOL_MISMATCH","required":4,"received":5}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 426 Upgrade Required\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let result = fetch_config(&test_node_config(format!("http://{address}"))).await;
+        assert!(matches!(result, FetchResult::ProtocolMismatch));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn socks5_credentials_are_never_serialized_to_disk_cache() {
+        let config = NodeConfigResponse {
+            listeners: vec![ListenerConfig {
+                rule_id: 9,
+                port: 10001,
+                protocol: Protocol::Tcp,
+                ingress: IngressConfig::Socks5 {
+                    auth: Socks5InboundAuth::UsernamePassword {
+                        username: "relay-user".into(),
+                        password: SecretString::new("relay-secret"),
+                    },
+                },
+                upstream: UpstreamConfig::Socks5 {
+                    resource_id: 3,
+                    resource_name: "resource".into(),
+                    host: "127.0.0.1".into(),
+                    port: 1080,
+                    username: Some("up-user".into()),
+                    password: Some(SecretString::new("upstream-secret")),
+                    remote_dns: true,
+                },
+                node_transport: NodeTransport::Raw,
+                ws_path: None,
+                targets: vec![],
+                load_balance_strategy: LoadBalanceStrategy::First,
+                upload_limit_bps: None,
+                download_limit_bps: None,
+                max_connections: None,
+            }],
+        };
+        let safe = cache_safe_config(&config);
+        assert!(safe.listeners.is_empty());
+        let json = serde_json::to_string(&safe).unwrap();
+        assert!(!json.contains("relay-secret"));
+        assert!(!json.contains("upstream-secret"));
+        assert!(!json.contains("relay-user"));
+        assert!(!json.contains("up-user"));
+    }
+
+    #[test]
+    fn cache_keeps_direct_rules_while_excluding_socks5_rules() {
+        let direct = ListenerConfig {
+            rule_id: 10,
+            port: 10002,
+            protocol: Protocol::Tcp,
+            ingress: IngressConfig::RawTcp,
+            upstream: UpstreamConfig::Direct,
+            node_transport: NodeTransport::Raw,
+            ws_path: None,
+            targets: vec!["127.0.0.1:80".into()],
+            load_balance_strategy: LoadBalanceStrategy::First,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+            max_connections: None,
+        };
+        let mut config = NodeConfigResponse {
+            listeners: vec![direct.clone()],
+        };
+        config.listeners.push(ListenerConfig {
+            rule_id: 11,
+            port: 10003,
+            protocol: Protocol::Tcp,
+            ingress: IngressConfig::Socks5 {
+                auth: Socks5InboundAuth::NoAuth,
+            },
+            upstream: UpstreamConfig::Socks5 {
+                resource_id: 4,
+                resource_name: "sensitive".into(),
+                host: "127.0.0.1".into(),
+                port: 1080,
+                username: Some("up-user".into()),
+                password: Some(SecretString::new("up-password")),
+                remote_dns: true,
+            },
+            node_transport: NodeTransport::Raw,
+            ws_path: None,
+            targets: vec![],
+            load_balance_strategy: LoadBalanceStrategy::First,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+            max_connections: None,
+        });
+
+        let safe = cache_safe_config(&config);
+        assert_eq!(safe.listeners.len(), 1);
+        assert_eq!(safe.listeners[0].rule_id, direct.rule_id);
+        assert!(matches!(safe.listeners[0].upstream, UpstreamConfig::Direct));
+    }
 
     /// A node_id generated once must be reused verbatim on every subsequent
     /// call — this stability is the contract the panel's status dedup depends

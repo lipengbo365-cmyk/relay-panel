@@ -88,9 +88,11 @@ if [ ! -f .env ]; then
     info "Generating secrets into .env ..."
     JWT_SECRET=$(openssl rand -hex 32)
     PANEL_KEY=$(openssl rand -hex 16)
+    SOCKS5_CREDENTIAL_KEY=$(openssl rand -hex 32)
     cat > .env <<EOF
 JWT_SECRET=${JWT_SECRET}
 PANEL_KEY=${PANEL_KEY}
+SOCKS5_CREDENTIAL_KEY=${SOCKS5_CREDENTIAL_KEY}
 NODE_TOKEN=change-me-after-creating-a-group
 EOF
     chmod 600 .env
@@ -98,6 +100,15 @@ EOF
 else
     FRESH_INSTALL=0
     warn ".env already exists - skipping secret generation"
+fi
+
+# Existing installations need a dedicated reversible-encryption key before
+# SOCKS5 credentials can be stored. Generate it once and preserve it forever.
+if ! grep -q '^SOCKS5_CREDENTIAL_KEY=' .env 2>/dev/null; then
+    SOCKS5_CREDENTIAL_KEY=$(openssl rand -hex 32)
+    printf 'SOCKS5_CREDENTIAL_KEY=%s\n' "$SOCKS5_CREDENTIAL_KEY" >> .env
+    chmod 600 .env
+    info "SOCKS5 credential key added to .env"
 fi
 
 # ---------- 2b. Database backend resolution ----------

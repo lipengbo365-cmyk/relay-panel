@@ -5,6 +5,7 @@
 #   1. Generate secrets:
 #        openssl rand -hex 32     # -> JWT_SECRET
 #        openssl rand -hex 16     # -> PANEL_KEY
+#        openssl rand -hex 32     # -> SOCKS5_CREDENTIAL_KEY
 #   2. Fill them in below (or use a .env file / secrets manager).
 #   3. Create an inbound device group in the panel UI and copy its Node Token
 #      into NODE_TOKEN for the node service.
@@ -18,7 +19,7 @@ services:
     build:
       context: .
       target: panel
-    image: relaypanel/panel:latest
+    image: relay-panel-socks5:v1.0.0-alpha1
     ports:
       # RELAYPANEL_WEB_MODE controls how the panel port is published:
       #   direct         → 0.0.0.0:18888:18888  (public, default)
@@ -35,6 +36,10 @@ services:
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set (see header comment)}
       # REQUIRED — generate with: openssl rand -hex 16
       - PANEL_KEY=${PANEL_KEY:?PANEL_KEY must be set (see header comment)}
+      # REQUIRED for SOCKS5 resources — encrypts reversible upstream/relay credentials.
+      - SOCKS5_CREDENTIAL_KEY=${SOCKS5_CREDENTIAL_KEY:?SOCKS5_CREDENTIAL_KEY must be set (see header comment)}
+      # Development-only opt-in. Keep 0 in production.
+      - ALLOW_INSECURE_SOCKS5_CONFIG=${ALLOW_INSECURE_SOCKS5_CONFIG:-0}
       # OPTIONAL — the public URL nodes should use to reach the panel.
       # Set this when the panel is behind a reverse proxy / domain, so the
       # "Copy Install Command" button emits e.g. https://panel.example.com
@@ -58,7 +63,7 @@ services:
     build:
       context: .
       target: node
-    image: relaypanel/node:latest
+    image: relay-node-socks5:v1.0.0-alpha1
     # Node is opt-in via --profile node. Most deployments run relay-node on a
     # separate server. To also run node on this host:
     #   docker compose --profile node up -d
@@ -81,6 +86,8 @@ services:
       # refuses to start with an unset or "default-token" value.
       - NODE_TOKEN=${NODE_TOKEN:?NODE_TOKEN must be set to a real inbound-group token from the panel UI}
       - POLL_INTERVAL=10
+      # Set to 1 only for an explicitly local loopback development stack.
+      - ALLOW_INSECURE_SOCKS5_CONFIG=${ALLOW_INSECURE_SOCKS5_CONFIG:-0}
     restart: unless-stopped
     depends_on:
       - panel

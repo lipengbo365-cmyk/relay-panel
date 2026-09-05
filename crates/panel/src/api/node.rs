@@ -37,6 +37,25 @@ pub(crate) fn config_protocol_compatible(headers: &HeaderMap) -> bool {
     }
 }
 
+/// Sensitive listener credentials are emitted only when both sides explicitly
+/// agree that the control channel is protected. Production panels must publish
+/// an HTTPS URL; the override exists solely for loopback development stacks.
+pub(crate) fn sensitive_config_allowed(state: &AppState, headers: &HeaderMap) -> bool {
+    let node_accepts = headers
+        .get("X-Accept-Sensitive-Config")
+        .and_then(|value| value.to_str().ok())
+        == Some("1");
+    let panel_secure = state
+        .config
+        .public_panel_url
+        .trim_start()
+        .starts_with("https://");
+    let development_override = std::env::var("ALLOW_INSECURE_SOCKS5_CONFIG")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"));
+    node_accepts && (panel_secure || development_override)
+}
+
 pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
     // v0.4.0: protocol-version gate. A node reporting a different
     // config_protocol_version (or none at all — pre-v0.4.0 node) must NOT
@@ -88,7 +107,16 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     //
     // An empty Ok result is a legitimate "no matching rules" state. A DB Err is
     // a transient backend failure → HTTP 503.
-    match crate::service::node_config::build_node_config(state.db.as_ref(), group.id).await {
+    let credential_key = sensitive_config_allowed(&state, &headers)
+        .then_some(state.config.socks5_credential_key.as_deref())
+        .flatten();
+    match crate::service::node_config::build_node_config_with_key(
+        state.db.as_ref(),
+        group.id,
+        credential_key,
+    )
+    .await
+    {
         Ok(cfg) => Json(cfg).into_response(),
         Err(e) => {
             tracing::error!(
@@ -163,8 +191,20 @@ pub async fn report_traffic(
     // HTTP-status note (preserved): a rejection returns HTTP 200 with a business
     // `code` (403/400/500) INSIDE the JSON body — NOT a real HTTP error. Nodes
     // read the JSON `code` and ignore the HTTP status on these endpoints.
-    match crate::service::traffic::apply_traffic_report(state.db.as_ref(), group.id, &req.reports)
-        .await
+    if uuid::Uuid::parse_str(&req.report_id).is_err() {
+        return Json(ApiResponse {
+            code: 400,
+            message: "invalid traffic report id".into(),
+            data: None,
+        });
+    }
+    match crate::service::traffic::apply_traffic_report(
+        state.db.as_ref(),
+        group.id,
+        &req.report_id,
+        &req.reports,
+    )
+    .await
     {
         Ok(()) => Json(ApiResponse::success(())),
         Err(crate::service::traffic::TrafficReportError::Unavailable) => {
@@ -402,6 +442,7 @@ mod tests {
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
+                socks5_credential_key: Some("11".repeat(32)),
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),
@@ -443,6 +484,7 @@ mod tests {
 
     fn report(_token: &str, entries: &[TrafficEntry]) -> TrafficReport {
         TrafficReport {
+            report_id: uuid::Uuid::new_v4().to_string(),
             reports: entries.to_vec(),
         }
     }
@@ -734,6 +776,55 @@ mod tests {
             Some(0),
             "missing token → empty config, not an error"
         );
+    }
+
+    #[tokio::test]
+    async fn every_non_v5_config_protocol_is_rejected_with_http_426() {
+        for received in [
+            Some("4"),
+            None,
+            Some("not-a-version"),
+            Some("6"),
+            Some("999"),
+        ] {
+            let (state, _pool) = seeded_state().await;
+            let mut headers = HeaderMap::new();
+            if let Some(received) = received {
+                headers.insert("X-Config-Protocol-Version", received.parse().unwrap());
+            }
+
+            let response = get_config(State(state), headers).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UPGRADE_REQUIRED,
+                "protocol header {received:?} must fail closed"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["code"], "CONFIG_PROTOCOL_MISMATCH");
+            assert_eq!(value["required"], CONFIG_PROTOCOL_VERSION);
+            match received.and_then(|value| value.parse::<u32>().ok()) {
+                Some(parsed) => assert_eq!(value["received"], parsed),
+                None => assert!(value["received"].is_null()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sensitive_config_requires_https_panel_and_node_opt_in() {
+        let (mut state, _pool) = seeded_state().await;
+        state.config.public_panel_url = "https://panel.example".into();
+        let mut headers = HeaderMap::new();
+        assert!(!sensitive_config_allowed(&state, &headers));
+
+        headers.insert("X-Accept-Sensitive-Config", "1".parse().unwrap());
+        assert!(sensitive_config_allowed(&state, &headers));
+
+        state.config.public_panel_url = "http://panel.example".into();
+        headers.insert("X-Accept-Sensitive-Config", "0".parse().unwrap());
+        assert!(!sensitive_config_allowed(&state, &headers));
     }
 
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one

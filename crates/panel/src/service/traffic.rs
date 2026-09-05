@@ -56,6 +56,7 @@ pub enum TrafficReportError {
 pub async fn apply_traffic_report(
     db: &dyn Repository,
     group_id: i64,
+    report_id: &str,
     reports: &[TrafficEntry],
 ) -> Result<(), TrafficReportError> {
     // Pre-validate obvious overflow before starting a transaction. The message
@@ -74,7 +75,7 @@ pub async fn apply_traffic_report(
     // apply_traffic_batch returns Ok(vec![result]) even on rejection; the
     // element(s) tell us which uniform response to send.
     let results = db
-        .apply_traffic_batch(group_id, reports)
+        .apply_traffic_batch_once(group_id, Some(report_id), reports)
         .await
         .map_err(TrafficReportError::Database)?;
 
@@ -325,6 +326,7 @@ mod tests {
         let err = apply_traffic_report(
             &repo(&pool),
             10,
+            "overflow-test",
             &[TrafficEntry {
                 rule_id: 100,
                 upload: u64::MAX,
@@ -343,6 +345,7 @@ mod tests {
         let err = apply_traffic_report(
             &repo(&pool),
             10,
+            "overflow-test",
             &[TrafficEntry {
                 rule_id: 100,
                 upload: i64::MAX as u64,

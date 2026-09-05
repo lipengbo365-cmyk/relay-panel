@@ -26,7 +26,7 @@ pub fn app_version() -> &'static str {
     })
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct Config {
     pub database_path: String,
     pub listen: String,
@@ -60,6 +60,32 @@ pub struct Config {
     /// blocks node status or forwarding.
     pub geoip_enabled: bool,
     pub geoip_cache_ttl: u64,
+    /// Dedicated 256-bit key for reversible SOCKS5/relay credential encryption.
+    /// Accepted encodings: 64 hexadecimal characters or standard base64.
+    /// Missing/invalid means the SOCKS5 feature fails closed; legacy features
+    /// continue to boot so an operator can repair configuration.
+    pub socks5_credential_key: Option<String>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_path", &self.database_path)
+            .field("listen", &self.listen)
+            .field("key", &"***")
+            .field("jwt_secret", &"***")
+            .field("public_dir", &self.public_dir)
+            .field("public_panel_url", &self.public_panel_url)
+            .field("registration_enabled", &self.registration_enabled)
+            .field("cors_origins", &self.cors_origins)
+            .field("geoip_enabled", &self.geoip_enabled)
+            .field("geoip_cache_ttl", &self.geoip_cache_ttl)
+            .field(
+                "socks5_credential_key",
+                &self.socks5_credential_key.as_ref().map(|_| "***"),
+            )
+            .finish()
+    }
 }
 
 impl Config {
@@ -104,6 +130,9 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(604_800); // 7 days
+        let socks5_credential_key = std::env::var("SOCKS5_CREDENTIAL_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
 
         let cfg = Self {
             database_path,
@@ -116,6 +145,7 @@ impl Config {
             cors_origins,
             geoip_enabled,
             geoip_cache_ttl,
+            socks5_credential_key,
         };
         cfg.validate();
         cfg
@@ -160,7 +190,29 @@ fn parse_geoip_enabled(raw: Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_geoip_enabled;
+    use super::{parse_geoip_enabled, Config};
+
+    #[test]
+    fn config_debug_redacts_all_secret_values() {
+        let config = Config {
+            database_path: "sqlite:test.db".into(),
+            listen: "127.0.0.1:18888".into(),
+            key: "panel-key-secret".into(),
+            jwt_secret: "jwt-secret-value".into(),
+            public_dir: "public".into(),
+            public_panel_url: "https://panel.example".into(),
+            registration_enabled: false,
+            cors_origins: vec![],
+            geoip_enabled: false,
+            geoip_cache_ttl: 60,
+            socks5_credential_key: Some("socks5-key-secret".into()),
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("panel-key-secret"));
+        assert!(!rendered.contains("jwt-secret-value"));
+        assert!(!rendered.contains("socks5-key-secret"));
+        assert!(rendered.contains("***"));
+    }
 
     /// v0.4.16: pin the GEOIP_ENABLED truth table. The default flipped from
     /// false (v0.4.15, opt-in) to true (opt-out). This test guards against a

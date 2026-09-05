@@ -21,6 +21,7 @@ const Login = lazy(() => import('./pages/Login'));
 const Register = lazy(() => import('./pages/Register'));
 const ForcePasswordChange = lazy(() => import('./pages/ForcePasswordChange'));
 const Rules = lazy(() => import('./pages/Rules'));
+const Socks5 = lazy(() => import('./pages/Socks5'));
 const Groups = lazy(() => import('./pages/Groups'));
 const Users = lazy(() => import('./pages/Users'));
 const NodeStatus = lazy(() => import('./pages/NodeStatus'));
@@ -70,6 +71,7 @@ export const router = createBrowserRouter([
       { index: true, element: <RoleHome /> },
       // Owner-scoped resources — any authenticated user manages their own.
       { path: 'rules', element: <Rules /> },
+      { path: 'socks5', element: <RequireAdmin><Socks5 /></RequireAdmin> },
       { path: 'groups', element: <Groups /> },
       { path: 'nodes', element: <NodeStatus /> },
       { path: 'node-status', element: <NodeStatus /> },

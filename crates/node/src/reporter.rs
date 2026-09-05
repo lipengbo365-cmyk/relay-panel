@@ -46,12 +46,73 @@ pub struct TrafficCounter {
     // lock and do a lock-free atomic fetch_add, so they never serialize on each
     // other — this is the per-packet path for both TCP and UDP forwarding.
     data: Arc<RwLock<HashMap<i64, RuleCounters>>>,
+    /// One exact unacknowledged delta. Retries reuse both its UUID and bytes;
+    /// newly arriving bytes remain in `data` and are sent by the next batch.
+    pending: Arc<Mutex<Option<TrafficReport>>>,
 }
 
 impl TrafficCounter {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn prepare_report(&self) -> Option<TrafficReport> {
+        let mut pending = self.pending.lock().await;
+        if let Some(report) = pending.as_ref() {
+            return Some(report.clone());
+        }
+        let snap = self.snapshot().await;
+        let reports: Vec<TrafficEntry> = snap
+            .entries
+            .iter()
+            .filter(|entry| entry.upload > 0 || entry.download > 0)
+            .cloned()
+            .collect();
+        if reports.is_empty() {
+            snap.commit().await;
+            return None;
+        }
+        let report = TrafficReport {
+            report_id: uuid::Uuid::new_v4().to_string(),
+            reports,
+        };
+        *pending = Some(report.clone());
+        Some(report)
+    }
+
+    async fn commit_report(&self, report_id: &str) {
+        let entries = {
+            let mut pending = self.pending.lock().await;
+            match pending.as_ref() {
+                Some(report) if report.report_id == report_id => {
+                    pending.take().map(|report| report.reports)
+                }
+                _ => None,
+            }
+        };
+        if let Some(entries) = entries {
+            self.commit_entries(&entries).await;
+        }
+    }
+
+    async fn commit_entries(&self, entries: &[TrafficEntry]) {
+        let mut map = self.data.write().await;
+        for entry in entries {
+            let drained = if let Some(counters) = map.get(&entry.rule_id) {
+                let previous_upload = counters.0.fetch_sub(entry.upload, Ordering::Relaxed);
+                let previous_download = counters.1.fetch_sub(entry.download, Ordering::Relaxed);
+                previous_upload == entry.upload
+                    && previous_download == entry.download
+                    && Arc::strong_count(counters) == 1
+            } else {
+                false
+            };
+            if drained {
+                map.remove(&entry.rule_id);
+            }
         }
     }
 
@@ -155,6 +216,13 @@ impl TrafficCounter {
     /// stale rule_id causes the panel to atomically reject the entire batch.
     pub async fn prune_rule(&self, rule_id: i64) {
         self.data.write().await.remove(&rule_id);
+        let mut pending = self.pending.lock().await;
+        if let Some(report) = pending.as_mut() {
+            report.reports.retain(|entry| entry.rule_id != rule_id);
+            if report.reports.is_empty() {
+                *pending = None;
+            }
+        }
     }
 
     /// Test-only: check whether a rule_id has any accumulated bytes.
@@ -176,39 +244,7 @@ impl TrafficSnapshot<'_> {
     /// Subtract the snapshotted bytes from the live counters. Bytes counted
     /// after the snapshot was taken are untouched. Safe to call once.
     pub async fn commit(self) {
-        // Periodic (not the hot path): take the write lock so fetch_sub AND the
-        // zero-entry cleanup happen without racing an add(). Only the exact
-        // snapshotted bytes are subtracted; bytes counted after the snapshot are
-        // preserved (they show up as a larger prev value → entry not removed).
-        let mut map = self.counter.data.write().await;
-        for e in &self.entries {
-            let drained = if let Some(c) = map.get(&e.rule_id) {
-                let prev_up = c.0.fetch_sub(e.upload, Ordering::Relaxed);
-                let prev_down = c.1.fetch_sub(e.download, Ordering::Relaxed);
-                // new == 0 iff prev == snapshotted (no adds since the snapshot).
-                //
-                // v1.2.3: draining to zero is NOT enough to remove the entry.
-                // A live connection holds a RuleCounterHandle — an Arc to this
-                // very counter — and removing the map's copy would orphan it:
-                // every later byte would land in an Arc nothing reads, and that
-                // connection would stop being billed for the rest of its life.
-                // That is this release's own long-connection hole, re-created
-                // at a poll boundary, and it would hit exactly the long-lived
-                // connections the change exists to fix.
-                //
-                // strong_count == 1 means the map is the only owner, so no
-                // connection can still be writing. The check is conservative in
-                // the safe direction: a handle dropped concurrently can leave
-                // the count momentarily high, which only keeps a zeroed entry
-                // around until the next cycle.
-                prev_up == e.upload && prev_down == e.download && Arc::strong_count(c) == 1
-            } else {
-                false
-            };
-            if drained {
-                map.remove(&e.rule_id);
-            }
-        }
+        self.counter.commit_entries(&self.entries).await;
     }
 }
 
@@ -375,39 +411,11 @@ impl Drop for TcpConnectionGuard {
 }
 
 pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
-    // Snapshot (non-destructive) first: the snapshotted bytes are only deducted
-    // from the counters after the panel ACKs the upload (see TrafficSnapshot).
-    // A failed/lost upload drops the guard without commit, so those bytes stay
-    // and are retried on the next cycle instead of being permanently dropped.
-    let snap = counter.snapshot().await;
-    // debug, not info: this runs every poll cycle (default 10s) and would
-    // flood the log at info level on a healthy node. Only the per-request
-    // HTTP status below is worth keeping visible.
-    // v1.2.3: skip entries with nothing in them. A rule now gets its counter
-    // the moment a connection OPENS rather than when it closes, so an idle but
-    // still-open connection holds a 0/0 entry — without this filter such a node
-    // would POST a batch of zeroes every cycle, forever. Only the UPLOAD is
-    // filtered; the snapshot still commits every entry.
-    let reports: Vec<TrafficEntry> = snap
-        .entries
-        .iter()
-        .filter(|e| e.upload > 0 || e.download > 0)
-        .cloned()
-        .collect();
-    tracing::debug!("report_traffic: {} entries to report", reports.len());
-    if reports.is_empty() {
-        // Commit before returning. There is nothing to send, but the snapshot
-        // still has to be applied: subtracting zero is a no-op that lets the
-        // strong_count cleanup in `commit` drop entries whose connection has
-        // closed. Returning without it would strand a 0/0 entry for every rule
-        // that ever had a connection open and transfer nothing, and nothing
-        // else would ever clear it — a batch of only zeroes is exactly the case
-        // that reaches this branch.
-        snap.commit().await;
+    let Some(report) = counter.prepare_report().await else {
         return;
-    }
-
-    let report = TrafficReport { reports };
+    };
+    tracing::debug!("report_traffic: {} entries to report", report.reports.len());
+    let report_id = report.report_id.clone();
 
     let url = format!("{}/api/v1/node/report_traffic", config.panel_url);
     let client = reqwest::Client::new();
@@ -434,7 +442,7 @@ pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
             }
             match r.json::<ApiResponse<()>>().await {
                 Ok(resp) if resp.code == 0 => {
-                    snap.commit().await;
+                    counter.commit_report(&report_id).await;
                     tracing::info!("report_traffic HTTP {} code 0", status);
                 }
                 Ok(resp) => {
@@ -1310,6 +1318,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ack_loss_retries_the_exact_same_report_then_sends_new_bytes() {
+        let counter = TrafficCounter::new();
+        counter.add(31, 100, 200).await;
+
+        let first = counter.prepare_report().await.expect("first delta");
+        counter.add(31, 7, 9).await;
+        let retry = counter.prepare_report().await.expect("pending retry");
+        assert_eq!(retry.report_id, first.report_id);
+        assert_eq!(retry.reports[0].upload, 100);
+        assert_eq!(retry.reports[0].download, 200);
+
+        counter.commit_report(&first.report_id).await;
+        let next = counter
+            .prepare_report()
+            .await
+            .expect("bytes after snapshot");
+        assert_ne!(next.report_id, first.report_id);
+        assert_eq!(next.reports[0].upload, 7);
+        assert_eq!(next.reports[0].download, 9);
+    }
+
+    #[tokio::test]
     async fn tcp_guard_increments_and_decrements_on_drop() {
         let tracker = ConnectionTracker::new();
         // Baseline: zero active connections.
@@ -1437,6 +1467,8 @@ mod tests {
                 rule_id: i,
                 port: 40000 + (i as u16),
                 protocol: relay_shared::protocol::Protocol::Tcp,
+                ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                upstream: relay_shared::protocol::UpstreamConfig::Direct,
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
                 targets: vec!["127.0.0.1:1".to_string()],

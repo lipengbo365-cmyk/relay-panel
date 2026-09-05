@@ -9,7 +9,10 @@ license.workspace = true
 [dependencies]
 relay-shared = { path = "../shared" }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Use the host's native CA store, matching the WSS client below. This keeps
+# HTTPS polling/reporting usable with an administrator-installed private CA;
+# using webpki roots here while WSS used native roots split the control plane.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -50,6 +53,9 @@ sha2 = "0.10"
 # compromised panel must not be able to roll a node back to an old, vulnerable
 # release).
 semver = "1"
+tokio-socks = "0.5.3"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # v0.4.16: test-only cert generator for the real WSS (wss://) regression test.

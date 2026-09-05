@@ -10,6 +10,7 @@ mod profiles;
 mod rules;
 mod settings;
 mod shop;
+mod socks5;
 mod users;
 
 pub use groups::*;
@@ -19,6 +20,7 @@ pub use profiles::*;
 pub use rules::*;
 pub use settings::*;
 pub use shop::*;
+pub use socks5::*;
 pub use users::*;
 
 /// A user WITHOUT the password hash — for API responses. Never expose the
@@ -158,6 +160,7 @@ mod tests {
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
+                socks5_credential_key: Some("11".repeat(32)),
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),

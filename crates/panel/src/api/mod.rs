@@ -194,6 +194,36 @@ pub fn routes() -> Router<AppState> {
             axum::routing::put(admin::admin_set_user_plan),
         )
         .route(
+            "/admin/socks5-resources",
+            axum::routing::get(admin::list_socks5_resources).post(admin::create_socks5_resource),
+        )
+        .route(
+            "/admin/socks5-resources/{id}",
+            axum::routing::get(admin::get_socks5_resource)
+                .put(admin::update_socks5_resource)
+                .delete(admin::delete_socks5_resource),
+        )
+        .route(
+            "/admin/socks5-resources/{id}/enabled/{enabled}",
+            axum::routing::post(admin::set_socks5_resource_enabled),
+        )
+        .route(
+            "/admin/socks5-rules",
+            axum::routing::get(admin::list_socks5_rules).post(admin::create_socks5_rule),
+        )
+        .route(
+            "/admin/socks5-rules/{id}",
+            axum::routing::put(admin::update_socks5_rule).delete(admin::delete_socks5_rule),
+        )
+        .route(
+            "/admin/socks5-rules/{id}/enabled/{enabled}",
+            axum::routing::post(admin::set_socks5_rule_enabled),
+        )
+        .route(
+            "/admin/socks5-rules/{id}/credential",
+            axum::routing::put(admin::reset_socks5_rule_credential),
+        )
+        .route(
             "/nodes/shared",
             axum::routing::get(groups::list_shared_node_summary),
         )

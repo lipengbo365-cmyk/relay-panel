@@ -196,6 +196,67 @@ CREATE TABLE IF NOT EXISTS forward_rule_targets (
 CREATE INDEX IF NOT EXISTS idx_forward_rule_targets_rule_position
     ON forward_rule_targets (rule_id, position);
 
+-- v2.0: administrator-managed SOCKS5 upstream inventory. Credentials are
+-- application-layer encrypted; the database never stores a plaintext password.
+CREATE TABLE IF NOT EXISTS socks5_resources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+    username TEXT,
+    password_ciphertext TEXT,
+    password_nonce TEXT,
+    password_key_version INTEGER NOT NULL DEFAULT 1,
+    country TEXT NOT NULL DEFAULT '',
+    country_code TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    isp TEXT NOT NULL DEFAULT '',
+    remark TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'UNKNOWN'
+        CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    detected_exit_ip TEXT,
+    detected_country TEXT,
+    latency_ms INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_check_at TEXT,
+    last_success_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+        OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+    UNIQUE(host, port, username)
+);
+
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter
+    ON socks5_resources(enabled, status, country_code);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
+    ON socks5_resources(host, port, COALESCE(username, ''));
+
+-- One-to-one extension of forward_rules. Inbound and upstream credentials are
+-- deliberately separate encrypted values.
+CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
+    rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+    socks5_resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+    remote_dns INTEGER NOT NULL DEFAULT 1,
+    relay_username TEXT,
+    relay_password_ciphertext TEXT,
+    relay_password_nonce TEXT,
+    relay_password_key_version INTEGER NOT NULL DEFAULT 1,
+    allow_no_auth INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK ((allow_no_auth = 1 AND relay_username IS NULL
+             AND relay_password_ciphertext IS NULL AND relay_password_nonce IS NULL)
+        OR (allow_no_auth = 0 AND relay_username IS NOT NULL
+             AND relay_password_ciphertext IS NOT NULL AND relay_password_nonce IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
+    ON socks5_rule_bindings(socks5_resource_id);
+
 CREATE TABLE IF NOT EXISTS statistics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     stat_type TEXT NOT NULL,
@@ -288,6 +349,18 @@ CREATE TABLE IF NOT EXISTS traffic_history (
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts);
 CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts);
+
+-- Protocol v5 traffic-report idempotency. The node retries an identical UUID
+-- until acknowledgement; this receipt and the accounting delta are committed
+-- in the same transaction so a lost HTTP response cannot double-charge.
+CREATE TABLE IF NOT EXISTS traffic_report_receipts (
+    group_id INTEGER NOT NULL,
+    report_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (group_id, report_id)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_report_receipts_created
+    ON traffic_report_receipts(created_at);
 -- NOTE: the index on group_id is deliberately NOT here — it lives in Migration
 -- 41, next to the ALTER that adds the column. This schema re-runs on every
 -- boot, and `CREATE TABLE IF NOT EXISTS` is a no-op against a database whose
@@ -933,7 +1006,9 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         r#"INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled)
            SELECT fr.id, fr.target_addr, fr.target_port, 1, 1
            FROM forward_rules fr
-           WHERE NOT EXISTS (
+           WHERE fr.target_port BETWEEN 1 AND 65535
+             AND NULLIF(TRIM(fr.target_addr), '') IS NOT NULL
+             AND NOT EXISTS (
                SELECT 1 FROM forward_rule_targets t WHERE t.rule_id = fr.id
            )"#,
     )
@@ -1794,6 +1869,97 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         carried
     );
 
+    // ── Migration 45: v2.0 SOCKS5 resources + rule bindings ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_resources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            host TEXT NOT NULL,
+            port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+            username TEXT,
+            password_ciphertext TEXT,
+            password_nonce TEXT,
+            password_key_version INTEGER NOT NULL DEFAULT 1,
+            country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+            region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+            isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'UNKNOWN'
+                CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            last_check_at TEXT, last_success_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+                OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+            UNIQUE(host, port, username)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter
+         ON socks5_resources(enabled, status, country_code)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
+         ON socks5_resources(host, port, COALESCE(username, ''))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
+            rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+            socks5_resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+            remote_dns INTEGER NOT NULL DEFAULT 1,
+            relay_username TEXT,
+            relay_password_ciphertext TEXT,
+            relay_password_nonce TEXT,
+            relay_password_key_version INTEGER NOT NULL DEFAULT 1,
+            allow_no_auth INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK ((allow_no_auth = 1 AND relay_username IS NULL
+                     AND relay_password_ciphertext IS NULL AND relay_password_nonce IS NULL)
+                OR (allow_no_auth = 0 AND relay_username IS NOT NULL
+                     AND relay_password_ciphertext IS NOT NULL AND relay_password_nonce IS NOT NULL))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
+         ON socks5_rule_bindings(socks5_resource_id)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 45: SOCKS5 resources and rule bindings present");
+
+    // ── Migration 46: idempotent node traffic reports ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS traffic_report_receipts (
+            group_id INTEGER NOT NULL,
+            report_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (group_id, report_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_traffic_report_receipts_created
+         ON traffic_report_receipts(created_at)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 46: traffic report receipts present");
+
     Ok(())
 }
 
@@ -2032,6 +2198,62 @@ mod tests {
         assert_eq!(
             before, after,
             "second migration run must not duplicate seed rows"
+        );
+    }
+
+    /// SOCKS5 relay rules intentionally have no fixed target: the CONNECT
+    /// destination arrives in the inbound SOCKS5 request, so their legacy
+    /// `target_port` sentinel is zero. Migration 19 runs on every SQLite boot
+    /// and must not try to backfill that sentinel into forward_rule_targets,
+    /// whose port CHECK correctly rejects zero.
+    #[tokio::test]
+    async fn migrations_are_idempotent_with_dynamic_socks5_rule_target() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (1, 'socks-in', 'in', 'socks-token', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_resources \
+             (id, name, host, port, enabled) \
+             VALUES (1, 'upstream', '127.0.0.1', 1080, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, device_group_in, \
+              target_addr, target_port, route_mode, forward_mode) \
+             VALUES (1, 'dynamic-socks', 1, 31080, 'tcp', 1, '', 0, \
+                     'socks5', 'socks5')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_rule_bindings \
+             (rule_id, socks5_resource_id, allow_no_auth) VALUES (1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool)
+            .await
+            .expect("second boot with a dynamic SOCKS5 target must succeed");
+
+        let targets: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM forward_rule_targets WHERE rule_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            targets.0, 0,
+            "dynamic SOCKS5 rules have no fixed target row"
         );
     }
 

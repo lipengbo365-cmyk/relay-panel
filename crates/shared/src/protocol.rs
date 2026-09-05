@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 /// wire fields from ListenerConfig. A v0.4.6 node still expects those fields,
 /// so deserialization would fail or misread — the gate forces a coordinated
 /// upgrade. Also adds node_transport to the listener fingerprint.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 4;
+/// v5 = SOCKS5 relay: ListenerConfig gains explicit ingress and upstream
+/// descriptors, including short-lived runtime credentials. Older nodes cannot
+/// safely infer this behavior, so panel and node must upgrade together.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 5;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -142,6 +145,15 @@ pub struct ListenerConfig {
     pub rule_id: i64,
     pub port: u16,
     pub protocol: Protocol,
+    /// v2 SOCKS5 relay: the protocol accepted from the client. This is kept
+    /// separate from `protocol`/`node_transport` because a SOCKS5 listener is
+    /// not a transparent raw TCP listener: it must parse the client's CONNECT
+    /// request before choosing the outbound target.
+    pub ingress: IngressConfig,
+    /// How this listener establishes the outbound side. There is deliberately
+    /// no implicit fallback from Socks5 to Direct; a missing or invalid SOCKS5
+    /// configuration makes the listener fail closed.
+    pub upstream: UpstreamConfig,
     /// v0.4.7: the route_mode wire field was removed (the node never read it —
     /// direct/group are resolved identically by the panel). CONFIG_PROTOCOL_VERSION
     /// bumped to 4 so a v0.4.6 node (which expects the field) is gated.
@@ -244,6 +256,11 @@ pub fn build_listeners_for_rule(
             rule_id: rule.id,
             port: rule.listen_port as u16,
             protocol: proto,
+            ingress: match proto {
+                Protocol::Udp => IngressConfig::RawUdp,
+                Protocol::Tcp | Protocol::TcpUdp => IngressConfig::RawTcp,
+            },
+            upstream: UpstreamConfig::Direct,
             node_transport: transport,
             // Per-rule WS path override; None → node uses its built-in "/relay".
             ws_path: rule.ws_path.clone(),
@@ -267,6 +284,62 @@ pub fn build_listeners_for_rule(
             },
         })
         .collect()
+}
+
+/// A serializable secret whose Debug representation is always redacted. The
+/// value still travels in the authenticated node config, but accidental
+/// `{:?}` logging cannot disclose it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Socks5InboundAuth {
+    NoAuth,
+    UsernamePassword {
+        username: String,
+        password: SecretString,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IngressConfig {
+    RawTcp,
+    RawUdp,
+    Socks5 { auth: Socks5InboundAuth },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UpstreamConfig {
+    Direct,
+    Socks5 {
+        resource_id: i64,
+        resource_name: String,
+        host: String,
+        port: u16,
+        username: Option<String>,
+        password: Option<SecretString>,
+        remote_dns: bool,
+    },
 }
 
 /// Note: in NodeConfigResponse, a TcpUdp rule is expanded into TWO separate
@@ -445,8 +518,12 @@ impl NodeTransport {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficReport {
+    /// Stable identifier for one exact traffic delta. The node retries the
+    /// same id and payload until the panel acknowledges it, allowing the panel
+    /// to make ACK-loss retries idempotent.
+    pub report_id: String,
     pub reports: Vec<TrafficEntry>,
 }
 
@@ -1144,6 +1221,26 @@ impl<T: Serialize> ApiResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_debug_is_always_redacted() {
+        let secret = SecretString::new("must-never-appear");
+        let rendered = format!("{secret:?}");
+        assert_eq!(rendered, "***");
+        assert!(!rendered.contains(secret.expose()));
+    }
+
+    #[test]
+    fn legacy_listener_without_v5_ingress_and_upstream_is_rejected() {
+        let legacy = serde_json::json!({
+            "rule_id": 1,
+            "port": 10001,
+            "protocol": "tcp",
+            "node_transport": "raw",
+            "targets": ["127.0.0.1:80"]
+        });
+        assert!(serde_json::from_value::<ListenerConfig>(legacy).is_err());
+    }
 
     // ── PublicTransport / NodeTransport / RouteMode parsing ──
 

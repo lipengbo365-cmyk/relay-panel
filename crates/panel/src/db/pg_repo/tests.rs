@@ -5139,6 +5139,135 @@ async fn pg_traffic_history_splits_by_line() {
     cleanup(&db).await;
 }
 
+#[tokio::test]
+async fn pg_traffic_report_receipt_makes_ack_loss_retry_idempotent() {
+    let Some(db) = repo("traffic_idempotent").await else {
+        return;
+    };
+    let alice = pg_seed_history_fixture(&db, "idempotent", 170, 1300, 1.0).await;
+    let entries = [relay_shared::protocol::TrafficEntry {
+        rule_id: 1300,
+        upload: 123,
+        download: 456,
+    }];
+    for _ in 0..2 {
+        db.apply_traffic_batch_once(170, Some("same-report-id"), &entries)
+            .await
+            .unwrap();
+    }
+    let rule_used: i64 = sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id=1300")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_used: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=$1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_used, 579);
+    assert_eq!(user_used, 579);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_socks5_rule_lifecycle_is_atomic_and_preserves_credentials() {
+    let Some(db) = repo("socks5_lifecycle").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id,name,group_type,token,uid,connect_host)
+         VALUES (50,'relay-in','in','socks-token',1,'127.0.0.1')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let first = db
+        .insert_socks5_resource(
+            "first",
+            "127.0.0.1",
+            1080,
+            Some("upstream"),
+            Some("cipher-one"),
+            Some("nonce-one"),
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let second = db
+        .insert_socks5_resource(
+            "second",
+            "127.0.0.1",
+            1081,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let rule_id = db
+        .create_socks5_rule_full(
+            "before",
+            1,
+            18080,
+            50,
+            first,
+            true,
+            Some("relay-user"),
+            Some("relay-cipher"),
+            Some("relay-nonce"),
+            1,
+            false,
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        db.delete_socks5_resource(first).await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+
+    assert_eq!(
+        db.update_socks5_rule_full(rule_id, "after", 18081, 50, second, false, false)
+            .await
+            .unwrap(),
+        1
+    );
+    let binding = db.find_socks5_rule_config(rule_id).await.unwrap().unwrap();
+    assert_eq!(binding.socks5_resource_id, second);
+    assert_eq!(binding.relay_username.as_deref(), Some("relay-user"));
+    assert_eq!(
+        binding.relay_password_ciphertext.as_deref(),
+        Some("relay-cipher")
+    );
+    let view = db.list_socks5_rule_views().await.unwrap().remove(0);
+    assert_eq!(view.name, "after");
+    assert_eq!(view.listen_port, 18081);
+    assert!(view.paused);
+    assert_eq!(db.delete_socks5_resource(first).await.unwrap(), 1);
+    assert_eq!(
+        db.delete_rule(rule_id, &ResourceScope::All).await.unwrap(),
+        1
+    );
+    assert_eq!(db.delete_socks5_resource(second).await.unwrap(), 1);
+    cleanup(&db).await;
+}
+
 /// PG twin: a deleted line keeps its history (LEFT JOIN must not gate the row).
 #[tokio::test]
 async fn pg_traffic_history_survives_group_and_rule_deletion() {

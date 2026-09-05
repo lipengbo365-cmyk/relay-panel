@@ -30,7 +30,7 @@ RUN cargo build --release -p relay-node
 
 # ---- Panel runtime ----
 FROM debian:bookworm-slim AS panel
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=panel-build /app/target/release/relay-panel /app/relay-panel
@@ -40,6 +40,8 @@ EXPOSE 18888
 ENV DATABASE_URL="sqlite:/app/data/data.db?mode=rwc" \
     LISTEN="0.0.0.0:18888" \
     PUBLIC_DIR="/app/public"
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 \
+    CMD curl --fail --silent --show-error http://127.0.0.1:18888/api/v1/health >/dev/null || exit 1
 CMD ["./relay-panel"]
 
 # ---- Node runtime ----
@@ -48,7 +50,8 @@ FROM debian:bookworm-slim AS node
 # IPv4 address when OUTBOUND_INTERFACE is set. Without it, multi-NIC egress
 # selection by interface name would fail. ca-certificates is for HTTPS to the
 # panel.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 && \
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates iproute2 && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=node-build /app/target/release/relay-node /app/relay-node
@@ -65,7 +68,7 @@ ENTRYPOINT ["./relay-node"]
 # produce `linux/amd64` and `linux/arm64` images from their respective native
 # runners without QEMU or cross-compilation toolchains.
 FROM debian:bookworm-slim AS panel-release
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY release-dist/panel/relay-panel /app/relay-panel
@@ -76,4 +79,6 @@ EXPOSE 18888
 ENV DATABASE_URL="sqlite:/app/data/data.db?mode=rwc" \
     LISTEN="0.0.0.0:18888" \
     PUBLIC_DIR="/app/public"
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 \
+    CMD curl --fail --silent --show-error http://127.0.0.1:18888/api/v1/health >/dev/null || exit 1
 CMD ["./relay-panel"]

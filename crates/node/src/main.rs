@@ -268,6 +268,15 @@ async fn run() {
                 }
             }
             poller::FetchResult::ProtocolMismatch => {
+                // A mismatched panel cannot authoritatively describe v5
+                // ingress/upstream semantics. Drop every current listener;
+                // retaining a v5 SOCKS listener here would keep forwarding
+                // after a panel downgrade, defeating the version gate.
+                let mut mgr = manager.lock().await;
+                mgr.apply_config(&relay_shared::protocol::NodeConfigResponse {
+                    listeners: Vec::new(),
+                })
+                .await;
                 // Permanent: upgrade required. Switch to a long interval if we
                 // haven't already (avoids re-logging every tick).
                 if !in_mismatch_backoff {

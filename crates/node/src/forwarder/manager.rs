@@ -1,13 +1,15 @@
 use super::gate::RuleRuntime;
 use super::limiter::RateLimit;
 use super::selector::TargetSelector;
+use super::socks5_inbound;
 use super::tcp;
 use super::tls;
 use super::udp;
 use super::ws;
 use crate::reporter::{ConnectionTracker, TrafficCounter};
 use relay_shared::protocol::{
-    ListenerConfig, ListenerError, LoadBalanceStrategy, NodeConfigResponse, NodeTransport, Protocol,
+    IngressConfig, ListenerConfig, ListenerError, LoadBalanceStrategy, NodeConfigResponse,
+    NodeTransport, Protocol, UpstreamConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -50,6 +52,8 @@ type ListenerKey = (u16, Protocol, NodeTransport);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ListenerFingerprint {
     rule_id: i64,
+    ingress: IngressConfig,
+    upstream: UpstreamConfig,
     targets: Vec<String>,
     ws_path: Option<String>,
     /// v0.4.6: a strategy change must restart the listener so the new selector
@@ -79,6 +83,8 @@ impl ListenerFingerprint {
     fn from_listener(l: &ListenerConfig) -> Self {
         Self {
             rule_id: l.rule_id,
+            ingress: l.ingress.clone(),
+            upstream: l.upstream.clone(),
             targets: l.targets.clone(),
             ws_path: l.ws_path.clone(),
             load_balance_strategy: l.load_balance_strategy,
@@ -359,6 +365,8 @@ impl ForwarderManager {
             let ip_v4 = crate::forwarder::outbound::parse_listen_ip(&self.listen_ipv4);
             let ip_v6 = crate::forwarder::outbound::parse_listen_ip(&self.listen_ipv6);
             let targets = listener.targets.clone();
+            let ingress = listener.ingress.clone();
+            let upstream = listener.upstream.clone();
             // v0.4.6: one selector per listener, shared across all of its
             // connections/sessions so a round-robin cursor advances globally.
             let selector = Arc::new(TargetSelector::new(
@@ -396,6 +404,22 @@ impl ForwarderManager {
                     listener.node_transport,
                     port
                 );
+                continue;
+            }
+            let socks5_pair = matches!(listener.ingress, IngressConfig::Socks5 { .. })
+                && matches!(listener.upstream, UpstreamConfig::Socks5 { .. });
+            let direct_pair = matches!(listener.ingress, IngressConfig::RawTcp)
+                && matches!(listener.upstream, UpstreamConfig::Direct);
+            if listener.protocol == Protocol::Tcp && !socks5_pair && !direct_pair {
+                tracing::error!(
+                    rule_id,
+                    "invalid ingress/upstream pairing; TCP listener skipped"
+                );
+                errors.lock().await.push(ListenerError {
+                    port,
+                    protocol: proto_str.clone(),
+                    error: "invalid ingress/upstream pairing".into(),
+                });
                 continue;
             }
             // v1.0.8: WS / TLS entry transports are DISABLED at runtime. The
@@ -495,6 +519,8 @@ impl ForwarderManager {
                         continue;
                     }
                     let tgt = targets.clone();
+                    let ing = ingress.clone();
+                    let ups = upstream.clone();
                     let sel = selector.clone();
                     let rl = rate_limit.clone();
                     let ctr = counter.clone();
@@ -512,17 +538,19 @@ impl ForwarderManager {
                     let gate6 = gate4.clone();
                     tokio::spawn(async move {
                         type SrvResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
-                        let (tgt4, sel4, rl4, ctr4, cn4) = (
+                        let (tgt4, sel4, rl4, ctr4, cn4, ing4, ups4) = (
                             tgt.clone(),
                             sel.clone(),
                             rl.clone(),
                             ctr.clone(),
                             cn.clone(),
+                            ing.clone(),
+                            ups.clone(),
                         );
                         let v4_fut = async move {
                             if let Some(l) = v4_listener {
-                                tcp::serve_tcp_listener(
-                                    l, tgt4, sel4, rl4, ctr4, cn4, rid, ipv4_src, gate4,
+                                serve_bound_tcp(
+                                    l, ing4, ups4, tgt4, sel4, rl4, ctr4, cn4, rid, ipv4_src, gate4,
                                 )
                                 .await
                             } else {
@@ -531,8 +559,8 @@ impl ForwarderManager {
                         };
                         let v6_fut = async move {
                             if let Some(l) = v6_listener {
-                                tcp::serve_tcp_listener(
-                                    l, tgt, sel, rl, ctr, cn, rid, ipv4_src, gate6,
+                                serve_bound_tcp(
+                                    l, ing, ups, tgt, sel, rl, ctr, cn, rid, ipv4_src, gate6,
                                 )
                                 .await
                             } else {
@@ -837,6 +865,53 @@ impl ForwarderManager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn serve_bound_tcp(
+    listener: tokio::net::TcpListener,
+    ingress: IngressConfig,
+    upstream: UpstreamConfig,
+    targets: Vec<String>,
+    selector: Arc<TargetSelector>,
+    rate_limit: RateLimit,
+    counter: Arc<TrafficCounter>,
+    connections: Arc<ConnectionTracker>,
+    rule_id: i64,
+    source_ipv4: Option<std::net::Ipv4Addr>,
+    gate: super::gate::RuleGate,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match (ingress, upstream) {
+        (IngressConfig::RawTcp, UpstreamConfig::Direct) => {
+            tcp::serve_tcp_listener(
+                listener,
+                targets,
+                selector,
+                rate_limit,
+                counter,
+                connections,
+                rule_id,
+                source_ipv4,
+                gate,
+            )
+            .await
+        }
+        (IngressConfig::Socks5 { auth }, upstream @ UpstreamConfig::Socks5 { .. }) => {
+            socks5_inbound::serve_socks5_listener(
+                listener,
+                auth,
+                upstream,
+                rate_limit,
+                counter,
+                connections,
+                rule_id,
+                source_ipv4,
+                gate,
+            )
+            .await
+        }
+        _ => Err("unsupported TCP ingress/upstream pairing".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +940,8 @@ mod tests {
                 rule_id: 1,
                 port,
                 protocol: proto,
+                ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                upstream: relay_shared::protocol::UpstreamConfig::Direct,
                 node_transport: transport,
                 ws_path: None,
                 targets: vec!["127.0.0.1:1".into()],
@@ -888,6 +965,8 @@ mod tests {
                 rule_id: 1,
                 port,
                 protocol: proto,
+                ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                upstream: relay_shared::protocol::UpstreamConfig::Direct,
                 node_transport: transport,
                 ws_path: ws_path.map(str::to_string),
                 targets: targets.into_iter().map(String::from).collect(),
@@ -1150,6 +1229,8 @@ mod tests {
                     rule_id: 1,
                     port: 40001,
                     protocol: Protocol::Tcp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
@@ -1162,6 +1243,8 @@ mod tests {
                     rule_id: 2,
                     port: 40002,
                     protocol: Protocol::Udp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
@@ -1230,6 +1313,8 @@ mod tests {
                     rule_id: 1,
                     port: 40050,
                     protocol: Protocol::Tcp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
@@ -1242,6 +1327,8 @@ mod tests {
                     rule_id: 2,
                     port: 40050,
                     protocol: Protocol::Udp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
@@ -1363,6 +1450,8 @@ mod tests {
                 rule_id: 1,
                 port: 40065,
                 protocol: Protocol::Tcp,
+                ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                upstream: relay_shared::protocol::UpstreamConfig::Direct,
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
                 targets: vec!["127.0.0.1:9".into(), "127.0.0.1:10".into()],
@@ -1396,6 +1485,8 @@ mod tests {
                 rule_id: 1,
                 port: 40066,
                 protocol: Protocol::Tcp,
+                ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                upstream: relay_shared::protocol::UpstreamConfig::Direct,
                 node_transport: transport,
                 ws_path: None,
                 targets: vec!["127.0.0.1:9".into()],
@@ -1447,6 +1538,62 @@ mod tests {
         assert!(mgr.listener_keys().is_empty(), "removed rule must stop");
     }
 
+    /// A disabled SOCKS5 relay rule disappears from panel config. Applying the
+    /// empty snapshot must release its listener before another client can begin
+    /// a handshake; keeping the old listener alive would bypass the admin
+    /// switch until the node restarted.
+    #[tokio::test]
+    async fn removed_socks5_rule_refuses_new_connections() {
+        use relay_shared::protocol::{SecretString, Socks5InboundAuth};
+
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+
+        let mut mgr = fresh_mgr();
+        mgr.listen_ipv6 = String::new();
+        let config = NodeConfigResponse {
+            listeners: vec![ListenerConfig {
+                rule_id: 700,
+                port,
+                protocol: Protocol::Tcp,
+                ingress: IngressConfig::Socks5 {
+                    auth: Socks5InboundAuth::UsernamePassword {
+                        username: "relay-user".into(),
+                        password: SecretString::new("relay-password"),
+                    },
+                },
+                upstream: UpstreamConfig::Socks5 {
+                    resource_id: 9,
+                    resource_name: "test".into(),
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                    username: None,
+                    password: None,
+                    remote_dns: true,
+                },
+                node_transport: NodeTransport::Raw,
+                ws_path: None,
+                targets: vec![],
+                load_balance_strategy: LoadBalanceStrategy::First,
+                upload_limit_bps: None,
+                download_limit_bps: None,
+                max_connections: None,
+            }],
+        };
+        mgr.apply_config(&config).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok());
+
+        mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
+            .await;
+        assert!(mgr.listener_keys().is_empty());
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err());
+    }
+
     /// Changing a field that does NOT affect runtime (here: rule_id on a port
     /// that isn't running yet — simulating an unrelated rule) must not restart
     /// an existing, unchanged listener on a different port.
@@ -1459,6 +1606,8 @@ mod tests {
                     rule_id: 1,
                     port: 40070,
                     protocol: Protocol::Tcp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:9".into()],
@@ -1471,6 +1620,8 @@ mod tests {
                     rule_id: 2,
                     port: 40071,
                     protocol: Protocol::Tcp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:9".into()],
@@ -1492,6 +1643,8 @@ mod tests {
                     rule_id: 1,
                     port: 40070,
                     protocol: Protocol::Tcp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:9".into()],
@@ -1504,6 +1657,8 @@ mod tests {
                     rule_id: 2,
                     port: 40071,
                     protocol: Protocol::Tcp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:10".into()], // changed
@@ -1559,6 +1714,8 @@ mod tests {
                 handle: finished_handle,
                 fingerprint: ListenerFingerprint {
                     rule_id: 1,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     targets: vec!["stale".into()],
                     ws_path: None,
                     load_balance_strategy: LoadBalanceStrategy::First,
@@ -1619,6 +1776,8 @@ mod tests {
                 handle: mk_live_handle(),
                 fingerprint: ListenerFingerprint {
                     rule_id: 7,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     targets: vec!["tcp-target".into()],
                     ws_path: None,
                     load_balance_strategy: LoadBalanceStrategy::First,
@@ -1635,6 +1794,8 @@ mod tests {
                 handle: mk_live_handle(),
                 fingerprint: ListenerFingerprint {
                     rule_id: 7,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     targets: vec!["udp-target".into()],
                     ws_path: None,
                     load_balance_strategy: LoadBalanceStrategy::First,
@@ -1674,6 +1835,8 @@ mod tests {
                 handle: live_handle,
                 fingerprint: ListenerFingerprint {
                     rule_id: 9,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     targets: vec!["udp-target".into()],
                     ws_path: None,
                     load_balance_strategy: LoadBalanceStrategy::First,
@@ -1770,6 +1933,8 @@ mod tests {
                     rule_id: 1,
                     port: 40004,
                     protocol: Protocol::Tcp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
@@ -1782,6 +1947,8 @@ mod tests {
                     rule_id: 1,
                     port: 40004,
                     protocol: Protocol::Udp,
+                    ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                    upstream: relay_shared::protocol::UpstreamConfig::Direct,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
@@ -1802,6 +1969,8 @@ mod tests {
                 rule_id: 1,
                 port: 40004,
                 protocol: Protocol::Tcp,
+                ingress: relay_shared::protocol::IngressConfig::RawTcp,
+                upstream: relay_shared::protocol::UpstreamConfig::Direct,
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
                 targets: vec!["127.0.0.1:2".into()],

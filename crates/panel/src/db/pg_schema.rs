@@ -160,6 +160,55 @@ CREATE TABLE IF NOT EXISTS forward_rule_targets (
 CREATE INDEX IF NOT EXISTS idx_forward_rule_targets_rule_position
     ON forward_rule_targets (rule_id, position);
 
+CREATE TABLE IF NOT EXISTS socks5_resources (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+    username TEXT,
+    password_ciphertext TEXT,
+    password_nonce TEXT,
+    password_key_version INTEGER NOT NULL DEFAULT 1,
+    country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+    isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'UNKNOWN'
+        CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_check_at TEXT, last_success_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+        OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+    UNIQUE(host, port, username)
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter
+    ON socks5_resources(enabled, status, country_code);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
+    ON socks5_resources(host, port, COALESCE(username, ''));
+
+CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
+    rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+    socks5_resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+    remote_dns BOOLEAN NOT NULL DEFAULT TRUE,
+    relay_username TEXT,
+    relay_password_ciphertext TEXT,
+    relay_password_nonce TEXT,
+    relay_password_key_version INTEGER NOT NULL DEFAULT 1,
+    allow_no_auth BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    CHECK ((allow_no_auth = TRUE AND relay_username IS NULL
+             AND relay_password_ciphertext IS NULL AND relay_password_nonce IS NULL)
+        OR (allow_no_auth = FALSE AND relay_username IS NOT NULL
+             AND relay_password_ciphertext IS NOT NULL AND relay_password_nonce IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
+    ON socks5_rule_bindings(socks5_resource_id);
+
 CREATE TABLE IF NOT EXISTS statistics (
     id BIGSERIAL PRIMARY KEY,
     stat_type TEXT NOT NULL,
@@ -215,6 +264,15 @@ CREATE TABLE IF NOT EXISTS traffic_history (
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts);
 CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts);
+
+CREATE TABLE IF NOT EXISTS traffic_report_receipts (
+    group_id BIGINT NOT NULL,
+    report_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    PRIMARY KEY (group_id, report_id)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_report_receipts_created
+    ON traffic_report_receipts(created_at);
 
 -- v1.2.4: hourly node metrics (mirrors the SQLite baseline — see there for why
 -- sum+samples+max instead of a running average, and why there is no FK).
@@ -379,7 +437,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 27;
+pub const PG_SCHEMA_VERSION: i32 = 29;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1444,6 +1502,93 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
             "PG migration 27: announcements table present ({} carried over from site config)",
             carried
         );
+    }
+
+    if current < 28 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_resources (
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL,
+                port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+                username TEXT, password_ciphertext TEXT, password_nonce TEXT,
+                password_key_version INTEGER NOT NULL DEFAULT 1,
+                country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+                isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'UNKNOWN'
+                    CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_check_at TEXT, last_success_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+                    OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+                UNIQUE(host, port, username)
+            )",
+        ).execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter ON socks5_resources(enabled, status, country_code)")
+            .execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth ON socks5_resources(host, port, COALESCE(username, ''))")
+            .execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
+                rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+                socks5_resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+                remote_dns BOOLEAN NOT NULL DEFAULT TRUE,
+                relay_username TEXT, relay_password_ciphertext TEXT, relay_password_nonce TEXT,
+                relay_password_key_version INTEGER NOT NULL DEFAULT 1,
+                allow_no_auth BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                CHECK ((allow_no_auth = TRUE AND relay_username IS NULL
+                         AND relay_password_ciphertext IS NULL AND relay_password_nonce IS NULL)
+                    OR (allow_no_auth = FALSE AND relay_username IS NOT NULL
+                         AND relay_password_ciphertext IS NOT NULL AND relay_password_nonce IS NOT NULL))
+            )",
+        ).execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource ON socks5_rule_bindings(socks5_resource_id)")
+            .execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (28) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 28: SOCKS5 resources and rule bindings present");
+    }
+
+    if current < 29 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS traffic_report_receipts (
+                group_id BIGINT NOT NULL,
+                report_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                PRIMARY KEY (group_id, report_id)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_traffic_report_receipts_created
+             ON traffic_report_receipts(created_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (29) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 29: traffic report receipts present");
     }
 
     Ok(())

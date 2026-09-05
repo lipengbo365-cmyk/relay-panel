@@ -7,6 +7,48 @@ export interface ApiEnvelope<T> {
   data: T | null;
 }
 
+export interface Socks5Resource {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  username_masked: string | null;
+  has_password: boolean;
+  country: string;
+  country_code: string;
+  region: string;
+  city: string;
+  isp: string;
+  remark: string;
+  status: 'ONLINE' | 'OFFLINE' | 'AUTH_FAILED' | 'TIMEOUT' | 'DISABLED' | 'UNKNOWN';
+  enabled: boolean;
+  detected_exit_ip: string | null;
+  detected_country: string | null;
+  latency_ms: number | null;
+  consecutive_failures: number;
+  last_check_at: string | null;
+  last_success_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Socks5RelayRule {
+  rule_id: number;
+  name: string;
+  listen_port: number;
+  device_group_in: number;
+  proxy_address: string;
+  paused: boolean;
+  traffic_used: number;
+  socks5_resource_id: number;
+  resource_name: string;
+  detected_exit_ip: string | null;
+  relay_username_masked: string | null;
+  allow_no_auth: boolean;
+  remote_dns: boolean;
+  created_at: string;
+}
+
 export interface User {
   id: number;
   username: string;
