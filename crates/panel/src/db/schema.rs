@@ -213,6 +213,7 @@ CREATE TABLE IF NOT EXISTS socks5_resources (
     city TEXT NOT NULL DEFAULT '',
     isp TEXT NOT NULL DEFAULT '',
     remark TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'UNKNOWN'
         CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
     enabled INTEGER NOT NULL DEFAULT 1,
@@ -256,6 +257,77 @@ CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
 
 CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
     ON socks5_rule_bindings(socks5_resource_id);
+
+-- A physical relay-node identity. KVS remains the real-time metrics store;
+-- this table provides stable relational ids for health checks and metadata.
+CREATE TABLE IF NOT EXISTS relay_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    node_key TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT '',
+    country_code TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    public_ip TEXT NOT NULL DEFAULT '',
+    bandwidth_mbps INTEGER NOT NULL DEFAULT 0,
+    remark TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(device_group_id, node_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id);
+CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled);
+
+CREATE TABLE IF NOT EXISTS socks5_resource_health (
+    resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN
+        ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+    tcp_latency_ms INTEGER,
+    handshake_latency_ms INTEGER,
+    connect_latency_ms INTEGER,
+    total_latency_ms INTEGER,
+    exit_ip TEXT,
+    country TEXT,
+    error_stage TEXT,
+    error_code TEXT,
+    safe_error_message TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    checked_at TEXT NOT NULL,
+    last_success_at TEXT,
+    PRIMARY KEY(resource_id, relay_node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_health_node_status
+    ON socks5_resource_health(relay_node_id, status, checked_at);
+CREATE INDEX IF NOT EXISTS idx_socks5_health_exit_ip
+    ON socks5_resource_health(exit_ip);
+
+CREATE TABLE IF NOT EXISTS socks5_check_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    tcp_latency_ms INTEGER,
+    handshake_latency_ms INTEGER,
+    connect_latency_ms INTEGER,
+    total_latency_ms INTEGER,
+    exit_ip TEXT,
+    country TEXT,
+    error_stage TEXT,
+    error_code TEXT,
+    safe_error_message TEXT,
+    checked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node
+    ON socks5_check_history(resource_id, relay_node_id, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at
+    ON socks5_check_history(checked_at);
 
 CREATE TABLE IF NOT EXISTS statistics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1959,6 +2031,75 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .execute(pool)
     .await?;
     tracing::info!("Migration 46: traffic report receipts present");
+
+    // ── Migration 47: relay-node inventory + per-node SOCKS5 health ──
+    add_column_if_missing(
+        pool,
+        "socks5_resources",
+        "tags",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS relay_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+            node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+            country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+            region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
+            bandwidth_mbps INTEGER NOT NULL DEFAULT 0, remark TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1,
+            first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(device_group_id, node_key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_resource_health (
+            resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+            relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+            tcp_latency_ms INTEGER, handshake_latency_ms INTEGER, connect_latency_ms INTEGER,
+            total_latency_ms INTEGER, exit_ip TEXT, country TEXT, error_stage TEXT,
+            error_code TEXT, safe_error_message TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            checked_at TEXT NOT NULL, last_success_at TEXT,
+            PRIMARY KEY(resource_id, relay_node_id)
+        )",
+    ).execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_health_node_status ON socks5_resource_health(relay_node_id, status, checked_at)").execute(pool).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_socks5_health_exit_ip ON socks5_resource_health(exit_ip)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_check_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+            relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+            status TEXT NOT NULL, tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
+            connect_latency_ms INTEGER, total_latency_ms INTEGER, exit_ip TEXT, country TEXT,
+            error_stage TEXT, error_code TEXT, safe_error_message TEXT, checked_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node ON socks5_check_history(resource_id, relay_node_id, checked_at DESC)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at ON socks5_check_history(checked_at)").execute(pool).await?;
+    tracing::info!("Migration 47: relay nodes and SOCKS5 health tables present");
 
     Ok(())
 }

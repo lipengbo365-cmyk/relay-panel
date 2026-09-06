@@ -1741,6 +1741,7 @@ name = "relay-node"
 version = "1.2.3"
 dependencies = [
  "async-trait",
+ "chrono",
  "dashmap",
  "futures-util",
  "libc",
@@ -1748,6 +1749,7 @@ dependencies = [
  "relay-shared",
  "reqwest",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "semver",
  "serde",

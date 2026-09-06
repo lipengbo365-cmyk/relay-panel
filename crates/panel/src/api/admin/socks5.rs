@@ -143,7 +143,7 @@ pub async fn list_socks5_resources(
 }
 
 pub async fn create_socks5_resource(
-    _admin: AdminOnly,
+    admin: AdminOnly,
     State(state): State<AppState>,
     Json(req): Json<CreateSocks5ResourceRequest>,
 ) -> Json<ApiResponse<Socks5ResourcePublic>> {
@@ -203,7 +203,18 @@ pub async fn create_socks5_resource(
     };
 
     match state.db.find_socks5_resource(id).await {
-        Ok(Some(row)) => Json(ApiResponse::success(row.into())),
+        Ok(Some(row)) => {
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "socks5_resource_create",
+                "socks5_resource",
+                id,
+                "resource created",
+            )
+            .await;
+            Json(ApiResponse::success(row.into()))
+        }
         Ok(None) => Json(err(500, "创建后读取 SOCKS5 资源失败")),
         Err(e) => {
             tracing::error!("read created SOCKS5 resource {id}: {e}");
@@ -228,7 +239,7 @@ pub async fn get_socks5_resource(
 }
 
 pub async fn update_socks5_resource(
-    _admin: AdminOnly,
+    admin: AdminOnly,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateSocks5ResourceRequest>,
@@ -253,6 +264,7 @@ pub async fn update_socks5_resource(
         None => current.username,
     };
     let supplied_password = normalize_optional(req.password);
+    let credential_changed = req.clear_password || supplied_password.is_some();
     let (ciphertext, nonce, key_version) = if req.clear_password {
         (None, None, 1)
     } else if let Some(password) = supplied_password.as_deref() {
@@ -313,11 +325,35 @@ pub async fn update_socks5_resource(
         }
     }
     broadcast_config_changed(&state).await;
-    get_socks5_resource(_admin, State(state), Path(id)).await
+    crate::service::audit::record(
+        &state,
+        Some(admin.user_id),
+        if credential_changed {
+            "socks5_resource_credential_update"
+        } else {
+            "socks5_resource_update"
+        },
+        "socks5_resource",
+        id,
+        if credential_changed {
+            "metadata and credential updated"
+        } else {
+            "metadata updated"
+        },
+    )
+    .await;
+    get_socks5_resource(
+        AdminOnly {
+            user_id: admin.user_id,
+        },
+        State(state),
+        Path(id),
+    )
+    .await
 }
 
 pub async fn set_socks5_resource_enabled(
-    _admin: AdminOnly,
+    admin: AdminOnly,
     State(state): State<AppState>,
     Path((id, enabled)): Path<(i64, bool)>,
 ) -> Json<ApiResponse<()>> {
@@ -325,6 +361,19 @@ pub async fn set_socks5_resource_enabled(
         Ok(0) => Json(err(404, "SOCKS5 资源不存在")),
         Ok(_) => {
             broadcast_config_changed(&state).await;
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                if enabled {
+                    "socks5_resource_enable"
+                } else {
+                    "socks5_resource_disable"
+                },
+                "socks5_resource",
+                id,
+                if enabled { "enabled" } else { "disabled" },
+            )
+            .await;
             Json(ApiResponse::success(()))
         }
         Err(e) => {
@@ -335,7 +384,7 @@ pub async fn set_socks5_resource_enabled(
 }
 
 pub async fn delete_socks5_resource(
-    _admin: AdminOnly,
+    admin: AdminOnly,
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
@@ -351,7 +400,18 @@ pub async fn delete_socks5_resource(
     }
     match state.db.delete_socks5_resource(id).await {
         Ok(0) => Json(err(404, "SOCKS5 资源不存在")),
-        Ok(_) => Json(ApiResponse::success(())),
+        Ok(_) => {
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "socks5_resource_delete",
+                "socks5_resource",
+                id,
+                "resource deleted",
+            )
+            .await;
+            Json(ApiResponse::success(()))
+        }
         Err(DbError::ForeignKeyViolation) => Json(err(409, "资源仍被规则使用")),
         Err(e) => {
             tracing::error!("delete_socks5_resource {id}: {e}");

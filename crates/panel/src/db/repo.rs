@@ -48,6 +48,7 @@ pub struct Socks5ResourceRecord {
     pub city: String,
     pub isp: String,
     pub remark: String,
+    pub tags: String,
     pub status: String,
     pub enabled: bool,
     pub detected_exit_ip: Option<String>,
@@ -58,6 +59,106 @@ pub struct Socks5ResourceRecord {
     pub last_success_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone)]
+pub struct BulkSocks5Resource {
+    pub name: String,
+    pub host: String,
+    pub port: i32,
+    pub username: Option<String>,
+    pub password_ciphertext: Option<String>,
+    pub password_nonce: Option<String>,
+    pub password_key_version: i32,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct BulkImportOutcome {
+    pub created: usize,
+    pub updated: usize,
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Socks5ResourceQuery {
+    pub search: Option<String>,
+    pub status: Option<String>,
+    pub country: Option<String>,
+    pub detected_country: Option<String>,
+    pub tag: Option<String>,
+    pub enabled: Option<bool>,
+    pub sort: String,
+    pub descending: bool,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct RelayNodeRecord {
+    pub id: i64,
+    pub device_group_id: i64,
+    pub node_key: String,
+    pub name: String,
+    pub country: String,
+    pub country_code: String,
+    pub region: String,
+    pub city: String,
+    pub provider: String,
+    pub public_ip: String,
+    pub bandwidth_mbps: i32,
+    pub remark: String,
+    pub tags: String,
+    pub enabled: bool,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct Socks5HealthRecord {
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub status: String,
+    pub tcp_latency_ms: Option<i32>,
+    pub handshake_latency_ms: Option<i32>,
+    pub connect_latency_ms: Option<i32>,
+    pub total_latency_ms: Option<i32>,
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub error_stage: Option<String>,
+    pub error_code: Option<String>,
+    pub safe_error_message: Option<String>,
+    pub consecutive_failures: i32,
+    pub checked_at: String,
+    pub last_success_at: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5LatestHealthRecord {
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub relay_node_name: String,
+    pub status: String,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct Socks5CheckHistoryRecord {
+    pub id: i64,
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub status: String,
+    pub tcp_latency_ms: Option<i32>,
+    pub handshake_latency_ms: Option<i32>,
+    pub connect_latency_ms: Option<i32>,
+    pub total_latency_ms: Option<i32>,
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub error_stage: Option<String>,
+    pub error_code: Option<String>,
+    pub safe_error_message: Option<String>,
+    pub checked_at: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -521,6 +622,23 @@ pub trait Socks5Repository: Send + Sync {
     ) -> Result<i64, DbError>;
 
     async fn list_socks5_resources(&self) -> Result<Vec<Socks5ResourceRecord>, DbError>;
+    async fn query_socks5_resources(
+        &self,
+        query: &Socks5ResourceQuery,
+    ) -> Result<(Vec<Socks5ResourceRecord>, i64), DbError>;
+    async fn list_latest_socks5_health_for_resources(
+        &self,
+        resource_ids: &[i64],
+    ) -> Result<Vec<Socks5LatestHealthRecord>, DbError>;
+    async fn find_socks5_resources_by_keys(
+        &self,
+        keys: &[(String, i32, Option<String>)],
+    ) -> Result<Vec<Socks5ResourceRecord>, DbError>;
+    async fn bulk_import_socks5_resources(
+        &self,
+        rows: &[BulkSocks5Resource],
+        update_credentials: bool,
+    ) -> Result<BulkImportOutcome, DbError>;
     async fn find_socks5_resource(&self, id: i64) -> Result<Option<Socks5ResourceRecord>, DbError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -544,6 +662,22 @@ pub trait Socks5Repository: Send + Sync {
     ) -> Result<u64, DbError>;
 
     async fn set_socks5_resource_enabled(&self, id: i64, enabled: bool) -> Result<u64, DbError>;
+    async fn bulk_set_socks5_resources_enabled(
+        &self,
+        ids: &[i64],
+        enabled: bool,
+    ) -> Result<u64, DbError>;
+    async fn bulk_set_socks5_resource_tags(
+        &self,
+        ids: &[i64],
+        tags_json: &str,
+    ) -> Result<u64, DbError>;
+    /// Deletes only unreferenced resources atomically and returns
+    /// (deleted_count, resource/rule blockers).
+    async fn bulk_delete_socks5_resources_guarded(
+        &self,
+        ids: &[i64],
+    ) -> Result<(u64, Vec<(i64, i64)>), DbError>;
     async fn delete_socks5_resource(&self, id: i64) -> Result<u64, DbError>;
     async fn count_socks5_resource_bindings(&self, id: i64) -> Result<i64, DbError>;
     async fn find_socks5_rule_config(
@@ -592,6 +726,43 @@ pub trait Socks5Repository: Send + Sync {
         relay_password_nonce: &str,
         relay_password_key_version: i32,
     ) -> Result<u64, DbError>;
+
+    async fn upsert_relay_node_seen(
+        &self,
+        device_group_id: i64,
+        node_key: &str,
+        public_ip: &str,
+        seen_at: &str,
+    ) -> Result<i64, DbError>;
+    async fn list_relay_nodes(&self) -> Result<Vec<RelayNodeRecord>, DbError>;
+    async fn find_relay_node(&self, id: i64) -> Result<Option<RelayNodeRecord>, DbError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn update_relay_node(
+        &self,
+        id: i64,
+        name: &str,
+        country: &str,
+        country_code: &str,
+        region: &str,
+        city: &str,
+        provider: &str,
+        bandwidth_mbps: i32,
+        remark: &str,
+        tags: &str,
+        enabled: bool,
+    ) -> Result<u64, DbError>;
+    async fn record_socks5_health(&self, health: &Socks5HealthRecord) -> Result<(), DbError>;
+    async fn list_socks5_health(
+        &self,
+        resource_id: i64,
+    ) -> Result<Vec<Socks5HealthRecord>, DbError>;
+    async fn list_socks5_check_history(
+        &self,
+        resource_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Socks5CheckHistoryRecord>, DbError>;
+    async fn prune_socks5_check_history(&self, cutoff: &str) -> Result<u64, DbError>;
 }
 
 // ── Group (device_groups) ──

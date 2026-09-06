@@ -608,6 +608,9 @@ pub struct StatusReport {
     /// panel treats a missing value as "incompatible — upgrade".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_protocol_version: Option<u32>,
+    /// Stage 3 low-priority SOCKS5 health-check tasks waiting for a permit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socks5_check_queue_depth: Option<u32>,
     /// Listeners that failed to bind on the node during the last config apply
     /// (e.g. port already in use, permission denied). Surfaced on the panel so
     /// an operator can see WHY a rule isn't forwarding, not just that it isn't.
@@ -837,6 +840,115 @@ pub struct DiagnoseResult {
     /// Per-target probe results (max 32, matching the rule target cap).
     #[serde(default)]
     pub results: Vec<DiagnoseTargetResult>,
+}
+
+// === Stage 3: directed SOCKS5 health checks ===
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Socks5HealthStatus {
+    Online,
+    Offline,
+    AuthFailed,
+    Timeout,
+    ConnectFailed,
+    Disabled,
+    Unknown,
+}
+
+impl Socks5HealthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "ONLINE",
+            Self::Offline => "OFFLINE",
+            Self::AuthFailed => "AUTH_FAILED",
+            Self::Timeout => "TIMEOUT",
+            Self::ConnectFailed => "CONNECT_FAILED",
+            Self::Disabled => "DISABLED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Socks5CheckStage {
+    TcpConnect,
+    Socks5Negotiation,
+    Authentication,
+    Socks5Connect,
+    InternetRequest,
+    ExitIpParse,
+}
+
+impl Socks5CheckStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TcpConnect => "TCP_CONNECT",
+            Self::Socks5Negotiation => "SOCKS5_NEGOTIATION",
+            Self::Authentication => "AUTHENTICATION",
+            Self::Socks5Connect => "SOCKS5_CONNECT",
+            Self::InternetRequest => "INTERNET_REQUEST",
+            Self::ExitIpParse => "EXIT_IP_PARSE",
+        }
+    }
+}
+
+/// Panel → one physical Node. Password Debug is redacted by SecretString and
+/// the command is never written to the Node's disk cache.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Socks5CheckRequest {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    pub challenge: String,
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub node_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<SecretString>,
+    pub check_urls: Vec<String>,
+    pub relay_public_ip: Option<String>,
+}
+
+impl std::fmt::Debug for Socks5CheckRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Socks5CheckRequest")
+            .field("request_id", &self.request_id)
+            .field("resource_id", &self.resource_id)
+            .field("relay_node_id", &self.relay_node_id)
+            .field("node_id", &self.node_id)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username.as_ref().map(|_| "***"))
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("check_urls", &self.check_urls)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Socks5CheckResult {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    pub challenge: String,
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub node_id: String,
+    pub status: Socks5HealthStatus,
+    pub tcp_latency_ms: Option<u64>,
+    pub handshake_latency_ms: Option<u64>,
+    pub connect_latency_ms: Option<u64>,
+    pub total_latency_ms: Option<u64>,
+    pub exit_ip: Option<String>,
+    pub detected_country: Option<String>,
+    pub error_stage: Option<Socks5CheckStage>,
+    pub error_code: Option<String>,
+    pub safe_error_message: Option<String>,
+    pub checked_at: String,
 }
 
 /// Compare a reported node_version against "0.4.9". Returns true if the node
@@ -1228,6 +1340,28 @@ mod tests {
         let rendered = format!("{secret:?}");
         assert_eq!(rendered, "***");
         assert!(!rendered.contains(secret.expose()));
+    }
+
+    #[test]
+    fn socks5_check_request_debug_redacts_credentials() {
+        let request = Socks5CheckRequest {
+            msg_type: "socks5_check".into(),
+            request_id: "request".into(),
+            challenge: "challenge".into(),
+            resource_id: 1,
+            relay_node_id: 2,
+            node_id: "node-a".into(),
+            host: "proxy.example".into(),
+            port: 1080,
+            username: Some("secret-user".into()),
+            password: Some(SecretString::new("secret-password")),
+            check_urls: vec!["https://api.ipify.org".into()],
+            relay_public_ip: None,
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("secret-user"));
+        assert!(!rendered.contains("secret-password"));
+        assert!(rendered.contains("***"));
     }
 
     #[test]

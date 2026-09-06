@@ -19,6 +19,10 @@ pub struct NodeConfig {
     pub outbound_interface: String,
     /// v1.0.4: Exact IPv4 source for outbound connections.
     pub outbound_bind_ipv4: Option<String>,
+    /// Stage 3 health checks are isolated from forwarding by their own bounded
+    /// semaphore and queue. They never consume RuleGate permits.
+    pub socks5_check_concurrency: usize,
+    pub socks5_check_queue_limit: usize,
 }
 
 impl NodeConfig {
@@ -61,6 +65,16 @@ impl NodeConfig {
             outbound_bind_ipv4: std::env::var("OUTBOUND_BIND_IPV4")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            socks5_check_concurrency: std::env::var("SOCKS5_CHECK_CONCURRENCY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(50)
+                .clamp(1, 500),
+            socks5_check_queue_limit: std::env::var("SOCKS5_CHECK_QUEUE_LIMIT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(200)
+                .clamp(1, 10_000),
         };
         cfg.validate();
         cfg

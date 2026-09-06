@@ -898,6 +898,7 @@ pub async fn report_status(
     start_time: Instant,
     node_id: &str,
     listener_errors: Vec<ListenerError>,
+    socks5_check_queue_depth: usize,
 ) {
     let snap = metrics.snapshot().await;
     let active_connections = connections.current().await;
@@ -931,6 +932,7 @@ pub async fn report_status(
         // X-Config-Protocol-Version header. Stored by the panel purely for the
         // frontend status display (the actual gate is request-scoped).
         config_protocol_version: Some(relay_shared::protocol::CONFIG_PROTOCOL_VERSION),
+        socks5_check_queue_depth: Some(socks5_check_queue_depth.min(u32::MAX as usize) as u32),
         // Only include listener_errors when non-empty, so healthy nodes send a
         // smaller payload and the panel renders "ok" by default.
         listener_errors: if listener_errors.is_empty() {
@@ -1308,6 +1310,8 @@ mod tests {
             listen_ipv6: "::".into(),
             outbound_interface: "auto".into(),
             outbound_bind_ipv4: None,
+            socks5_check_concurrency: 50,
+            socks5_check_queue_limit: 200,
         };
         report_traffic(&config, &counter).await;
 

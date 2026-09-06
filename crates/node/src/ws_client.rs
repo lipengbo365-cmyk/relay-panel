@@ -45,6 +45,7 @@ pub async fn run_ws_loop(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     node_id: &str,
+    socks5_checks: Arc<crate::socks5_check::Socks5CheckRuntime>,
 ) {
     let ws_url = derive_ws_url(&config.panel_url);
     let mut backoff = 1u64;
@@ -56,7 +57,15 @@ pub async fn run_ws_loop(
     loop {
         tracing::info!("websocket connecting to {} ...", ws_url);
 
-        let exit = connect_and_run(&ws_url, &config.token, config, manager, node_id).await;
+        let exit = connect_and_run(
+            &ws_url,
+            &config.token,
+            config,
+            manager,
+            node_id,
+            socks5_checks.clone(),
+        )
+        .await;
         match exit {
             WsExit::ConfigChanged => {
                 tracing::info!("websocket: config_changed received, reconnecting immediately");
@@ -176,6 +185,7 @@ async fn connect_and_run(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     node_id: &str,
+    socks5_checks: Arc<crate::socks5_check::Socks5CheckRuntime>,
 ) -> WsExit {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
@@ -301,6 +311,14 @@ async fn connect_and_run(
                                 }
                             }
                             return WsExit::ConfigChanged;
+                        } else if let Some(check) =
+                            serde_json::from_str::<relay_shared::protocol::Socks5CheckRequest>(&text)
+                                .ok()
+                                .filter(|request| request.msg_type == "socks5_check")
+                        {
+                            // Credentials live only inside this in-memory task.
+                            // The bounded runtime protects forwarding capacity.
+                            socks5_checks.submit(check, config.clone(), node_id.to_string());
                         } else if let Some(rm) =
                             serde_json::from_str::<relay_shared::protocol::RestartRuleMessage>(&text)
                                 .ok()

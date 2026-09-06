@@ -1,7 +1,9 @@
 use super::SqliteRepository;
 use crate::db::error::DbError;
 use crate::db::repo::{
-    Socks5Repository, Socks5ResourceRecord, Socks5RuleConfigRecord, Socks5RuleViewRecord,
+    BulkImportOutcome, BulkSocks5Resource, RelayNodeRecord, Socks5CheckHistoryRecord,
+    Socks5HealthRecord, Socks5LatestHealthRecord, Socks5Repository, Socks5ResourceQuery,
+    Socks5ResourceRecord, Socks5RuleConfigRecord, Socks5RuleViewRecord,
 };
 use async_trait::async_trait;
 
@@ -58,6 +60,177 @@ impl Socks5Repository for SqliteRepository {
         )
     }
 
+    async fn query_socks5_resources(
+        &self,
+        query: &Socks5ResourceQuery,
+    ) -> Result<(Vec<Socks5ResourceRecord>, i64), DbError> {
+        let mut where_sql = Vec::new();
+        let mut values = Vec::<String>::new();
+        if let Some(value) = query.search.as_deref().filter(|v| !v.is_empty()) {
+            where_sql.push("(LOWER(name) LIKE ? OR LOWER(host) LIKE ? OR LOWER(COALESCE(detected_exit_ip,'')) LIKE ?)");
+            let pattern = format!("%{}%", value.to_lowercase());
+            values.extend([pattern.clone(), pattern.clone(), pattern]);
+        }
+        for (column, value) in [
+            ("status", query.status.as_ref()),
+            ("country_code", query.country.as_ref()),
+            ("detected_country", query.detected_country.as_ref()),
+        ] {
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                where_sql.push(match column {
+                    "status" => "status = ?",
+                    "country_code" => "country_code = ?",
+                    _ => "detected_country = ?",
+                });
+                values.push(value.to_owned());
+            }
+        }
+        if let Some(tag) = query.tag.as_deref().filter(|v| !v.is_empty()) {
+            where_sql.push(
+                "EXISTS (SELECT 1 FROM json_each(socks5_resources.tags) WHERE LOWER(value) = ?)",
+            );
+            values.push(tag.to_lowercase());
+        }
+        if query.enabled.is_some() {
+            where_sql.push("enabled = ?");
+        }
+        let clause = if where_sql.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_sql.join(" AND "))
+        };
+        let count_sql = format!("SELECT COUNT(*) FROM socks5_resources{clause}");
+        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+        for value in &values {
+            count_query = count_query.bind(value);
+        }
+        if let Some(enabled) = query.enabled {
+            count_query = count_query.bind(enabled);
+        }
+        let total = count_query.fetch_one(&self.pool).await?;
+        let sort = match query.sort.as_str() {
+            "name" => "name",
+            "host" => "host",
+            "country" => "country_code",
+            "status" => "status",
+            "latency" => "latency_ms",
+            "last_check" => "last_check_at",
+            _ => "id",
+        };
+        let direction = if query.descending { "DESC" } else { "ASC" };
+        let sql = format!(
+            "SELECT * FROM socks5_resources{clause} ORDER BY {sort} {direction}, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut rows_query = sqlx::query_as::<_, Socks5ResourceRecord>(&sql);
+        for value in &values {
+            rows_query = rows_query.bind(value);
+        }
+        if let Some(enabled) = query.enabled {
+            rows_query = rows_query.bind(enabled);
+        }
+        let rows = rows_query
+            .bind(query.limit)
+            .bind(query.offset)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok((rows, total))
+    }
+
+    async fn list_latest_socks5_health_for_resources(
+        &self,
+        resource_ids: &[i64],
+    ) -> Result<Vec<Socks5LatestHealthRecord>, DbError> {
+        if resource_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; resource_ids.len()].join(",");
+        let sql = format!(
+            "SELECT resource_id,relay_node_id,relay_node_name,status,checked_at FROM (
+                SELECT h.resource_id,h.relay_node_id,
+                       CASE WHEN n.name='' THEN n.node_key ELSE n.name END AS relay_node_name,
+                       h.status,h.checked_at,
+                       ROW_NUMBER() OVER (PARTITION BY h.resource_id ORDER BY h.checked_at DESC,h.relay_node_id DESC) AS row_number
+                FROM socks5_resource_health h JOIN relay_nodes n ON n.id=h.relay_node_id
+                WHERE h.resource_id IN ({placeholders})
+             ) ranked WHERE row_number=1"
+        );
+        let mut query = sqlx::query_as(&sql);
+        for id in resource_ids {
+            query = query.bind(id);
+        }
+        Ok(query.fetch_all(&self.pool).await?)
+    }
+
+    async fn find_socks5_resources_by_keys(
+        &self,
+        keys: &[(String, i32, Option<String>)],
+    ) -> Result<Vec<Socks5ResourceRecord>, DbError> {
+        let wanted: std::collections::HashSet<(&str, i32, &str)> = keys
+            .iter()
+            .map(|(h, p, u)| (h.as_str(), *p, u.as_deref().unwrap_or("")))
+            .collect();
+        Ok(self
+            .list_socks5_resources()
+            .await?
+            .into_iter()
+            .filter(|row| {
+                wanted.contains(&(
+                    row.host.as_str(),
+                    row.port,
+                    row.username.as_deref().unwrap_or(""),
+                ))
+            })
+            .collect())
+    }
+
+    async fn bulk_import_socks5_resources(
+        &self,
+        rows: &[BulkSocks5Resource],
+        update_credentials: bool,
+    ) -> Result<BulkImportOutcome, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_ {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(e));
+                    }
+                }
+            };
+        }
+        let mut outcome = BulkImportOutcome::default();
+        for row in rows {
+            let existing: Option<i64> = try_!(sqlx::query_scalar(
+                "SELECT id FROM socks5_resources WHERE host=? AND port=? AND COALESCE(username,'')=?"
+            )
+            .bind(&row.host).bind(row.port).bind(row.username.as_deref().unwrap_or(""))
+            .fetch_optional(&mut *conn).await);
+            if let Some(id) = existing {
+                if update_credentials && row.password_ciphertext.is_some() {
+                    try_!(sqlx::query(
+                        "UPDATE socks5_resources SET password_ciphertext=?,password_nonce=?,password_key_version=?,updated_at=datetime('now') WHERE id=?"
+                    ).bind(&row.password_ciphertext).bind(&row.password_nonce)
+                    .bind(row.password_key_version).bind(id).execute(&mut *conn).await);
+                    outcome.updated += 1;
+                } else {
+                    outcome.skipped += 1;
+                }
+                continue;
+            }
+            try_!(sqlx::query(
+                "INSERT INTO socks5_resources(name,host,port,username,password_ciphertext,password_nonce,password_key_version,status,enabled) VALUES(?,?,?,?,?,?,?,'UNKNOWN',1)"
+            ).bind(&row.name).bind(&row.host).bind(row.port).bind(&row.username)
+            .bind(&row.password_ciphertext).bind(&row.password_nonce).bind(row.password_key_version)
+            .execute(&mut *conn).await);
+            outcome.created += 1;
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(outcome)
+    }
+
     async fn find_socks5_resource(&self, id: i64) -> Result<Option<Socks5ResourceRecord>, DbError> {
         Ok(sqlx::query_as("SELECT * FROM socks5_resources WHERE id=?")
             .bind(id)
@@ -101,6 +274,86 @@ impl Socks5Repository for SqliteRepository {
              updated_at=datetime('now') WHERE id=?")
             .bind(enabled).bind(enabled).bind(id).execute(&self.pool).await?;
         Ok(result.rows_affected())
+    }
+
+    async fn bulk_set_socks5_resources_enabled(
+        &self,
+        ids: &[i64],
+        enabled: bool,
+    ) -> Result<u64, DbError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "UPDATE socks5_resources SET enabled=?,status=CASE WHEN ? THEN CASE WHEN status='DISABLED' THEN 'UNKNOWN' ELSE status END ELSE 'DISABLED' END,updated_at=datetime('now') WHERE id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql).bind(enabled).bind(enabled);
+        for id in ids {
+            query = query.bind(id);
+        }
+        Ok(query.execute(&self.pool).await?.rows_affected())
+    }
+
+    async fn bulk_set_socks5_resource_tags(
+        &self,
+        ids: &[i64],
+        tags_json: &str,
+    ) -> Result<u64, DbError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "UPDATE socks5_resources SET tags=?,updated_at=datetime('now') WHERE id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql).bind(tags_json);
+        for id in ids {
+            query = query.bind(id);
+        }
+        Ok(query.execute(&self.pool).await?.rows_affected())
+    }
+
+    async fn bulk_delete_socks5_resources_guarded(
+        &self,
+        ids: &[i64],
+    ) -> Result<(u64, Vec<(i64, i64)>), DbError> {
+        if ids.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let mut tx = self.pool.begin().await?;
+        let blocker_sql = format!(
+            "SELECT socks5_resource_id,rule_id FROM socks5_rule_bindings WHERE socks5_resource_id IN ({placeholders}) ORDER BY socks5_resource_id,rule_id"
+        );
+        let mut blockers_query = sqlx::query_as::<_, (i64, i64)>(&blocker_sql);
+        for id in ids {
+            blockers_query = blockers_query.bind(id);
+        }
+        let blockers = blockers_query.fetch_all(&mut *tx).await?;
+        let blocked = blockers
+            .iter()
+            .map(|row| row.0)
+            .collect::<std::collections::HashSet<_>>();
+        let deletable = ids
+            .iter()
+            .filter(|id| !blocked.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        let deleted = if deletable.is_empty() {
+            0
+        } else {
+            let delete_placeholders = vec!["?"; deletable.len()].join(",");
+            let delete_sql =
+                format!("DELETE FROM socks5_resources WHERE id IN ({delete_placeholders})");
+            let mut delete_query = sqlx::query(&delete_sql);
+            for id in deletable {
+                delete_query = delete_query.bind(id);
+            }
+            delete_query.execute(&mut *tx).await?.rows_affected()
+        };
+        tx.commit().await?;
+        Ok((deleted, blockers))
     }
 
     async fn delete_socks5_resource(&self, id: i64) -> Result<u64, DbError> {
@@ -332,5 +585,143 @@ impl Socks5Repository for SqliteRepository {
              WHERE rule_id=?")
             .bind(relay_username).bind(relay_password_ciphertext).bind(relay_password_nonce)
             .bind(relay_password_key_version).bind(rule_id).execute(&self.pool).await?.rows_affected())
+    }
+
+    async fn upsert_relay_node_seen(
+        &self,
+        device_group_id: i64,
+        node_key: &str,
+        public_ip: &str,
+        seen_at: &str,
+    ) -> Result<i64, DbError> {
+        sqlx::query(
+            "INSERT INTO relay_nodes(device_group_id,node_key,name,public_ip,first_seen_at,last_seen_at)
+             VALUES(?,?,?, ?,?,?) ON CONFLICT(device_group_id,node_key) DO UPDATE SET
+             public_ip=excluded.public_ip,last_seen_at=excluded.last_seen_at,updated_at=datetime('now')",
+        )
+        .bind(device_group_id).bind(node_key).bind(node_key).bind(public_ip).bind(seen_at).bind(seen_at)
+        .execute(&self.pool).await?;
+        Ok(
+            sqlx::query_scalar("SELECT id FROM relay_nodes WHERE device_group_id=? AND node_key=?")
+                .bind(device_group_id)
+                .bind(node_key)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn list_relay_nodes(&self) -> Result<Vec<RelayNodeRecord>, DbError> {
+        Ok(sqlx::query_as("SELECT * FROM relay_nodes ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn find_relay_node(&self, id: i64) -> Result<Option<RelayNodeRecord>, DbError> {
+        Ok(sqlx::query_as("SELECT * FROM relay_nodes WHERE id=?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    async fn update_relay_node(
+        &self,
+        id: i64,
+        name: &str,
+        country: &str,
+        country_code: &str,
+        region: &str,
+        city: &str,
+        provider: &str,
+        bandwidth_mbps: i32,
+        remark: &str,
+        tags: &str,
+        enabled: bool,
+    ) -> Result<u64, DbError> {
+        Ok(sqlx::query(
+            "UPDATE relay_nodes SET name=?,country=?,country_code=?,region=?,city=?,provider=?,bandwidth_mbps=?,remark=?,tags=?,enabled=?,updated_at=datetime('now') WHERE id=?"
+        ).bind(name).bind(country).bind(country_code).bind(region).bind(city).bind(provider)
+        .bind(bandwidth_mbps).bind(remark).bind(tags).bind(enabled).bind(id)
+        .execute(&self.pool).await?.rows_affected())
+    }
+
+    async fn record_socks5_health(&self, health: &Socks5HealthRecord) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let previous: i32 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT consecutive_failures FROM socks5_resource_health WHERE resource_id=? AND relay_node_id=?),0)"
+        ).bind(health.resource_id).bind(health.relay_node_id).fetch_one(&mut *tx).await?;
+        let failures = if health.status == "ONLINE" {
+            0
+        } else {
+            previous.saturating_add(1)
+        };
+        let last_success = if health.status == "ONLINE" {
+            Some(health.checked_at.as_str())
+        } else {
+            health.last_success_at.as_deref()
+        };
+        sqlx::query(
+            "INSERT INTO socks5_resource_health(resource_id,relay_node_id,status,tcp_latency_ms,handshake_latency_ms,connect_latency_ms,total_latency_ms,exit_ip,country,error_stage,error_code,safe_error_message,consecutive_failures,checked_at,last_success_at)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(resource_id,relay_node_id) DO UPDATE SET
+             status=excluded.status,tcp_latency_ms=excluded.tcp_latency_ms,handshake_latency_ms=excluded.handshake_latency_ms,
+             connect_latency_ms=excluded.connect_latency_ms,total_latency_ms=excluded.total_latency_ms,exit_ip=excluded.exit_ip,
+             country=excluded.country,error_stage=excluded.error_stage,error_code=excluded.error_code,
+             safe_error_message=excluded.safe_error_message,consecutive_failures=excluded.consecutive_failures,
+             checked_at=excluded.checked_at,last_success_at=COALESCE(excluded.last_success_at,socks5_resource_health.last_success_at)"
+        ).bind(health.resource_id).bind(health.relay_node_id).bind(&health.status)
+        .bind(health.tcp_latency_ms).bind(health.handshake_latency_ms).bind(health.connect_latency_ms)
+        .bind(health.total_latency_ms).bind(&health.exit_ip).bind(&health.country).bind(&health.error_stage)
+        .bind(&health.error_code).bind(&health.safe_error_message).bind(failures).bind(&health.checked_at)
+        .bind(last_success).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO socks5_check_history(resource_id,relay_node_id,status,tcp_latency_ms,handshake_latency_ms,connect_latency_ms,total_latency_ms,exit_ip,country,error_stage,error_code,safe_error_message,checked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ).bind(health.resource_id).bind(health.relay_node_id).bind(&health.status)
+        .bind(health.tcp_latency_ms).bind(health.handshake_latency_ms).bind(health.connect_latency_ms)
+        .bind(health.total_latency_ms).bind(&health.exit_ip).bind(&health.country).bind(&health.error_stage)
+        .bind(&health.error_code).bind(&health.safe_error_message).bind(&health.checked_at)
+        .execute(&mut *tx).await?;
+        let resource_status = if health.status == "CONNECT_FAILED" {
+            "OFFLINE"
+        } else {
+            &health.status
+        };
+        sqlx::query(
+            "UPDATE socks5_resources SET status=?,detected_exit_ip=?,detected_country=?,latency_ms=?,consecutive_failures=?,last_check_at=?,last_success_at=COALESCE(?,last_success_at),updated_at=datetime('now') WHERE id=?"
+        ).bind(resource_status).bind(&health.exit_ip).bind(&health.country).bind(health.total_latency_ms)
+        .bind(failures).bind(&health.checked_at).bind(last_success).bind(health.resource_id)
+        .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_socks5_health(
+        &self,
+        resource_id: i64,
+    ) -> Result<Vec<Socks5HealthRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM socks5_resource_health WHERE resource_id=? ORDER BY relay_node_id",
+        )
+        .bind(resource_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn list_socks5_check_history(
+        &self,
+        resource_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Socks5CheckHistoryRecord>, DbError> {
+        Ok(sqlx::query_as("SELECT * FROM socks5_check_history WHERE resource_id=? ORDER BY checked_at DESC,id DESC LIMIT ? OFFSET ?")
+            .bind(resource_id).bind(limit).bind(offset).fetch_all(&self.pool).await?)
+    }
+
+    async fn prune_socks5_check_history(&self, cutoff: &str) -> Result<u64, DbError> {
+        Ok(
+            sqlx::query("DELETE FROM socks5_check_history WHERE checked_at < ?")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
     }
 }

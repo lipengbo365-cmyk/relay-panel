@@ -5241,6 +5241,12 @@ async fn pg_socks5_rule_lifecycle_is_atomic_and_preserves_credentials() {
         db.delete_socks5_resource(first).await,
         Err(DbError::ForeignKeyViolation)
     ));
+    let (deleted, blockers) = db
+        .bulk_delete_socks5_resources_guarded(&[first])
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(blockers, vec![(first, rule_id)]);
 
     assert_eq!(
         db.update_socks5_rule_full(rule_id, "after", 18081, 50, second, false, false)
@@ -5866,4 +5872,85 @@ async fn pg_admin_order_list_pages_without_overlap() {
         3,
         "the two pages must cover all three rows exactly once"
     );
+}
+
+#[tokio::test]
+async fn pg_stage3_bulk_pagination_and_health_contract() {
+    let Some(db) = repo("stage3_socks5").await else {
+        return;
+    };
+    db.insert_group("stage3", "in", "stage3-token", 1, "", "", 1.0, false)
+        .await
+        .unwrap();
+    let group_id = db.find_by_token("stage3-token").await.unwrap().unwrap().id;
+    let rows = (0..1_000)
+        .map(|index| BulkSocks5Resource {
+            name: format!("proxy-{index:04}"),
+            host: format!("proxy-{index:04}.example"),
+            port: 1080,
+            username: None,
+            password_ciphertext: None,
+            password_nonce: None,
+            password_key_version: 1,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        db.bulk_import_socks5_resources(&rows, false)
+            .await
+            .unwrap()
+            .created,
+        1_000
+    );
+    let (page, total) = db
+        .query_socks5_resources(&Socks5ResourceQuery {
+            search: Some("proxy-0999".into()),
+            sort: "id".into(),
+            descending: true,
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(page[0].host, "proxy-0999.example");
+
+    let node_id = db
+        .upsert_relay_node_seen(group_id, "node-a", "192.0.2.10", "2026-01-01 00:00:00")
+        .await
+        .unwrap();
+    let resource_id = page[0].id;
+    db.record_socks5_health(&Socks5HealthRecord {
+        resource_id,
+        relay_node_id: node_id,
+        status: "ONLINE".into(),
+        tcp_latency_ms: Some(10),
+        handshake_latency_ms: Some(20),
+        connect_latency_ms: Some(30),
+        total_latency_ms: Some(60),
+        exit_ip: Some("198.51.100.8".into()),
+        country: Some("US".into()),
+        error_stage: None,
+        error_code: None,
+        safe_error_message: None,
+        consecutive_failures: 0,
+        checked_at: "2026-01-01 00:00:00".into(),
+        last_success_at: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(db.list_socks5_health(resource_id).await.unwrap().len(), 1);
+    assert_eq!(
+        db.list_socks5_check_history(resource_id, 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let projection = db
+        .list_latest_socks5_health_for_resources(&[resource_id])
+        .await
+        .unwrap();
+    assert_eq!(projection.len(), 1);
+    assert_eq!(projection[0].relay_node_id, node_id);
+    assert_eq!(projection[0].status, "ONLINE");
 }

@@ -40,6 +40,9 @@ services:
       - SOCKS5_CREDENTIAL_KEY=${SOCKS5_CREDENTIAL_KEY:?SOCKS5_CREDENTIAL_KEY must be set (see header comment)}
       # Development-only opt-in. Keep 0 in production.
       - ALLOW_INSECURE_SOCKS5_CONFIG=${ALLOW_INSECURE_SOCKS5_CONFIG:-0}
+      - SOCKS5_CHECK_URLS=${SOCKS5_CHECK_URLS:-https://api.ipify.org,https://ifconfig.me/ip}
+      - SOCKS5_CHECK_CONCURRENCY=${SOCKS5_CHECK_CONCURRENCY:-50}
+      - SOCKS5_CHECK_RETENTION_DAYS=${SOCKS5_CHECK_RETENTION_DAYS:-30}
       # OPTIONAL — the public URL nodes should use to reach the panel.
       # Set this when the panel is behind a reverse proxy / domain, so the
       # "Copy Install Command" button emits e.g. https://panel.example.com
@@ -88,6 +91,8 @@ services:
       - POLL_INTERVAL=10
       # Set to 1 only for an explicitly local loopback development stack.
       - ALLOW_INSECURE_SOCKS5_CONFIG=${ALLOW_INSECURE_SOCKS5_CONFIG:-0}
+      - SOCKS5_CHECK_CONCURRENCY=${SOCKS5_CHECK_CONCURRENCY:-50}
+      - SOCKS5_CHECK_QUEUE_LIMIT=${SOCKS5_CHECK_QUEUE_LIMIT:-200}
     restart: unless-stopped
     depends_on:
       - panel

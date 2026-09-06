@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS socks5_resources (
     country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
     region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
     isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'UNKNOWN'
         CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -208,6 +209,47 @@ CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
 );
 CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
     ON socks5_rule_bindings(socks5_resource_id);
+
+CREATE TABLE IF NOT EXISTS relay_nodes (
+    id BIGSERIAL PRIMARY KEY,
+    device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
+    bandwidth_mbps INTEGER NOT NULL DEFAULT 0, remark TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]', enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    UNIQUE(device_group_id, node_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id);
+CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled);
+
+CREATE TABLE IF NOT EXISTS socks5_resource_health (
+    resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+    tcp_latency_ms INTEGER, handshake_latency_ms INTEGER, connect_latency_ms INTEGER,
+    total_latency_ms INTEGER, exit_ip TEXT, country TEXT, error_stage TEXT,
+    error_code TEXT, safe_error_message TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    checked_at TEXT NOT NULL, last_success_at TEXT,
+    PRIMARY KEY(resource_id, relay_node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_health_node_status ON socks5_resource_health(relay_node_id, status, checked_at);
+CREATE INDEX IF NOT EXISTS idx_socks5_health_exit_ip ON socks5_resource_health(exit_ip);
+
+CREATE TABLE IF NOT EXISTS socks5_check_history (
+    id BIGSERIAL PRIMARY KEY,
+    resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL, tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
+    connect_latency_ms INTEGER, total_latency_ms INTEGER, exit_ip TEXT, country TEXT,
+    error_stage TEXT, error_code TEXT, safe_error_message TEXT, checked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node ON socks5_check_history(resource_id, relay_node_id, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at ON socks5_check_history(checked_at);
 
 CREATE TABLE IF NOT EXISTS statistics (
     id BIGSERIAL PRIMARY KEY,
@@ -437,7 +479,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 29;
+pub const PG_SCHEMA_VERSION: i32 = 30;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1589,6 +1631,72 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .await?;
         tx.commit().await?;
         tracing::info!("PG migration 29: traffic report receipts present");
+    }
+
+    if current < 30 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE socks5_resources ADD COLUMN IF NOT EXISTS tags TEXT NOT NULL DEFAULT '[]'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_nodes (
+                id BIGSERIAL PRIMARY KEY,
+                device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+                node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+                country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
+                bandwidth_mbps INTEGER NOT NULL DEFAULT 0, remark TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]', enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')),
+                updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')),
+                UNIQUE(device_group_id,node_key)
+            )",
+        ).execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code,enabled)").execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_resource_health (
+                resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+                relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+                tcp_latency_ms INTEGER, handshake_latency_ms INTEGER, connect_latency_ms INTEGER,
+                total_latency_ms INTEGER, exit_ip TEXT, country TEXT, error_stage TEXT,
+                error_code TEXT, safe_error_message TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                checked_at TEXT NOT NULL, last_success_at TEXT,
+                PRIMARY KEY(resource_id,relay_node_id)
+            )",
+        ).execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_health_node_status ON socks5_resource_health(relay_node_id,status,checked_at)").execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_health_exit_ip ON socks5_resource_health(exit_ip)").execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_check_history (
+                id BIGSERIAL PRIMARY KEY,
+                resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+                relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+                status TEXT NOT NULL, tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
+                connect_latency_ms INTEGER, total_latency_ms INTEGER, exit_ip TEXT, country TEXT,
+                error_stage TEXT, error_code TEXT, safe_error_message TEXT, checked_at TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node ON socks5_check_history(resource_id,relay_node_id,checked_at DESC)").execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at ON socks5_check_history(checked_at)").execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(30) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 30: relay nodes and SOCKS5 health tables present");
     }
 
     Ok(())

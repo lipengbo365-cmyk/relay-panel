@@ -105,6 +105,7 @@ async fn main() {
         release_cache: api::system::ReleaseCache::new(),
         node_connections: api::ws::NodeConnections::new(),
         diagnose: api::diagnose::DiagnoseRegistry::new(),
+        socks5_checks: api::socks5_health::Socks5CheckRegistry::new(),
         geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::new(),
         )),

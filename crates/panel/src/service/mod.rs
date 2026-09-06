@@ -14,5 +14,6 @@ pub mod rules;
 pub mod settings;
 pub mod site;
 pub mod socks5;
+pub mod socks5_import;
 pub mod traffic;
 pub mod users;

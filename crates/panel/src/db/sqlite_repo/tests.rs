@@ -5764,6 +5764,13 @@ async fn socks5_resource_and_rule_creation_is_atomic_and_port_safe() {
         .await;
     assert!(matches!(conflict, Err(DbError::PortConflict)));
 
+    let (deleted, blockers) = db
+        .bulk_delete_socks5_resources_guarded(&[resource_id])
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(blockers, vec![(resource_id, rule_id)]);
+
     assert_eq!(
         db.delete_rule(rule_id, &ResourceScope::All).await.unwrap(),
         1
@@ -5774,6 +5781,12 @@ async fn socks5_resource_and_rule_creation_is_atomic_and_port_safe() {
             .await
             .unwrap(),
         0
+    );
+    assert_eq!(
+        db.bulk_delete_socks5_resources_guarded(&[resource_id])
+            .await
+            .unwrap(),
+        (1, Vec::new())
     );
 }
 
@@ -5825,4 +5838,141 @@ async fn disabled_socks5_resource_cannot_be_bound_to_a_new_rule() {
             .await
             .unwrap();
     assert_eq!(count, 0, "failed binding must roll back the rule row");
+}
+
+#[tokio::test]
+async fn stage3_bulk_import_10000_and_server_pagination() {
+    let db = repo().await;
+    let rows = (0..10_000)
+        .map(|index| BulkSocks5Resource {
+            name: format!("proxy-{index:05}"),
+            host: format!("proxy-{index:05}.example"),
+            port: 1080,
+            username: None,
+            password_ciphertext: None,
+            password_nonce: None,
+            password_key_version: 1,
+        })
+        .collect::<Vec<_>>();
+    let outcome = db.bulk_import_socks5_resources(&rows, false).await.unwrap();
+    assert_eq!(outcome.created, 10_000);
+
+    let (page, total) = db
+        .query_socks5_resources(&Socks5ResourceQuery {
+            sort: "name".into(),
+            limit: 50,
+            offset: 9950,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(total, 10_000);
+    assert_eq!(page.len(), 50);
+    assert_eq!(page.first().unwrap().name, "proxy-09950");
+
+    let (filtered, filtered_total) = db
+        .query_socks5_resources(&Socks5ResourceQuery {
+            search: Some("proxy-09999".into()),
+            sort: "id".into(),
+            descending: true,
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered_total, 1);
+    assert_eq!(filtered[0].host, "proxy-09999.example");
+}
+
+#[tokio::test]
+async fn stage3_health_is_per_node_and_retention_is_bounded() {
+    let db = repo().await;
+    seed_group_typed(&db, 71, 1, "in").await;
+    let node_id = db
+        .upsert_relay_node_seen(71, "node-a", "192.0.2.10", "2026-01-01 00:00:00")
+        .await
+        .unwrap();
+    let node_b = db
+        .upsert_relay_node_seen(71, "node-b", "192.0.2.11", "2026-01-01 00:00:00")
+        .await
+        .unwrap();
+    let resource_id = db
+        .insert_socks5_resource(
+            "health",
+            "proxy.example",
+            1080,
+            None,
+            None,
+            None,
+            1,
+            "US",
+            "US",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let mut health = Socks5HealthRecord {
+        resource_id,
+        relay_node_id: node_id,
+        status: "ONLINE".into(),
+        tcp_latency_ms: Some(10),
+        handshake_latency_ms: Some(20),
+        connect_latency_ms: Some(30),
+        total_latency_ms: Some(60),
+        exit_ip: Some("198.51.100.8".into()),
+        country: Some("US".into()),
+        error_stage: None,
+        error_code: None,
+        safe_error_message: None,
+        consecutive_failures: 0,
+        checked_at: "2026-01-01 00:00:00".into(),
+        last_success_at: None,
+    };
+    db.record_socks5_health(&health).await.unwrap();
+    let mut other_node = health.clone();
+    other_node.relay_node_id = node_b;
+    other_node.checked_at = "2026-01-01 12:00:00".into();
+    other_node.exit_ip = Some("198.51.100.9".into());
+    db.record_socks5_health(&other_node).await.unwrap();
+    health.status = "TIMEOUT".into();
+    health.checked_at = "2026-01-02 00:00:00".into();
+    health.exit_ip = None;
+    db.record_socks5_health(&health).await.unwrap();
+
+    let latest = db.list_socks5_health(resource_id).await.unwrap();
+    assert_eq!(latest.len(), 2);
+    let node_a = latest
+        .iter()
+        .find(|row| row.relay_node_id == node_id)
+        .unwrap();
+    assert_eq!(node_a.status, "TIMEOUT");
+    assert_eq!(node_a.consecutive_failures, 1);
+    assert_eq!(
+        node_a.last_success_at.as_deref(),
+        Some("2026-01-01 00:00:00")
+    );
+    let projection = db
+        .list_latest_socks5_health_for_resources(&[resource_id])
+        .await
+        .unwrap();
+    assert_eq!(projection.len(), 1);
+    assert_eq!(projection[0].relay_node_id, node_id);
+    assert_eq!(projection[0].status, "TIMEOUT");
+    assert_eq!(
+        db.list_socks5_check_history(resource_id, 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        db.prune_socks5_check_history("2026-01-01 12:00:00")
+            .await
+            .unwrap(),
+        1
+    );
 }

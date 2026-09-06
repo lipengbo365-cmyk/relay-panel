@@ -289,6 +289,7 @@ pub async fn report_status(
             // X-Config-Protocol-Version header). The frontend uses this to show
             // "配置协议不兼容，请升级节点" when it doesn't match the panel's.
             "config_protocol_version": req.config_protocol_version,
+            "socks5_check_queue_depth": req.socks5_check_queue_depth,
             "last_seen": chrono::Utc::now().to_rfc3339(),
             "public_ip": req.public_ip,
             // v0.4.15: dual-stack public IPs. Falls back to public_ip (legacy
@@ -325,6 +326,29 @@ pub async fn report_status(
             .set(&status_key, &status.to_string())
             .await
             .map_err(|e| tracing::warn!("report_status: kvs set failed: {}", e));
+
+        // Stage 3: keep a stable relational identity for every physical node.
+        // KVS above remains the source for live metrics; this UPSERT only
+        // supplies metadata/foreign keys for directed SOCKS5 health checks.
+        if let Some(nid) = req
+            .node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let seen_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let public_ip = req
+                .public_ipv4
+                .as_deref()
+                .or(req.public_ip.as_deref())
+                .or(req.public_ipv6.as_deref())
+                .unwrap_or("");
+            let _ = state
+                .db
+                .upsert_relay_node_seen(g.id, nid, public_ip, &seen_at)
+                .await
+                .map_err(|e| tracing::warn!("report_status: relay node upsert failed: {}", e));
+        }
 
         // v1.2.4: fold this report into the node's hourly metrics bucket. The
         // status written above is a snapshot each report overwrites; this is the
@@ -443,10 +467,14 @@ mod tests {
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
                 socks5_credential_key: Some("11".repeat(32)),
+                socks5_check_urls: vec!["https://api.ipify.org".into()],
+                socks5_check_concurrency: 50,
+                socks5_check_retention_days: 30,
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),
             diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
+            socks5_checks: crate::api::socks5_health::Socks5CheckRegistry::new(),
             geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -725,6 +753,7 @@ mod tests {
             cpu_usage: 0.0,
             mem_usage: 0.0,
             active_connections: 0,
+            socks5_check_queue_depth: Some(0),
             uptime_secs: 0,
             public_ip: None,
             public_ipv4: None,
@@ -864,6 +893,7 @@ mod tests {
             cpu_usage: 0.0,
             mem_usage: 0.0,
             active_connections: 0,
+            socks5_check_queue_depth: Some(0),
             uptime_secs: 0,
             public_ip: None,
             public_ipv4: None,

@@ -34,6 +34,9 @@ services:
       - PANEL_KEY=${PANEL_KEY:?PANEL_KEY must be set (see header comment in docker-compose.yaml)}
       - SOCKS5_CREDENTIAL_KEY=${SOCKS5_CREDENTIAL_KEY:?SOCKS5_CREDENTIAL_KEY must be set (see header comment in docker-compose.yaml)}
       - ALLOW_INSECURE_SOCKS5_CONFIG=${ALLOW_INSECURE_SOCKS5_CONFIG:-0}
+      - SOCKS5_CHECK_URLS=${SOCKS5_CHECK_URLS:-https://api.ipify.org,https://ifconfig.me/ip}
+      - SOCKS5_CHECK_CONCURRENCY=${SOCKS5_CHECK_CONCURRENCY:-50}
+      - SOCKS5_CHECK_RETENTION_DAYS=${SOCKS5_CHECK_RETENTION_DAYS:-30}
       # OPTIONAL — the public URL nodes should use to reach the panel.
       - PUBLIC_PANEL_URL=${PUBLIC_PANEL_URL:?PUBLIC_PANEL_URL must be the public HTTPS panel URL}
       # v0.4.19 — node-level GeoIP is now ON by default. The panel resolves
@@ -78,6 +81,8 @@ services:
       - POLL_INTERVAL=10
       # Development-only override; production nodes must use HTTPS/WSS.
       - ALLOW_INSECURE_SOCKS5_CONFIG=${ALLOW_INSECURE_SOCKS5_CONFIG:-0}
+      - SOCKS5_CHECK_CONCURRENCY=${SOCKS5_CHECK_CONCURRENCY:-50}
+      - SOCKS5_CHECK_QUEUE_LIMIT=${SOCKS5_CHECK_QUEUE_LIMIT:-200}
       # v1.0.5: dual-stack listen + outbound source binding. All optional —
       # the defaults already enable IPv4+IPv6 listening with system routing.
       # LISTEN_IPV4 / LISTEN_IPV6 set the inbound listen addresses. An empty

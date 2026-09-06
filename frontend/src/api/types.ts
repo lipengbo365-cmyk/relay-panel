@@ -20,7 +20,8 @@ export interface Socks5Resource {
   city: string;
   isp: string;
   remark: string;
-  status: 'ONLINE' | 'OFFLINE' | 'AUTH_FAILED' | 'TIMEOUT' | 'DISABLED' | 'UNKNOWN';
+  tags: string[];
+  status: 'ONLINE' | 'OFFLINE' | 'AUTH_FAILED' | 'TIMEOUT' | 'CONNECT_FAILED' | 'DISABLED' | 'UNKNOWN';
   enabled: boolean;
   detected_exit_ip: string | null;
   detected_country: string | null;
@@ -28,8 +29,93 @@ export interface Socks5Resource {
   consecutive_failures: number;
   last_check_at: string | null;
   last_success_at: string | null;
+  last_relay_node_id: number | null;
+  last_relay_node_name: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface Socks5ResourcePage {
+  items: Socks5Resource[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface RelayNode {
+  id: number;
+  device_group_id: number;
+  node_key: string;
+  name: string;
+  country: string;
+  country_code: string;
+  region: string;
+  city: string;
+  provider: string;
+  public_ip: string;
+  bandwidth_mbps: number;
+  remark: string;
+  tags: string[];
+  enabled: boolean;
+  first_seen_at: string;
+  last_seen_at: string;
+  online: boolean;
+  cpu: number | null;
+  ram: number | null;
+  connections: number | null;
+  node_version: string | null;
+  socks5_check_queue: number | null;
+  supports_socks5_check: boolean;
+}
+
+export interface Socks5Health {
+  resource_id: number;
+  relay_node_id: number;
+  status: Socks5Resource['status'];
+  tcp_latency_ms: number | null;
+  handshake_latency_ms: number | null;
+  connect_latency_ms: number | null;
+  total_latency_ms: number | null;
+  exit_ip: string | null;
+  country: string | null;
+  error_stage: string | null;
+  error_code: string | null;
+  safe_error_message: string | null;
+  consecutive_failures: number;
+  checked_at: string;
+  last_success_at: string | null;
+}
+
+export interface Socks5CheckResult {
+  resource_id: number;
+  relay_node_id: number;
+  status: Socks5Resource['status'];
+  tcp_latency_ms: number | null;
+  handshake_latency_ms: number | null;
+  connect_latency_ms: number | null;
+  total_latency_ms: number | null;
+  exit_ip: string | null;
+  detected_country: string | null;
+  error_stage: string | null;
+  error_code: string | null;
+  safe_error_message: string | null;
+  checked_at: string;
+}
+
+export interface Socks5CheckResponse {
+  resource_id: number;
+  relay_node_id: number;
+  outcome: string;
+  result?: Socks5CheckResult;
+}
+
+export interface Socks5ImportPreview {
+  total: number;
+  valid: number;
+  invalid: number;
+  duplicate: number;
+  new: number;
+  invalid_lines: Array<{ line_number: number; raw_masked: string; error_reason: string }>;
 }
 
 export interface Socks5RelayRule {

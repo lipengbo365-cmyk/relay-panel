@@ -65,6 +65,13 @@ pub struct Config {
     /// Missing/invalid means the SOCKS5 feature fails closed; legacy features
     /// continue to boot so an operator can repair configuration.
     pub socks5_credential_key: Option<String>,
+    /// Internet IP-echo endpoints used by directed Relay Node checks. The node
+    /// tries them in order so one provider outage does not poison every result.
+    pub socks5_check_urls: Vec<String>,
+    /// Maximum number of in-flight checks started by one batch request.
+    pub socks5_check_concurrency: usize,
+    /// Check-history retention window. Pruning is opportunistic after writes.
+    pub socks5_check_retention_days: i64,
 }
 
 impl std::fmt::Debug for Config {
@@ -83,6 +90,12 @@ impl std::fmt::Debug for Config {
             .field(
                 "socks5_credential_key",
                 &self.socks5_credential_key.as_ref().map(|_| "***"),
+            )
+            .field("socks5_check_urls", &self.socks5_check_urls)
+            .field("socks5_check_concurrency", &self.socks5_check_concurrency)
+            .field(
+                "socks5_check_retention_days",
+                &self.socks5_check_retention_days,
             )
             .finish()
     }
@@ -133,6 +146,25 @@ impl Config {
         let socks5_credential_key = std::env::var("SOCKS5_CREDENTIAL_KEY")
             .ok()
             .filter(|v| !v.trim().is_empty());
+        let socks5_check_urls = std::env::var("SOCKS5_CHECK_URLS")
+            .or_else(|_| std::env::var("SOCKS5_CHECK_URL"))
+            .unwrap_or_else(|_| "https://api.ipify.org,https://ifconfig.me/ip".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .take(4)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let socks5_check_concurrency = std::env::var("SOCKS5_CHECK_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(50)
+            .clamp(1, 500);
+        let socks5_check_retention_days = std::env::var("SOCKS5_CHECK_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(30)
+            .clamp(1, 3650);
 
         let cfg = Self {
             database_path,
@@ -146,6 +178,9 @@ impl Config {
             geoip_enabled,
             geoip_cache_ttl,
             socks5_credential_key,
+            socks5_check_urls,
+            socks5_check_concurrency,
+            socks5_check_retention_days,
         };
         cfg.validate();
         cfg
@@ -206,6 +241,9 @@ mod tests {
             geoip_enabled: false,
             geoip_cache_ttl: 60,
             socks5_credential_key: Some("socks5-key-secret".into()),
+            socks5_check_urls: vec!["https://api.ipify.org".into()],
+            socks5_check_concurrency: 50,
+            socks5_check_retention_days: 30,
         };
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("panel-key-secret"));

@@ -15,9 +15,13 @@ pub mod middleware;
 pub mod node;
 pub mod notify;
 pub mod redeem;
+pub mod relay_nodes;
 pub mod restart;
 pub mod security_headers;
 pub mod site;
+pub mod socks5_health;
+pub mod socks5_import;
+pub mod socks5_resources;
 pub mod stats;
 pub mod system;
 pub mod ws;
@@ -34,6 +38,7 @@ pub struct AppState {
     pub node_connections: ws::NodeConnections,
     /// v0.4.8: in-memory rule-diagnosis task registry (request_id → run).
     pub diagnose: diagnose::DiagnoseRegistry,
+    pub socks5_checks: socks5_health::Socks5CheckRegistry,
     /// v0.4.15: GeoIP concurrent-lookup de-duplication (set of IPs being
     /// fetched right now). Shared across all report_status handlers.
     pub geoip_in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
@@ -208,6 +213,47 @@ pub fn routes() -> Router<AppState> {
             axum::routing::post(admin::set_socks5_resource_enabled),
         )
         .route(
+            "/admin/socks5-resources/{id}/check",
+            axum::routing::post(socks5_health::check_resource),
+        )
+        .route(
+            "/admin/socks5-resources/check-batch",
+            axum::routing::post(socks5_health::check_batch),
+        )
+        .route(
+            "/admin/socks5-resources/check-all",
+            axum::routing::post(socks5_health::check_all),
+        )
+        .route(
+            "/admin/socks5-resources/import/preview",
+            axum::routing::post(socks5_import::preview),
+        )
+        .route(
+            "/admin/socks5-resources/import/confirm",
+            axum::routing::post(socks5_import::confirm),
+        )
+        .route(
+            "/admin/socks5-resources/page",
+            axum::routing::get(socks5_resources::list_page),
+        )
+        .route(
+            "/admin/socks5-resources/bulk-action",
+            axum::routing::post(socks5_resources::bulk_action),
+        )
+        .route(
+            "/admin/socks5-resources/{id}/health",
+            axum::routing::get(socks5_health::list_health),
+        )
+        .route(
+            "/admin/socks5-resources/{id}/check-history",
+            axum::routing::get(socks5_health::list_history),
+        )
+        .route("/admin/relay-nodes", axum::routing::get(relay_nodes::list))
+        .route(
+            "/admin/relay-nodes/{id}",
+            axum::routing::put(relay_nodes::update),
+        )
+        .route(
             "/admin/socks5-rules",
             axum::routing::get(admin::list_socks5_rules).post(admin::create_socks5_rule),
         )
@@ -352,5 +398,9 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/node/diagnose_result",
             axum::routing::post(diagnose::receive_diagnose_result),
+        )
+        .route(
+            "/node/socks5-check-result",
+            axum::routing::post(socks5_health::receive_result),
         )
 }

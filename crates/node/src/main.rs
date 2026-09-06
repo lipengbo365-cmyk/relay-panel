@@ -3,6 +3,7 @@ mod diagnose;
 mod forwarder;
 mod poller;
 mod reporter;
+mod socks5_check;
 mod updater;
 mod ws_client;
 
@@ -198,6 +199,10 @@ async fn run() {
     }
 
     let manager = Arc::new(Mutex::new(manager_inner));
+    let socks5_checks = Arc::new(socks5_check::Socks5CheckRuntime::new(
+        config.socks5_check_concurrency,
+        config.socks5_check_queue_limit,
+    ));
 
     // Unified sampler: CPU/mem + disk + network rate + cumulative traffic.
     let metrics = Arc::new(NodeMetrics::new(&config.network_interface));
@@ -236,8 +241,9 @@ async fn run() {
         let config_ws = config.clone();
         let manager_ws = manager.clone();
         let node_id_ws = node_id.clone();
+        let socks5_checks_ws = socks5_checks.clone();
         tokio::spawn(async move {
-            ws_client::run_ws_loop(&config_ws, &manager_ws, &node_id_ws).await;
+            ws_client::run_ws_loop(&config_ws, &manager_ws, &node_id_ws, socks5_checks_ws).await;
         });
     }
 
@@ -318,6 +324,7 @@ async fn run() {
             start_time,
             &node_id,
             listener_errors,
+            socks5_checks.queue_depth(),
         )
         .await;
     }

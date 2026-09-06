@@ -277,6 +277,8 @@ mod tests {
             listen_ipv6: "::1".into(),
             outbound_interface: "auto".into(),
             outbound_bind_ipv4: None,
+            socks5_check_concurrency: 50,
+            socks5_check_queue_limit: 200,
         }
     }
 
