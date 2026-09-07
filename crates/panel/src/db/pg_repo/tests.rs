@@ -5915,29 +5915,60 @@ async fn pg_stage3_bulk_pagination_and_health_contract() {
     assert_eq!(page[0].host, "proxy-0999.example");
 
     let node_id = db
-        .upsert_relay_node_seen(group_id, "node-a", "192.0.2.10", "2026-01-01 00:00:00")
+        .upsert_relay_node_seen(
+            group_id,
+            "node-a",
+            "hash-a",
+            "192.0.2.10",
+            "2026-01-01 00:00:00",
+        )
         .await
+        .unwrap()
         .unwrap();
+    assert!(db
+        .upsert_relay_node_seen(
+            group_id,
+            "node-a",
+            "wrong-hash",
+            "192.0.2.99",
+            "2026-01-02 00:00:00",
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let bound = db.find_relay_node(node_id).await.unwrap().unwrap();
+    assert_eq!(bound.identity_secret_hash, "hash-a");
+    assert_eq!(bound.public_ip, "192.0.2.10");
     let resource_id = page[0].id;
-    db.record_socks5_health(&Socks5HealthRecord {
-        resource_id,
-        relay_node_id: node_id,
-        status: "ONLINE".into(),
-        tcp_latency_ms: Some(10),
-        handshake_latency_ms: Some(20),
-        connect_latency_ms: Some(30),
-        total_latency_ms: Some(60),
-        exit_ip: Some("198.51.100.8".into()),
-        country: Some("US".into()),
-        error_stage: None,
-        error_code: None,
-        safe_error_message: None,
-        consecutive_failures: 0,
-        checked_at: "2026-01-01 00:00:00".into(),
-        last_success_at: None,
-    })
-    .await
-    .unwrap();
+    let (resource, generation) = db
+        .begin_socks5_health_check(resource_id, node_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .record_socks5_health(
+            &Socks5HealthRecord {
+                resource_id,
+                relay_node_id: node_id,
+                status: "ONLINE".into(),
+                tcp_latency_ms: Some(10),
+                handshake_latency_ms: Some(20),
+                connect_latency_ms: Some(30),
+                total_latency_ms: Some(60),
+                exit_ip: Some("198.51.100.8".into()),
+                country: Some("US".into()),
+                error_stage: None,
+                error_code: None,
+                safe_error_message: None,
+                consecutive_failures: 0,
+                checked_at: "2026-01-01 00:00:00".into(),
+                last_success_at: None,
+            },
+            resource.health_generation,
+            generation,
+        )
+        .await
+        .unwrap());
     assert_eq!(db.list_socks5_health(resource_id).await.unwrap().len(), 1);
     assert_eq!(
         db.list_socks5_check_history(resource_id, 10, 0)
@@ -5953,4 +5984,280 @@ async fn pg_stage3_bulk_pagination_and_health_contract() {
     assert_eq!(projection.len(), 1);
     assert_eq!(projection[0].relay_node_id, node_id);
     assert_eq!(projection[0].status, "ONLINE");
+}
+
+#[tokio::test]
+async fn pg_stage3_ten_concurrent_identical_imports_are_unique_and_conserved() {
+    use std::sync::Arc;
+    let Some(db) = repo("stage3_import_race").await else {
+        return;
+    };
+    let db = Arc::new(db);
+    let rows = Arc::new(
+        (0..1_000)
+            .map(|index| BulkSocks5Resource {
+                name: format!("race-{index:04}"),
+                host: format!("race-{index:04}.example"),
+                port: 1080,
+                username: Some("same-user".into()),
+                password_ciphertext: Some("cipher".into()),
+                password_nonce: Some("nonce".into()),
+                password_key_version: 1,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(11));
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let db = db.clone();
+        let rows = rows.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&rows, false).await.unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let mut created = 0;
+    let mut skipped = 0;
+    for task in tasks {
+        let outcome = task.await.unwrap();
+        created += outcome.created;
+        skipped += outcome.skipped;
+    }
+    assert_eq!(created, 1_000);
+    assert_eq!(skipped, 9_000);
+    assert_eq!(created + skipped, 10_000);
+    assert_eq!(db.list_socks5_resources().await.unwrap().len(), 1_000);
+}
+
+#[tokio::test]
+async fn pg_stage3_update_credentials_wins_a_concurrent_skip() {
+    use std::sync::Arc;
+
+    let Some(db) = repo("stage3_credential_import_race").await else {
+        return;
+    };
+    let db = Arc::new(db);
+    let row = |cipher: &str, nonce: &str| BulkSocks5Resource {
+        name: "credential-race".into(),
+        host: "credential-race.example".into(),
+        port: 1080,
+        username: Some("same-user".into()),
+        password_ciphertext: Some(cipher.into()),
+        password_nonce: Some(nonce.into()),
+        password_key_version: 1,
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let skip = {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&[row("old-cipher", "old-nonce")], false)
+                .await
+                .unwrap()
+        })
+    };
+    let update = {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&[row("new-cipher", "new-nonce")], true)
+                .await
+                .unwrap()
+        })
+    };
+    barrier.wait().await;
+    let skip = skip.await.unwrap();
+    let update = update.await.unwrap();
+    assert_eq!(skip.created + skip.skipped, 1);
+    assert_eq!(update.created + update.updated, 1);
+    let resource = db.list_socks5_resources().await.unwrap().pop().unwrap();
+    assert_eq!(resource.password_ciphertext.as_deref(), Some("new-cipher"));
+    assert_eq!(resource.password_nonce.as_deref(), Some("new-nonce"));
+}
+
+#[tokio::test]
+async fn pg_stage3_health_generation_is_atomic_per_resource_node_cell() {
+    use std::sync::Arc;
+    let Some(db) = repo("stage3_health_generation").await else {
+        return;
+    };
+    db.insert_group("health", "in", "health-token", 1, "", "", 1.0, false)
+        .await
+        .unwrap();
+    let group_id = db.find_by_token("health-token").await.unwrap().unwrap().id;
+    let mut nodes = Vec::new();
+    for suffix in ["a", "b", "c"] {
+        nodes.push(
+            db.upsert_relay_node_seen(
+                group_id,
+                &format!("node-{suffix}"),
+                &format!("hash-{suffix}"),
+                "192.0.2.1",
+                "2026-01-01 00:00:00",
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+    }
+    let resource_id = db
+        .insert_socks5_resource(
+            "generation",
+            "generation.example",
+            1080,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let db = Arc::new(db);
+    let node_a = nodes[0];
+
+    let starts = futures_util::future::join_all((0..100).map(|_| {
+        let db = db.clone();
+        async move {
+            db.begin_socks5_health_check(resource_id, node_a)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    }))
+    .await;
+    let resource_revision = starts[0].0.health_generation;
+    let latest_generation = starts
+        .iter()
+        .map(|(_, generation)| *generation)
+        .max()
+        .unwrap();
+    assert_eq!(latest_generation, 100);
+    let health = Socks5HealthRecord {
+        resource_id,
+        relay_node_id: node_a,
+        status: "ONLINE".into(),
+        tcp_latency_ms: Some(1),
+        handshake_latency_ms: Some(1),
+        connect_latency_ms: Some(1),
+        total_latency_ms: Some(3),
+        exit_ip: Some("198.51.100.8".into()),
+        country: None,
+        error_stage: None,
+        error_code: None,
+        safe_error_message: None,
+        consecutive_failures: 0,
+        checked_at: "2026-01-01 00:00:00".into(),
+        last_success_at: None,
+    };
+    assert!(db
+        .record_socks5_health(&health, resource_revision, latest_generation)
+        .await
+        .unwrap());
+    for (_, stale_generation) in starts {
+        if stale_generation != latest_generation {
+            assert!(!db
+                .record_socks5_health(&health, resource_revision, stale_generation)
+                .await
+                .unwrap());
+        }
+    }
+
+    let checks = futures_util::future::join_all(nodes[1..].iter().map(|node| {
+        let db = db.clone();
+        async move {
+            db.begin_socks5_health_check(resource_id, *node)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    }))
+    .await;
+    for ((resource, generation), (node, status)) in checks
+        .into_iter()
+        .zip([(nodes[1], "AUTH_FAILED"), (nodes[2], "TIMEOUT")])
+    {
+        let mut per_node = health.clone();
+        per_node.relay_node_id = node;
+        per_node.status = status.into();
+        per_node.exit_ip = None;
+        assert!(db
+            .record_socks5_health(&per_node, resource.health_generation, generation)
+            .await
+            .unwrap());
+    }
+    let matrix = db.list_socks5_health(resource_id).await.unwrap();
+    assert_eq!(matrix.len(), 3);
+    assert_eq!(
+        db.list_socks5_check_history(resource_id, 200, 0)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "stale generations are discarded rather than saved as history"
+    );
+}
+
+#[tokio::test]
+async fn pg_concurrent_relay_node_first_claim_accepts_exactly_one_identity() {
+    use std::sync::Arc;
+
+    let Some(db) = repo("stage3_identity_claim_race").await else {
+        return;
+    };
+    db.insert_group("identity", "in", "identity-token", 1, "", "", 1.0, false)
+        .await
+        .unwrap();
+    let group_id = db
+        .find_by_token("identity-token")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let db = Arc::new(db);
+    let claims = futures_util::future::join_all(["hash-a", "hash-b"].map(|hash| {
+        let db = db.clone();
+        async move {
+            db.upsert_relay_node_seen(
+                group_id,
+                "shared-node-id",
+                hash,
+                "192.0.2.10",
+                "2026-01-01 00:00:00",
+            )
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+
+    let node = db.list_relay_nodes().await.unwrap().pop().unwrap();
+    assert!(["hash-a", "hash-b"].contains(&node.identity_secret_hash.as_str()));
+    let rejected_hash = if node.identity_secret_hash == "hash-a" {
+        "hash-b"
+    } else {
+        "hash-a"
+    };
+    assert!(db
+        .upsert_relay_node_seen(
+            group_id,
+            "shared-node-id",
+            rejected_hash,
+            "192.0.2.99",
+            "2026-01-02 00:00:00",
+        )
+        .await
+        .unwrap()
+        .is_none());
 }

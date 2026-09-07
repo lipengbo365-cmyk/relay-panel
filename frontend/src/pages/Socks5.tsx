@@ -398,7 +398,7 @@ export default function Socks5() {
         [row.country_code, row.region, row.city].filter(Boolean).join(' · ') || '-',
     },
     {
-      title: '检测状态',
+      title: '最近一次检测',
       render: (_: unknown, row: Socks5Resource) => (
         <Tag color={row.status === 'ONLINE' ? 'green' : row.status === 'UNKNOWN' ? 'default' : row.status === 'TIMEOUT' ? 'orange' : 'red'}>
           {row.status}
@@ -413,7 +413,7 @@ export default function Socks5() {
       </Space>
     ) },
     { title: 'Latency', dataIndex: 'latency_ms', render: (value: number | null) => value == null ? '-' : `${value} ms` },
-    { title: 'Relay Node', dataIndex: 'last_relay_node_name', render: (value: string | null) => value || '-' },
+    { title: '检测节点', dataIndex: 'last_relay_node_name', render: (value: string | null) => value || '-' },
     { title: 'Last Check', dataIndex: 'last_check_at', render: (value: string | null) => value || '-' },
     { title: 'Tags', render: (_: unknown, row: Socks5Resource) => row.tags?.map((tag) => <Tag key={tag}>{tag}</Tag>) },
     {

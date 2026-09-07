@@ -215,12 +215,13 @@ CREATE TABLE IF NOT EXISTS socks5_resources (
     remark TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'UNKNOWN'
-        CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
+        CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
     enabled INTEGER NOT NULL DEFAULT 1,
     detected_exit_ip TEXT,
     detected_country TEXT,
     latency_ms INTEGER,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    health_generation INTEGER NOT NULL DEFAULT 0,
     last_check_at TEXT,
     last_success_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -233,6 +234,11 @@ CREATE TABLE IF NOT EXISTS socks5_resources (
 CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter
     ON socks5_resources(enabled, status, country_code);
 CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
     ON socks5_resources(host, port, COALESCE(username, ''));
 
@@ -264,6 +270,7 @@ CREATE TABLE IF NOT EXISTS relay_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
     node_key TEXT NOT NULL,
+    identity_secret_hash TEXT NOT NULL DEFAULT '',
     name TEXT NOT NULL DEFAULT '',
     country TEXT NOT NULL DEFAULT '',
     country_code TEXT NOT NULL DEFAULT '',
@@ -271,10 +278,10 @@ CREATE TABLE IF NOT EXISTS relay_nodes (
     city TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL DEFAULT '',
     public_ip TEXT NOT NULL DEFAULT '',
-    bandwidth_mbps INTEGER NOT NULL DEFAULT 0,
+    bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps >= 0),
     remark TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
-    enabled INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -283,6 +290,13 @@ CREATE TABLE IF NOT EXISTS relay_nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id);
 CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled);
+
+CREATE TABLE IF NOT EXISTS socks5_check_generations (
+    resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(resource_id, relay_node_id)
+);
 
 CREATE TABLE IF NOT EXISTS socks5_resource_health (
     resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
@@ -312,7 +326,8 @@ CREATE TABLE IF NOT EXISTS socks5_check_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
     relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN
+        ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
     tcp_latency_ms INTEGER,
     handshake_latency_ms INTEGER,
     connect_latency_ms INTEGER,
@@ -1956,7 +1971,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
             region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
             isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'UNKNOWN'
-                CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
+                CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
             enabled INTEGER NOT NULL DEFAULT 1,
             detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
@@ -1979,6 +1994,15 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name)")
         .execute(pool)
         .await?;
+    for statement in [
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at,id)",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
          ON socks5_resources(host, port, COALESCE(username, ''))",
@@ -2040,16 +2064,24 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         "TEXT NOT NULL DEFAULT '[]'",
     )
     .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_resources",
+        "health_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS relay_nodes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
             node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+            identity_secret_hash TEXT NOT NULL DEFAULT '',
             country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
             region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
             provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
-            bandwidth_mbps INTEGER NOT NULL DEFAULT 0, remark TEXT NOT NULL DEFAULT '',
-            tags TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1,
+            bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps >= 0), remark TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
             first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -2058,11 +2090,28 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     )
     .execute(pool)
     .await?;
+    add_column_if_missing(
+        pool,
+        "relay_nodes",
+        "identity_secret_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id)")
         .execute(pool)
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_check_generations (
+            resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+            relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+            generation INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(resource_id,relay_node_id)
+        )",
     )
     .execute(pool)
     .await?;
@@ -2090,7 +2139,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
             relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
-            status TEXT NOT NULL, tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
+            status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')), tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
             connect_latency_ms INTEGER, total_latency_ms INTEGER, exit_ip TEXT, country TEXT,
             error_stage TEXT, error_code TEXT, safe_error_message TEXT, checked_at TEXT NOT NULL
         )",
@@ -2099,8 +2148,148 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node ON socks5_check_history(resource_id, relay_node_id, checked_at DESC)").execute(pool).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at ON socks5_check_history(checked_at)").execute(pool).await?;
+    for statement in [
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at,id)",
+        "CREATE TRIGGER IF NOT EXISTS validate_socks5_history_status_insert BEFORE INSERT ON socks5_check_history WHEN NEW.status NOT IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN') BEGIN SELECT RAISE(ABORT,'invalid SOCKS5 history status'); END",
+        "CREATE TRIGGER IF NOT EXISTS validate_socks5_history_status_update BEFORE UPDATE OF status ON socks5_check_history WHEN NEW.status NOT IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN') BEGIN SELECT RAISE(ABORT,'invalid SOCKS5 history status'); END",
+        "CREATE TRIGGER IF NOT EXISTS validate_relay_node_metadata_insert BEFORE INSERT ON relay_nodes WHEN NEW.bandwidth_mbps < 0 OR NEW.enabled NOT IN (0,1) BEGIN SELECT RAISE(ABORT,'invalid relay node metadata'); END",
+        "CREATE TRIGGER IF NOT EXISTS validate_relay_node_metadata_update BEFORE UPDATE OF bandwidth_mbps,enabled ON relay_nodes WHEN NEW.bandwidth_mbps < 0 OR NEW.enabled NOT IN (0,1) BEGIN SELECT RAISE(ABORT,'invalid relay node metadata'); END",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
+    migrate_sqlite_socks5_resource_status(pool).await?;
     tracing::info!("Migration 47: relay nodes and SOCKS5 health tables present");
 
+    Ok(())
+}
+
+/// SQLite cannot alter an inline CHECK constraint. Alpha2 omitted
+/// CONNECT_FAILED from the resource projection even though the per-node health
+/// table and protocol support it, so upgrade the parent table atomically while
+/// preserving ids and every Stage 2/3 column.
+async fn migrate_sqlite_socks5_resource_status(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    let table_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='socks5_resources'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    if table_sql.contains("'CONNECT_FAILED'") {
+        return Ok(());
+    }
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys=OFF")
+        .execute(&mut *conn)
+        .await?;
+    let migration = async {
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        sqlx::query(
+            "CREATE TABLE socks5_resources_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, host TEXT NOT NULL,
+                port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+                username TEXT, password_ciphertext TEXT, password_nonce TEXT,
+                password_key_version INTEGER NOT NULL DEFAULT 1,
+                country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+                isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK (status IN
+                    ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+                detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                health_generation INTEGER NOT NULL DEFAULT 0,
+                last_check_at TEXT, last_success_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+                    OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+                UNIQUE(host, port, username)
+            )",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO socks5_resources_new
+             (id,name,host,port,username,password_ciphertext,password_nonce,password_key_version,
+              country,country_code,region,city,isp,remark,tags,status,enabled,detected_exit_ip,
+              detected_country,latency_ms,consecutive_failures,health_generation,last_check_at,
+              last_success_at,created_at,updated_at)
+             SELECT id,name,host,port,username,password_ciphertext,password_nonce,password_key_version,
+              country,country_code,region,city,isp,remark,tags,status,enabled,detected_exit_ip,
+              detected_country,latency_ms,consecutive_failures,health_generation,last_check_at,
+              last_success_at,created_at,updated_at FROM socks5_resources",
+        )
+        .execute(&mut *conn)
+        .await?;
+        let old_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources")
+            .fetch_one(&mut *conn)
+            .await?;
+        let new_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources_new")
+            .fetch_one(&mut *conn)
+            .await?;
+        if old_count != new_count {
+            return Err(sqlx::Error::Protocol(
+                "SOCKS5 resource status migration row-count mismatch".into(),
+            ));
+        }
+        sqlx::query("DROP TABLE socks5_resources")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("ALTER TABLE socks5_resources_new RENAME TO socks5_resources")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX idx_socks5_resources_filter ON socks5_resources(enabled,status,country_code)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query("CREATE INDEX idx_socks5_resources_name ON socks5_resources(name)")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_socks5_resources_endpoint_auth ON socks5_resources(host,port,COALESCE(username,''))",
+        )
+        .execute(&mut *conn)
+        .await?;
+        for statement in [
+            "CREATE INDEX idx_socks5_resources_country ON socks5_resources(country_code,id)",
+            "CREATE INDEX idx_socks5_resources_status ON socks5_resources(status,id)",
+            "CREATE INDEX idx_socks5_resources_enabled ON socks5_resources(enabled,id)",
+            "CREATE INDEX idx_socks5_resources_latency ON socks5_resources(latency_ms,id)",
+            "CREATE INDEX idx_socks5_resources_last_check ON socks5_resources(last_check_at,id)",
+        ] {
+            sqlx::query(statement).execute(&mut *conn).await?;
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    let foreign_keys = sqlx::query("PRAGMA foreign_keys=ON")
+        .execute(&mut *conn)
+        .await;
+    migration?;
+    foreign_keys?;
+    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&mut *conn)
+        .await?;
+    if violations != 0 {
+        return Err(sqlx::Error::Protocol(
+            "SOCKS5 resource status migration produced foreign-key violations".into(),
+        ));
+    }
+    tracing::info!("Migration 48: SOCKS5 CONNECT_FAILED resource status enabled");
     Ok(())
 }
 

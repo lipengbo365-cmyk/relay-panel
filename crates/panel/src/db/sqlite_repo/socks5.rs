@@ -145,10 +145,10 @@ impl Socks5Repository for SqliteRepository {
         }
         let placeholders = vec!["?"; resource_ids.len()].join(",");
         let sql = format!(
-            "SELECT resource_id,relay_node_id,relay_node_name,status,checked_at FROM (
+            "SELECT resource_id,relay_node_id,relay_node_name,status,total_latency_ms,exit_ip,country,consecutive_failures,checked_at FROM (
                 SELECT h.resource_id,h.relay_node_id,
                        CASE WHEN n.name='' THEN n.node_key ELSE n.name END AS relay_node_name,
-                       h.status,h.checked_at,
+                       h.status,h.total_latency_ms,h.exit_ip,h.country,h.consecutive_failures,h.checked_at,
                        ROW_NUMBER() OVER (PARTITION BY h.resource_id ORDER BY h.checked_at DESC,h.relay_node_id DESC) AS row_number
                 FROM socks5_resource_health h JOIN relay_nodes n ON n.id=h.relay_node_id
                 WHERE h.resource_id IN ({placeholders})
@@ -165,22 +165,26 @@ impl Socks5Repository for SqliteRepository {
         &self,
         keys: &[(String, i32, Option<String>)],
     ) -> Result<Vec<Socks5ResourceRecord>, DbError> {
-        let wanted: std::collections::HashSet<(&str, i32, &str)> = keys
-            .iter()
-            .map(|(h, p, u)| (h.as_str(), *p, u.as_deref().unwrap_or("")))
-            .collect();
-        Ok(self
-            .list_socks5_resources()
-            .await?
-            .into_iter()
-            .filter(|row| {
-                wanted.contains(&(
-                    row.host.as_str(),
-                    row.port,
-                    row.username.as_deref().unwrap_or(""),
-                ))
-            })
-            .collect())
+        let mut found = Vec::new();
+        for chunk in keys.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut query = sqlx::QueryBuilder::new("SELECT * FROM socks5_resources WHERE ");
+            let mut separated = query.separated(" OR ");
+            for (host, port, username) in chunk {
+                separated
+                    .push("(host=")
+                    .push_bind(host)
+                    .push(" AND port=")
+                    .push_bind(port)
+                    .push(" AND COALESCE(username,'')=")
+                    .push_bind(username.as_deref().unwrap_or(""))
+                    .push(")");
+            }
+            found.extend(query.build_query_as().fetch_all(&self.pool).await?);
+        }
+        Ok(found)
     }
 
     async fn bulk_import_socks5_resources(
@@ -211,7 +215,7 @@ impl Socks5Repository for SqliteRepository {
             if let Some(id) = existing {
                 if update_credentials && row.password_ciphertext.is_some() {
                     try_!(sqlx::query(
-                        "UPDATE socks5_resources SET password_ciphertext=?,password_nonce=?,password_key_version=?,updated_at=datetime('now') WHERE id=?"
+                        "UPDATE socks5_resources SET password_ciphertext=?,password_nonce=?,password_key_version=?,health_generation=health_generation+1,status='UNKNOWN',last_check_at=NULL,updated_at=datetime('now') WHERE id=?"
                     ).bind(&row.password_ciphertext).bind(&row.password_nonce)
                     .bind(row.password_key_version).bind(id).execute(&mut *conn).await);
                     outcome.updated += 1;
@@ -260,7 +264,7 @@ impl Socks5Repository for SqliteRepository {
             "UPDATE socks5_resources SET name=?,host=?,port=?,username=?,password_ciphertext=?,
              password_nonce=?,password_key_version=?,country=?,country_code=?,region=?,city=?,isp=?,
              remark=?,enabled=?,status=CASE WHEN ? THEN CASE WHEN status='DISABLED' THEN 'UNKNOWN' ELSE status END
-             ELSE 'DISABLED' END,updated_at=datetime('now') WHERE id=?")
+             ELSE 'DISABLED' END,health_generation=health_generation+1,updated_at=datetime('now') WHERE id=?")
             .bind(name).bind(host).bind(port).bind(username).bind(password_ciphertext)
             .bind(password_nonce).bind(password_key_version).bind(country).bind(country_code)
             .bind(region).bind(city).bind(isp).bind(remark).bind(enabled).bind(enabled).bind(id)
@@ -271,7 +275,7 @@ impl Socks5Repository for SqliteRepository {
     async fn set_socks5_resource_enabled(&self, id: i64, enabled: bool) -> Result<u64, DbError> {
         let result = sqlx::query(
             "UPDATE socks5_resources SET enabled=?,status=CASE WHEN ? THEN 'UNKNOWN' ELSE 'DISABLED' END,
-             updated_at=datetime('now') WHERE id=?")
+             health_generation=health_generation+1,updated_at=datetime('now') WHERE id=?")
             .bind(enabled).bind(enabled).bind(id).execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
@@ -286,7 +290,7 @@ impl Socks5Repository for SqliteRepository {
         }
         let placeholders = vec!["?"; ids.len()].join(",");
         let sql = format!(
-            "UPDATE socks5_resources SET enabled=?,status=CASE WHEN ? THEN CASE WHEN status='DISABLED' THEN 'UNKNOWN' ELSE status END ELSE 'DISABLED' END,updated_at=datetime('now') WHERE id IN ({placeholders})"
+            "UPDATE socks5_resources SET enabled=?,status=CASE WHEN ? THEN CASE WHEN status='DISABLED' THEN 'UNKNOWN' ELSE status END ELSE 'DISABLED' END,health_generation=health_generation+1,updated_at=datetime('now') WHERE id IN ({placeholders})"
         );
         let mut query = sqlx::query(&sql).bind(enabled).bind(enabled);
         for id in ids {
@@ -591,23 +595,28 @@ impl Socks5Repository for SqliteRepository {
         &self,
         device_group_id: i64,
         node_key: &str,
+        identity_secret_hash: &str,
         public_ip: &str,
         seen_at: &str,
-    ) -> Result<i64, DbError> {
-        sqlx::query(
-            "INSERT INTO relay_nodes(device_group_id,node_key,name,public_ip,first_seen_at,last_seen_at)
-             VALUES(?,?,?, ?,?,?) ON CONFLICT(device_group_id,node_key) DO UPDATE SET
-             public_ip=excluded.public_ip,last_seen_at=excluded.last_seen_at,updated_at=datetime('now')",
+    ) -> Result<Option<i64>, DbError> {
+        Ok(sqlx::query_scalar(
+            "INSERT INTO relay_nodes(device_group_id,node_key,identity_secret_hash,name,public_ip,first_seen_at,last_seen_at)
+             VALUES(?,?,?,?,?,?,?) ON CONFLICT(device_group_id,node_key) DO UPDATE SET
+             identity_secret_hash=CASE WHEN relay_nodes.identity_secret_hash='' THEN excluded.identity_secret_hash ELSE relay_nodes.identity_secret_hash END,
+             public_ip=CASE WHEN excluded.public_ip='' THEN relay_nodes.public_ip ELSE excluded.public_ip END,
+             last_seen_at=excluded.last_seen_at,updated_at=datetime('now')
+             WHERE relay_nodes.identity_secret_hash='' OR relay_nodes.identity_secret_hash=excluded.identity_secret_hash
+             RETURNING id",
         )
-        .bind(device_group_id).bind(node_key).bind(node_key).bind(public_ip).bind(seen_at).bind(seen_at)
-        .execute(&self.pool).await?;
-        Ok(
-            sqlx::query_scalar("SELECT id FROM relay_nodes WHERE device_group_id=? AND node_key=?")
-                .bind(device_group_id)
-                .bind(node_key)
-                .fetch_one(&self.pool)
-                .await?,
-        )
+        .bind(device_group_id)
+        .bind(node_key)
+        .bind(identity_secret_hash)
+        .bind(node_key)
+        .bind(public_ip)
+        .bind(seen_at)
+        .bind(seen_at)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     async fn list_relay_nodes(&self) -> Result<Vec<RelayNodeRecord>, DbError> {
@@ -621,6 +630,21 @@ impl Socks5Repository for SqliteRepository {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    async fn replace_relay_node_identity(
+        &self,
+        id: i64,
+        identity_secret_hash: &str,
+    ) -> Result<u64, DbError> {
+        Ok(sqlx::query(
+            "UPDATE relay_nodes SET identity_secret_hash=?,updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(identity_secret_hash)
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
     async fn update_relay_node(
@@ -644,22 +668,87 @@ impl Socks5Repository for SqliteRepository {
         .execute(&self.pool).await?.rows_affected())
     }
 
-    async fn record_socks5_health(&self, health: &Socks5HealthRecord) -> Result<(), DbError> {
-        let mut tx = self.pool.begin().await?;
-        let previous: i32 = sqlx::query_scalar(
+    async fn begin_socks5_health_check(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+    ) -> Result<Option<(Socks5ResourceRecord, i64)>, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_rollback {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+        let resource: Option<Socks5ResourceRecord> = try_rollback!(
+            sqlx::query_as("SELECT * FROM socks5_resources WHERE id=? AND enabled=1")
+                .bind(resource_id)
+                .fetch_optional(&mut *conn)
+                .await
+        );
+        let Some(resource) = resource else {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Ok(None);
+        };
+        let generation: i64 = try_rollback!(
+            sqlx::query_scalar(
+                "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation)
+             VALUES(?,?,1) ON CONFLICT(resource_id,relay_node_id) DO UPDATE SET
+             generation=socks5_check_generations.generation+1 RETURNING generation",
+            )
+            .bind(resource_id)
+            .bind(relay_node_id)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        try_rollback!(sqlx::query("COMMIT").execute(&mut *conn).await);
+        Ok(Some((resource, generation)))
+    }
+
+    async fn record_socks5_health(
+        &self,
+        health: &Socks5HealthRecord,
+        resource_generation: i64,
+        generation: i64,
+    ) -> Result<bool, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let operation: Result<bool, DbError> = async {
+            let current: Option<i64> =
+                sqlx::query_scalar("SELECT health_generation FROM socks5_resources WHERE id=?")
+                    .bind(health.resource_id)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+            let current_check: Option<i64> = sqlx::query_scalar(
+                "SELECT generation FROM socks5_check_generations WHERE resource_id=? AND relay_node_id=?",
+            )
+            .bind(health.resource_id)
+            .bind(health.relay_node_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if current != Some(resource_generation) || current_check != Some(generation) {
+                return Ok(false);
+            }
+            let previous: i32 = sqlx::query_scalar(
             "SELECT COALESCE((SELECT consecutive_failures FROM socks5_resource_health WHERE resource_id=? AND relay_node_id=?),0)"
-        ).bind(health.resource_id).bind(health.relay_node_id).fetch_one(&mut *tx).await?;
-        let failures = if health.status == "ONLINE" {
-            0
-        } else {
-            previous.saturating_add(1)
-        };
-        let last_success = if health.status == "ONLINE" {
-            Some(health.checked_at.as_str())
-        } else {
-            health.last_success_at.as_deref()
-        };
-        sqlx::query(
+        ).bind(health.resource_id).bind(health.relay_node_id).fetch_one(&mut *conn).await?;
+            let failures = if health.status == "ONLINE" {
+                0
+            } else {
+                previous.saturating_add(1)
+            };
+            let last_success = if health.status == "ONLINE" {
+                Some(health.checked_at.as_str())
+            } else {
+                health.last_success_at.as_deref()
+            };
+            sqlx::query(
             "INSERT INTO socks5_resource_health(resource_id,relay_node_id,status,tcp_latency_ms,handshake_latency_ms,connect_latency_ms,total_latency_ms,exit_ip,country,error_stage,error_code,safe_error_message,consecutive_failures,checked_at,last_success_at)
              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(resource_id,relay_node_id) DO UPDATE SET
              status=excluded.status,tcp_latency_ms=excluded.tcp_latency_ms,handshake_latency_ms=excluded.handshake_latency_ms,
@@ -671,26 +760,36 @@ impl Socks5Repository for SqliteRepository {
         .bind(health.tcp_latency_ms).bind(health.handshake_latency_ms).bind(health.connect_latency_ms)
         .bind(health.total_latency_ms).bind(&health.exit_ip).bind(&health.country).bind(&health.error_stage)
         .bind(&health.error_code).bind(&health.safe_error_message).bind(failures).bind(&health.checked_at)
-        .bind(last_success).execute(&mut *tx).await?;
-        sqlx::query(
+        .bind(last_success).execute(&mut *conn).await?;
+            sqlx::query(
             "INSERT INTO socks5_check_history(resource_id,relay_node_id,status,tcp_latency_ms,handshake_latency_ms,connect_latency_ms,total_latency_ms,exit_ip,country,error_stage,error_code,safe_error_message,checked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
         ).bind(health.resource_id).bind(health.relay_node_id).bind(&health.status)
         .bind(health.tcp_latency_ms).bind(health.handshake_latency_ms).bind(health.connect_latency_ms)
         .bind(health.total_latency_ms).bind(&health.exit_ip).bind(&health.country).bind(&health.error_stage)
         .bind(&health.error_code).bind(&health.safe_error_message).bind(&health.checked_at)
-        .execute(&mut *tx).await?;
-        let resource_status = if health.status == "CONNECT_FAILED" {
-            "OFFLINE"
-        } else {
-            &health.status
-        };
-        sqlx::query(
+        .execute(&mut *conn).await?;
+            sqlx::query(
             "UPDATE socks5_resources SET status=?,detected_exit_ip=?,detected_country=?,latency_ms=?,consecutive_failures=?,last_check_at=?,last_success_at=COALESCE(?,last_success_at),updated_at=datetime('now') WHERE id=?"
-        ).bind(resource_status).bind(&health.exit_ip).bind(&health.country).bind(health.total_latency_ms)
+        ).bind(&health.status).bind(&health.exit_ip).bind(&health.country).bind(health.total_latency_ms)
         .bind(failures).bind(&health.checked_at).bind(last_success).bind(health.resource_id)
-        .execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
+        .execute(&mut *conn).await?;
+            Ok(true)
+        }
+        .await;
+        match operation {
+            Ok(true) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(true)
+            }
+            Ok(false) => {
+                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
     }
 
     async fn list_socks5_health(
@@ -716,12 +815,15 @@ impl Socks5Repository for SqliteRepository {
     }
 
     async fn prune_socks5_check_history(&self, cutoff: &str) -> Result<u64, DbError> {
-        Ok(
-            sqlx::query("DELETE FROM socks5_check_history WHERE checked_at < ?")
-                .bind(cutoff)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
+        Ok(sqlx::query(
+            "DELETE FROM socks5_check_history WHERE id IN (
+                    SELECT id FROM socks5_check_history
+                    WHERE checked_at < ? ORDER BY id LIMIT 10000
+                 )",
         )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 }

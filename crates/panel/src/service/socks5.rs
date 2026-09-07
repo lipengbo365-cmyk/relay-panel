@@ -150,6 +150,7 @@ mod tests {
             detected_country: None,
             latency_ms: None,
             consecutive_failures: 0,
+            health_generation: 0,
             last_check_at: None,
             last_success_at: None,
             created_at: "2026-09-04 00:00:00".into(),

@@ -410,7 +410,12 @@ impl Drop for TcpConnectionGuard {
     }
 }
 
-pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
+pub async fn report_traffic(
+    config: &NodeConfig,
+    counter: &TrafficCounter,
+    node_id: &str,
+    node_identity_secret: &str,
+) {
     let Some(report) = counter.prepare_report().await else {
         return;
     };
@@ -422,6 +427,8 @@ pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
     match client
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.token))
+        .header("X-Node-ID", node_id)
+        .header("X-Node-Identity", node_identity_secret)
         .json(&report)
         .send()
         .await
@@ -891,14 +898,19 @@ impl NodeMetrics {
 /// the panel. Every new field is independent of the WebSocket control channel
 /// — this runs on the plain-HTTP poll loop, so it keeps reporting even if WS
 /// is down. Failures are logged, never crash.
+pub struct StatusDiagnostics {
+    pub listener_errors: Vec<ListenerError>,
+    pub socks5_check_queue_depth: usize,
+}
+
 pub async fn report_status(
     config: &NodeConfig,
     metrics: &Arc<NodeMetrics>,
     connections: &ConnectionTracker,
     start_time: Instant,
     node_id: &str,
-    listener_errors: Vec<ListenerError>,
-    socks5_check_queue_depth: usize,
+    node_identity_secret: &str,
+    diagnostics: StatusDiagnostics,
 ) {
     let snap = metrics.snapshot().await;
     let active_connections = connections.current().await;
@@ -927,18 +939,25 @@ pub async fn report_status(
         process_uptime_secs: Some(start_time.elapsed().as_secs()),
         // v0.3.4: report this binary's version so the panel can flag stale
         // nodes for upgrade. env! is compile-time, zero runtime cost.
-        node_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        node_version: Some(
+            std::env::var("RELAY_BUILD_VERSION")
+                .ok()
+                .filter(|value| !value.trim().is_empty() && value != "dev")
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        ),
         // v0.4.0: config-protocol version, mirrored from the
         // X-Config-Protocol-Version header. Stored by the panel purely for the
         // frontend status display (the actual gate is request-scoped).
         config_protocol_version: Some(relay_shared::protocol::CONFIG_PROTOCOL_VERSION),
-        socks5_check_queue_depth: Some(socks5_check_queue_depth.min(u32::MAX as usize) as u32),
+        socks5_check_queue_depth: Some(
+            diagnostics.socks5_check_queue_depth.min(u32::MAX as usize) as u32
+        ),
         // Only include listener_errors when non-empty, so healthy nodes send a
         // smaller payload and the panel renders "ok" by default.
-        listener_errors: if listener_errors.is_empty() {
+        listener_errors: if diagnostics.listener_errors.is_empty() {
             None
         } else {
-            Some(listener_errors)
+            Some(diagnostics.listener_errors)
         },
         // v1.0.10: how this node is run, so the panel only offers a one-click
         // self-upgrade to systemd nodes (docker → update image; manual → none).
@@ -971,6 +990,8 @@ pub async fn report_status(
     match client
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.token))
+        .header("X-Node-ID", node_id)
+        .header("X-Node-Identity", node_identity_secret)
         .json(&report)
         .send()
         .await
@@ -1313,7 +1334,7 @@ mod tests {
             socks5_check_concurrency: 50,
             socks5_check_queue_limit: 200,
         };
-        report_traffic(&config, &counter).await;
+        report_traffic(&config, &counter, "node-a", &"a".repeat(64)).await;
 
         assert!(
             !counter.has_rule(21).await,

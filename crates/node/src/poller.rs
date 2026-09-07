@@ -13,6 +13,10 @@ const CACHE_FILE: &str = "config-cache.json";
 /// node_status:{group_id} was a single key overwritten by every node).
 const NODE_ID_FILE: &str = "node-id";
 
+/// Independent bearer secret proving possession of this physical node's
+/// identity. Unlike `node-id`, this value is never logged or sent in JSON.
+const NODE_IDENTITY_SECRET_FILE: &str = "node-identity-secret";
+
 /// v0.4.0: outcome of a config fetch, distinguishing a permanent protocol
 /// mismatch (426) from a transient failure (network/5xx). The caller uses this
 /// to decide the poll interval: 426 → long backoff (upgrade needed), transient
@@ -29,13 +33,19 @@ pub enum FetchResult {
     Transient,
 }
 
-pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
+pub async fn fetch_config(
+    config: &NodeConfig,
+    node_id: &str,
+    node_identity_secret: &str,
+) -> FetchResult {
     let url = format!("{}/api/v1/node/config", config.panel_url);
     let client = reqwest::Client::new();
 
     let resp = match client
         .get(&url)
         .header("Authorization", format!("Bearer {}", config.token))
+        .header("X-Node-ID", node_id)
+        .header("X-Node-Identity", node_identity_secret)
         .header(
             "X-Accept-Sensitive-Config",
             if secure_control_channel_allowed(&config.panel_url) {
@@ -187,6 +197,66 @@ fn node_id_path() -> PathBuf {
     PathBuf::from(NODE_ID_FILE)
 }
 
+fn node_identity_secret_path() -> PathBuf {
+    let prod = PathBuf::from("/opt/relay-node").join(NODE_IDENTITY_SECRET_FILE);
+    if prod.parent().map(|p| p.exists()).unwrap_or(false) {
+        return prod;
+    }
+    PathBuf::from(NODE_IDENTITY_SECRET_FILE)
+}
+
+/// Load or create the physical-node identity proof. Creation is fail-closed:
+/// accepting an ephemeral or predictable fallback would let identity change
+/// after restart and defeat the panel's TOFU binding.
+pub fn get_or_create_node_identity_secret() -> Result<String, String> {
+    get_or_create_node_identity_secret_at(&node_identity_secret_path())
+}
+
+fn get_or_create_node_identity_secret_at(path: &std::path::Path) -> Result<String, String> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let trimmed = existing.trim();
+        if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(trimmed.to_ascii_lowercase());
+        }
+        return Err(format!(
+            "{} exists but does not contain a 256-bit hex secret",
+            path.display()
+        ));
+    }
+
+    let mut bytes = [0u8; 32];
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|e| format!("secure random source unavailable: {e}"))?;
+    let secret = hex_encode(&bytes);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        use std::io::Write;
+        let mut file = options
+            .open(path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        file.write_all(secret.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("cannot persist {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, &secret)
+            .map_err(|e| format!("cannot persist {}: {e}", path.display()))?;
+    }
+
+    tracing::info!(
+        "generated physical-node identity proof at {}",
+        path.display()
+    );
+    Ok(secret)
+}
+
 /// Get this node's stable identity, generating + persisting it on first call.
 ///
 /// The id is a random hex string generated once and reused across restarts, so
@@ -283,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v5_node_treats_v4_panel_response_as_permanent_protocol_mismatch() {
+    async fn current_node_treats_legacy_panel_response_as_permanent_protocol_mismatch() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -292,10 +362,10 @@ mod tests {
             let size = socket.read(&mut request).await.unwrap();
             let request = String::from_utf8_lossy(&request[..size]);
             assert!(
-                request.contains("X-Config-Protocol-Version: 5")
-                    || request.contains("x-config-protocol-version: 5")
+                request.contains("X-Config-Protocol-Version: 6")
+                    || request.contains("x-config-protocol-version: 6")
             );
-            let body = r#"{"code":"CONFIG_PROTOCOL_MISMATCH","required":4,"received":5}"#;
+            let body = r#"{"code":"CONFIG_PROTOCOL_MISMATCH","required":5,"received":6}"#;
             socket
                 .write_all(
                     format!(
@@ -308,7 +378,12 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = fetch_config(&test_node_config(format!("http://{address}"))).await;
+        let result = fetch_config(
+            &test_node_config(format!("http://{address}")),
+            "node-a",
+            &"a".repeat(64),
+        )
+        .await;
         assert!(matches!(result, FetchResult::ProtocolMismatch));
         server.await.unwrap();
     }
@@ -466,6 +541,32 @@ mod tests {
         std::fs::write(&path, "my-fixed-id-12345").unwrap();
         let id = get_or_create_node_id_at(&path);
         assert_eq!(id, "my-fixed-id-12345");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn physical_identity_secret_is_stable_and_not_accepted_if_malformed() {
+        let dir = std::env::temp_dir();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = dir.join(format!("relaypanel-test-node-secret-{stamp}"));
+        let first = get_or_create_node_identity_secret_at(&path).unwrap();
+        let second = get_or_create_node_identity_secret_at(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::write(&path, "predictable").unwrap();
+        assert!(get_or_create_node_identity_secret_at(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }

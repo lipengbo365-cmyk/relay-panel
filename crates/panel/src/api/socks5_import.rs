@@ -154,6 +154,7 @@ pub async fn confirm(
                 tracing::error!("SOCKS5 bulk import chunk failed: {db_error}");
                 failures.extend(chunk.iter().map(|row| ImportLineError {
                     line_number: row.line_number,
+                    error_code: "DATABASE_TRANSACTION_FAILED",
                     raw_masked: row.raw_masked.clone(),
                     error_reason: "数据库事务失败，当前批次已回滚".into(),
                 }));
@@ -220,6 +221,7 @@ fn encrypt_row(
         }
         Err(()) => Err(ImportLineError {
             line_number: row.line_number,
+            error_code: "CREDENTIAL_ENCRYPTION_FAILED",
             raw_masked: format!("{}:{}", row.host, row.port),
             error_reason: "凭据加密失败".into(),
         }),

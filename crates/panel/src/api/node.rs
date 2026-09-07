@@ -3,6 +3,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
 use relay_shared::models::*;
 use relay_shared::protocol::*;
+use sha2::{Digest, Sha256};
 
 /// Extract the node token from the `Authorization: Bearer <NODE_TOKEN>` header.
 /// The token is accepted ONLY from this header — never from the query string
@@ -14,6 +15,19 @@ pub(crate) fn extract_node_token(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string())
+}
+
+/// Read and hash the independent physical-node identity proof. The raw secret
+/// is deliberately request-scoped and never enters JSON, logs, or storage.
+pub(crate) fn node_identity_hash(headers: &HeaderMap) -> Option<String> {
+    let secret = headers
+        .get("X-Node-Identity")
+        .and_then(|value| value.to_str().ok())?
+        .trim();
+    if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("{:x}", Sha256::digest(secret.as_bytes())))
 }
 
 /// v0.4.0: read the node's config-protocol version from the
@@ -101,6 +115,31 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     let Some(group) = group else {
         return Json(NodeConfigResponse { listeners: vec![] }).into_response();
     };
+
+    let Some(node_id) = headers
+        .get("X-Node-ID")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(identity_hash) = node_identity_hash(&headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let seen_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    match state
+        .db
+        .upsert_relay_node_seen(group.id, node_id, &identity_hash, "", &seen_at)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::FORBIDDEN.into_response(),
+        Err(error) => {
+            tracing::warn!("get_config: physical node authentication failed: {error}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
 
     // v0.3.6: delegate to the shared `build_node_config`. This path and the WS
     // push path (ws.rs) now use the SAME function.
@@ -259,6 +298,73 @@ pub async fn report_status(
     };
 
     if let Some(g) = group {
+        let node_id = req
+            .node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let header_node_id = headers
+            .get("X-Node-ID")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if node_id.is_some() && node_id != header_node_id {
+            return Json(ApiResponse {
+                code: 403,
+                message: "Physical node identity does not match report".into(),
+                data: None,
+            });
+        }
+        let identity_hash = if node_id.is_some() {
+            match node_identity_hash(&headers) {
+                Some(hash) => Some(hash),
+                None => {
+                    return Json(ApiResponse {
+                        code: 403,
+                        message: "Physical node identity is missing or invalid".into(),
+                        data: None,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        // Bind or authenticate the physical identity before accepting any
+        // node-keyed state. A sibling with the same group token cannot replace
+        // an already-bound node by merely copying its public X-Node-ID.
+        if let (Some(nid), Some(hash)) = (node_id, identity_hash.as_deref()) {
+            let seen_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let public_ip = req
+                .public_ipv4
+                .as_deref()
+                .or(req.public_ip.as_deref())
+                .or(req.public_ipv6.as_deref())
+                .unwrap_or("");
+            match state
+                .db
+                .upsert_relay_node_seen(g.id, nid, hash, public_ip, &seen_at)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Json(ApiResponse {
+                        code: 403,
+                        message: "Physical node identity does not match".into(),
+                        data: None,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!("report_status: relay node authentication failed: {}", error);
+                    return Json(ApiResponse {
+                        code: 500,
+                        message: "database error".into(),
+                        data: None,
+                    });
+                }
+            }
+        }
+
         // v0.3.0: key node status by (group_id, node_id) so multiple nodes
         // sharing one group token no longer overwrite each other. The node_id
         // is a stable per-node identity generated on first start (see
@@ -326,29 +432,6 @@ pub async fn report_status(
             .set(&status_key, &status.to_string())
             .await
             .map_err(|e| tracing::warn!("report_status: kvs set failed: {}", e));
-
-        // Stage 3: keep a stable relational identity for every physical node.
-        // KVS above remains the source for live metrics; this UPSERT only
-        // supplies metadata/foreign keys for directed SOCKS5 health checks.
-        if let Some(nid) = req
-            .node_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let seen_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let public_ip = req
-                .public_ipv4
-                .as_deref()
-                .or(req.public_ip.as_deref())
-                .or(req.public_ipv6.as_deref())
-                .unwrap_or("");
-            let _ = state
-                .db
-                .upsert_relay_node_seen(g.id, nid, public_ip, &seen_at)
-                .await
-                .map_err(|e| tracing::warn!("report_status: relay node upsert failed: {}", e));
-        }
 
         // v1.2.4: fold this report into the node's hourly metrics bucket. The
         // status written above is a snapshot each report overwrites; this is the
@@ -520,6 +603,12 @@ mod tests {
     fn auth_headers(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        h.insert("X-Node-ID", "node-a".parse().unwrap());
+        h.insert("X-Node-Identity", "a".repeat(64).parse().unwrap());
+        h.insert(
+            "X-Config-Protocol-Version",
+            CONFIG_PROTOCOL_VERSION.to_string().parse().unwrap(),
+        );
         h
     }
 
@@ -808,12 +897,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_non_v5_config_protocol_is_rejected_with_http_426() {
+    async fn every_non_current_config_protocol_is_rejected_with_http_426() {
         for received in [
             Some("4"),
             None,
             Some("not-a-version"),
-            Some("6"),
+            Some("5"),
             Some("999"),
         ] {
             let (state, _pool) = seeded_state().await;
@@ -842,6 +931,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_requires_bound_physical_identity_after_group_authentication() {
+        let (state, _pool) = seeded_state().await;
+        let accepted = get_config(State(state.clone()), auth_headers("tok-A")).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let mut forged = auth_headers("tok-A");
+        forged.insert("X-Node-Identity", "b".repeat(64).parse().unwrap());
+        let rejected = get_config(State(state), forged).await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn sensitive_config_requires_https_panel_and_node_opt_in() {
         let (mut state, _pool) = seeded_state().await;
         state.config.public_panel_url = "https://panel.example".into();
@@ -854,6 +955,20 @@ mod tests {
         state.config.public_panel_url = "http://panel.example".into();
         headers.insert("X-Accept-Sensitive-Config", "0".parse().unwrap());
         assert!(!sensitive_config_allowed(&state, &headers));
+    }
+
+    #[test]
+    fn physical_node_identity_header_is_strict_and_hashed() {
+        let mut headers = HeaderMap::new();
+        assert!(node_identity_hash(&headers).is_none());
+        headers.insert("X-Node-Identity", "short".parse().unwrap());
+        assert!(node_identity_hash(&headers).is_none());
+        headers.insert("X-Node-Identity", "g".repeat(64).parse().unwrap());
+        assert!(node_identity_hash(&headers).is_none());
+        headers.insert("X-Node-Identity", "a".repeat(64).parse().unwrap());
+        let hash = node_identity_hash(&headers).unwrap();
+        assert_eq!(hash.len(), 64);
+        assert_ne!(hash, "a".repeat(64));
     }
 
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one
@@ -914,8 +1029,9 @@ mod tests {
             listener_errors: None,
             install_method: Some("systemd".into()),
         };
-        let Json(resp) =
-            report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
+        let mut headers = auth_headers("tok-A");
+        headers.insert("X-Node-ID", "n1".parse().unwrap());
+        let Json(resp) = report_status(State(state.clone()), headers, Json(req)).await;
         assert_eq!(resp.code, 0, "valid report → success");
 
         // The per-node status key is node_status:{group_id}:{node_id}.
@@ -931,5 +1047,40 @@ mod tests {
             Some("systemd"),
             "install_method must be persisted so the upgrade UI can offer a self-upgrade"
         );
+
+        let mut wrong_headers = auth_headers("tok-A");
+        wrong_headers.insert("X-Node-ID", "n1".parse().unwrap());
+        wrong_headers.insert("X-Node-Identity", "b".repeat(64).parse().unwrap());
+        let forged = StatusReport {
+            cpu_usage: 99.0,
+            mem_usage: 99.0,
+            active_connections: 999,
+            socks5_check_queue_depth: Some(0),
+            uptime_secs: 0,
+            public_ip: Some("192.0.2.99".into()),
+            public_ipv4: Some("192.0.2.99".into()),
+            public_ipv6: None,
+            disk_total: None,
+            disk_used: None,
+            disk_usage_percent: None,
+            disk_mount: None,
+            upload_bps: None,
+            download_bps: None,
+            boot_upload_bytes: None,
+            boot_download_bytes: None,
+            network_interface: None,
+            node_id: Some("n1".into()),
+            process_uptime_secs: None,
+            node_version: Some("forged".into()),
+            config_protocol_version: Some(CONFIG_PROTOCOL_VERSION),
+            listener_errors: None,
+            install_method: Some("manual".into()),
+        };
+        let Json(resp) = report_status(State(state.clone()), wrong_headers, Json(forged)).await;
+        assert_eq!(resp.code, 403);
+        let unchanged = state.db.get("node_status:10:n1").await.unwrap().unwrap();
+        let unchanged: serde_json::Value = serde_json::from_str(&unchanged).unwrap();
+        assert_eq!(unchanged["cpu"], 0.0);
+        assert_eq!(unchanged["node_version"], "1.1.1");
     }
 }

@@ -45,6 +45,7 @@ pub async fn run_ws_loop(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     node_id: &str,
+    node_identity_secret: &str,
     socks5_checks: Arc<crate::socks5_check::Socks5CheckRuntime>,
 ) {
     let ws_url = derive_ws_url(&config.panel_url);
@@ -63,6 +64,7 @@ pub async fn run_ws_loop(
             config,
             manager,
             node_id,
+            node_identity_secret,
             socks5_checks.clone(),
         )
         .await;
@@ -132,7 +134,7 @@ enum WsExit {
     ConfigChanged,
     Disconnected,
     /// A config protocol mismatch invalidates every active listener. Keeping a
-    /// v5 SOCKS listener after a panel downgrade would bypass the gate.
+    /// SOCKS listener after a panel downgrade would bypass the gate.
     ProtocolMismatch(String),
     /// A permanent error (426 protocol mismatch, 401/403 auth). The node backs
     /// off 5 minutes — the only fix is an upgrade or reconfiguration.
@@ -185,6 +187,7 @@ async fn connect_and_run(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     node_id: &str,
+    node_identity_secret: &str,
     socks5_checks: Arc<crate::socks5_check::Socks5CheckRuntime>,
 ) -> WsExit {
     use futures_util::{SinkExt, StreamExt};
@@ -240,6 +243,9 @@ async fn connect_and_run(
             request.headers_mut().insert("X-Node-ID", v);
         }
     }
+    if let Ok(v) = node_identity_secret.parse() {
+        request.headers_mut().insert("X-Node-Identity", v);
+    }
 
     let ws_result = connect_async(request).await;
 
@@ -292,7 +298,7 @@ async fn connect_and_run(
                             tracing::info!("websocket: config applied");
                         } else if text.contains("config_changed") {
                             tracing::info!("websocket: config_changed received, re-fetching");
-                            match poller::fetch_config(config).await {
+                            match poller::fetch_config(config, node_id, node_identity_secret).await {
                                 poller::FetchResult::Ok(resp) => {
                                     let mut mgr = manager.lock().await;
                                     mgr.apply_config(&resp).await;
@@ -318,7 +324,12 @@ async fn connect_and_run(
                         {
                             // Credentials live only inside this in-memory task.
                             // The bounded runtime protects forwarding capacity.
-                            socks5_checks.submit(check, config.clone(), node_id.to_string());
+                            socks5_checks.submit(
+                                check,
+                                config.clone(),
+                                node_id.to_string(),
+                                node_identity_secret.to_string(),
+                            ).await;
                         } else if let Some(rm) =
                             serde_json::from_str::<relay_shared::protocol::RestartRuleMessage>(&text)
                                 .ok()

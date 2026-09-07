@@ -84,6 +84,15 @@ async fn seed_group_typed(db: &SqliteRepository, gid: i64, uid: i64, gtype: &str
     .unwrap();
 }
 
+async fn begin_health(db: &SqliteRepository, resource_id: i64, relay_node_id: i64) -> (i64, i64) {
+    let (resource, generation) = db
+        .begin_socks5_health_check(resource_id, relay_node_id)
+        .await
+        .unwrap()
+        .unwrap();
+    (resource.health_generation, generation)
+}
+
 /// v0.4.12 PR1 (scenario 1): an admin-owned `group_type='in'` group is
 /// visible to a regular user even with NO rules. (scenario 8): the summary
 /// DTO carries no token/uid/config columns.
@@ -5882,6 +5891,179 @@ async fn stage3_bulk_import_10000_and_server_pagination() {
         .unwrap();
     assert_eq!(filtered_total, 1);
     assert_eq!(filtered[0].host, "proxy-09999.example");
+
+    for (sql, expected_index) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT * FROM socks5_resources WHERE country_code='US' ORDER BY id DESC LIMIT 50",
+            "idx_socks5_resources_country",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT * FROM socks5_resources WHERE status='UNKNOWN' ORDER BY id DESC LIMIT 50",
+            "idx_socks5_resources_status",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT * FROM socks5_resources WHERE enabled=1 ORDER BY id DESC LIMIT 50",
+            "idx_socks5_resources_enabled",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT * FROM socks5_resources ORDER BY latency_ms ASC,id DESC LIMIT 50",
+            "idx_socks5_resources_latency",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT * FROM socks5_resources ORDER BY last_check_at ASC,id DESC LIMIT 50",
+            "idx_socks5_resources_last_check",
+        ),
+    ] {
+        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(sql)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.3)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains(expected_index),
+            "expected {expected_index} in query plan: {plan}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stage3_bulk_import_required_sizes_preserve_accounting() {
+    let db = repo().await;
+    let mut expected_total = 0;
+    for (batch, size) in [1_usize, 100, 1_000, 5_000, 10_000].into_iter().enumerate() {
+        let rows = (0..size)
+            .map(|index| BulkSocks5Resource {
+                name: format!("size-{batch}-{index}"),
+                host: format!("size-{batch}-{index}.example"),
+                port: 1080,
+                username: None,
+                password_ciphertext: None,
+                password_nonce: None,
+                password_key_version: 1,
+            })
+            .collect::<Vec<_>>();
+        let outcome = db.bulk_import_socks5_resources(&rows, false).await.unwrap();
+        assert_eq!(outcome.created, size);
+        assert_eq!(outcome.created + outcome.updated + outcome.skipped, size);
+        expected_total += size;
+    }
+    assert_eq!(
+        db.list_socks5_resources().await.unwrap().len(),
+        expected_total
+    );
+}
+
+#[tokio::test]
+async fn stage3_sqlite_ten_concurrent_identical_imports_are_unique_and_conserved() {
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    let path = std::env::temp_dir().join(format!(
+        "relaypanel-import-race-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let options =
+        sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .busy_timeout(std::time::Duration::from_secs(30));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(10)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    let db = Arc::new(SqliteRepository::new(pool));
+    let rows = Arc::new(
+        (0..1_000)
+            .map(|index| BulkSocks5Resource {
+                name: format!("race-{index:04}"),
+                host: format!("race-{index:04}.example"),
+                port: 1080,
+                username: Some("same-user".into()),
+                password_ciphertext: Some("cipher".into()),
+                password_nonce: Some("nonce".into()),
+                password_key_version: 1,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(11));
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let db = db.clone();
+        let rows = rows.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&rows, false).await.unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let mut created = 0;
+    let mut skipped = 0;
+    for task in tasks {
+        let outcome = task.await.unwrap();
+        created += outcome.created;
+        skipped += outcome.skipped;
+    }
+    assert_eq!(created, 1_000);
+    assert_eq!(skipped, 9_000);
+    assert_eq!(created + skipped, 10_000);
+    assert_eq!(db.list_socks5_resources().await.unwrap().len(), 1_000);
+    db.pool.close().await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn stage3_sqlite_update_credentials_wins_a_concurrent_skip() {
+    use std::sync::Arc;
+
+    let db = Arc::new(repo().await);
+    let row = |cipher: &str, nonce: &str| BulkSocks5Resource {
+        name: "credential-race".into(),
+        host: "credential-race.example".into(),
+        port: 1080,
+        username: Some("same-user".into()),
+        password_ciphertext: Some(cipher.into()),
+        password_nonce: Some(nonce.into()),
+        password_key_version: 1,
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let skip = {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&[row("old-cipher", "old-nonce")], false)
+                .await
+                .unwrap()
+        })
+    };
+    let update = {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&[row("new-cipher", "new-nonce")], true)
+                .await
+                .unwrap()
+        })
+    };
+    barrier.wait().await;
+    let skip = skip.await.unwrap();
+    let update = update.await.unwrap();
+    assert_eq!(skip.created + skip.skipped, 1);
+    assert_eq!(update.created + update.updated, 1);
+    let resource = db.list_socks5_resources().await.unwrap().pop().unwrap();
+    assert_eq!(resource.password_ciphertext.as_deref(), Some("new-cipher"));
+    assert_eq!(resource.password_nonce.as_deref(), Some("new-nonce"));
 }
 
 #[tokio::test]
@@ -5889,12 +6071,14 @@ async fn stage3_health_is_per_node_and_retention_is_bounded() {
     let db = repo().await;
     seed_group_typed(&db, 71, 1, "in").await;
     let node_id = db
-        .upsert_relay_node_seen(71, "node-a", "192.0.2.10", "2026-01-01 00:00:00")
+        .upsert_relay_node_seen(71, "node-a", "hash-a", "192.0.2.10", "2026-01-01 00:00:00")
         .await
+        .unwrap()
         .unwrap();
     let node_b = db
-        .upsert_relay_node_seen(71, "node-b", "192.0.2.11", "2026-01-01 00:00:00")
+        .upsert_relay_node_seen(71, "node-b", "hash-b", "192.0.2.11", "2026-01-01 00:00:00")
         .await
+        .unwrap()
         .unwrap();
     let resource_id = db
         .insert_socks5_resource(
@@ -5932,16 +6116,28 @@ async fn stage3_health_is_per_node_and_retention_is_bounded() {
         checked_at: "2026-01-01 00:00:00".into(),
         last_success_at: None,
     };
-    db.record_socks5_health(&health).await.unwrap();
+    let (resource_generation, generation) = begin_health(&db, resource_id, node_id).await;
+    assert!(db
+        .record_socks5_health(&health, resource_generation, generation)
+        .await
+        .unwrap());
     let mut other_node = health.clone();
     other_node.relay_node_id = node_b;
     other_node.checked_at = "2026-01-01 12:00:00".into();
     other_node.exit_ip = Some("198.51.100.9".into());
-    db.record_socks5_health(&other_node).await.unwrap();
+    let (resource_generation, generation) = begin_health(&db, resource_id, node_b).await;
+    assert!(db
+        .record_socks5_health(&other_node, resource_generation, generation)
+        .await
+        .unwrap());
     health.status = "TIMEOUT".into();
     health.checked_at = "2026-01-02 00:00:00".into();
     health.exit_ip = None;
-    db.record_socks5_health(&health).await.unwrap();
+    let (resource_generation, generation) = begin_health(&db, resource_id, node_id).await;
+    assert!(db
+        .record_socks5_health(&health, resource_generation, generation)
+        .await
+        .unwrap());
 
     let latest = db.list_socks5_health(resource_id).await.unwrap();
     assert_eq!(latest.len(), 2);
@@ -5962,6 +6158,9 @@ async fn stage3_health_is_per_node_and_retention_is_bounded() {
     assert_eq!(projection.len(), 1);
     assert_eq!(projection[0].relay_node_id, node_id);
     assert_eq!(projection[0].status, "TIMEOUT");
+    assert_eq!(projection[0].total_latency_ms, Some(60));
+    assert!(projection[0].exit_ip.is_none());
+    assert_eq!(projection[0].consecutive_failures, 1);
     assert_eq!(
         db.list_socks5_check_history(resource_id, 10, 0)
             .await
@@ -5975,4 +6174,548 @@ async fn stage3_health_is_per_node_and_retention_is_bounded() {
             .unwrap(),
         1
     );
+
+    let (stale_resource_generation, stale_generation) =
+        begin_health(&db, resource_id, node_id).await;
+    let (current_resource_generation, current_generation) =
+        begin_health(&db, resource_id, node_id).await;
+    health.status = "ONLINE".into();
+    health.exit_ip = Some("198.51.100.10".into());
+    assert!(db
+        .record_socks5_health(&health, current_resource_generation, current_generation)
+        .await
+        .unwrap());
+    health.status = "AUTH_FAILED".into();
+    health.exit_ip = None;
+    assert!(!db
+        .record_socks5_health(&health, stale_resource_generation, stale_generation)
+        .await
+        .unwrap());
+    let latest = db.list_socks5_health(resource_id).await.unwrap();
+    assert_eq!(
+        latest
+            .iter()
+            .find(|row| row.relay_node_id == node_id)
+            .unwrap()
+            .status,
+        "ONLINE"
+    );
+
+    health.status = "CONNECT_FAILED".into();
+    health.exit_ip = None;
+    let (resource_generation, generation) = begin_health(&db, resource_id, node_id).await;
+    assert!(db
+        .record_socks5_health(&health, resource_generation, generation)
+        .await
+        .unwrap());
+    assert_eq!(
+        db.find_socks5_resource(resource_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "CONNECT_FAILED"
+    );
+}
+
+#[tokio::test]
+async fn relay_node_identity_is_bound_once_and_cannot_be_replaced() {
+    let db = repo().await;
+    seed_group_typed(&db, 72, 1, "in").await;
+    let original = db
+        .upsert_relay_node_seen(72, "node-a", "hash-a", "192.0.2.1", "2026-01-01 00:00:00")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .upsert_relay_node_seen(72, "node-a", "hash-b", "192.0.2.99", "2026-01-02 00:00:00")
+        .await
+        .unwrap()
+        .is_none());
+    let row = db.find_relay_node(original).await.unwrap().unwrap();
+    assert_eq!(row.identity_secret_hash, "hash-a");
+    assert_eq!(row.public_ip, "192.0.2.1");
+    assert_eq!(row.last_seen_at, "2026-01-01 00:00:00");
+
+    assert_eq!(
+        db.replace_relay_node_identity(original, "hash-c")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(db
+        .upsert_relay_node_seen(72, "node-a", "hash-a", "", "2026-01-03 00:00:00")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.upsert_relay_node_seen(72, "node-a", "hash-c", "", "2026-01-03 00:00:00")
+            .await
+            .unwrap(),
+        Some(original)
+    );
+}
+
+#[tokio::test]
+async fn concurrent_relay_node_first_claim_accepts_exactly_one_identity() {
+    use std::sync::Arc;
+
+    let db = Arc::new(repo().await);
+    seed_group_typed(&db, 73, 1, "in").await;
+    let claims = futures_util::future::join_all(["hash-a", "hash-b"].map(|hash| {
+        let db = db.clone();
+        async move {
+            db.upsert_relay_node_seen(
+                73,
+                "shared-node-id",
+                hash,
+                "192.0.2.10",
+                "2026-01-01 00:00:00",
+            )
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+
+    let node = db.list_relay_nodes().await.unwrap().pop().unwrap();
+    assert!(["hash-a", "hash-b"].contains(&node.identity_secret_hash.as_str()));
+    let rejected_hash = if node.identity_secret_hash == "hash-a" {
+        "hash-b"
+    } else {
+        "hash-a"
+    };
+    assert!(db
+        .upsert_relay_node_seen(
+            73,
+            "shared-node-id",
+            rejected_hash,
+            "192.0.2.99",
+            "2026-01-02 00:00:00",
+        )
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn resource_node_health_matrix_is_independent_and_history_survives_disable() {
+    let db = repo().await;
+    seed_group_typed(&db, 74, 1, "in").await;
+    let mut nodes = Vec::new();
+    for suffix in ["a", "b", "c"] {
+        nodes.push(
+            db.upsert_relay_node_seen(
+                74,
+                &format!("node-{suffix}"),
+                &format!("hash-{suffix}"),
+                "192.0.2.1",
+                "2026-01-01 00:00:00",
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+    }
+    let resource_id = db
+        .insert_socks5_resource(
+            "matrix",
+            "matrix.example",
+            1080,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Begin all three before recording any result. A resource-global check
+    // sequence would incorrectly supersede A and B here.
+    let checks = futures_util::future::join_all(
+        nodes
+            .iter()
+            .map(|node| begin_health(&db, resource_id, *node)),
+    )
+    .await;
+    for ((resource_generation, generation), (node, status)) in checks.into_iter().zip([
+        (nodes[0], "ONLINE"),
+        (nodes[1], "AUTH_FAILED"),
+        (nodes[2], "TIMEOUT"),
+    ]) {
+        let health = Socks5HealthRecord {
+            resource_id,
+            relay_node_id: node,
+            status: status.into(),
+            tcp_latency_ms: Some(1),
+            handshake_latency_ms: Some(2),
+            connect_latency_ms: None,
+            total_latency_ms: Some(3),
+            exit_ip: (status == "ONLINE").then(|| "198.51.100.8".into()),
+            country: None,
+            error_stage: None,
+            error_code: None,
+            safe_error_message: None,
+            consecutive_failures: 0,
+            checked_at: "2026-01-01 00:00:00".into(),
+            last_success_at: None,
+        };
+        assert!(db
+            .record_socks5_health(&health, resource_generation, generation)
+            .await
+            .unwrap());
+    }
+    let matrix = db.list_socks5_health(resource_id).await.unwrap();
+    assert_eq!(matrix.len(), 3);
+    assert_eq!(matrix[0].status, "ONLINE");
+    assert_eq!(matrix[1].status, "AUTH_FAILED");
+    assert_eq!(matrix[2].status, "TIMEOUT");
+
+    let (resource_generation, generation) = begin_health(&db, resource_id, nodes[0]).await;
+    let mut again = matrix[0].clone();
+    again.checked_at = "2026-01-01 00:01:00".into();
+    assert!(db
+        .record_socks5_health(&again, resource_generation, generation)
+        .await
+        .unwrap());
+    let unchanged = db.list_socks5_health(resource_id).await.unwrap();
+    assert_eq!(unchanged[1].status, "AUTH_FAILED");
+    assert_eq!(unchanged[2].status, "TIMEOUT");
+    assert_eq!(
+        db.list_socks5_check_history(resource_id, 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+
+    db.set_socks5_resource_enabled(resource_id, false)
+        .await
+        .unwrap();
+    db.set_socks5_resource_enabled(resource_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_socks5_check_history(resource_id, 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn history_retention_prunes_one_hundred_thousand_rows_in_bounded_chunks() {
+    let db = repo().await;
+    seed_group_typed(&db, 75, 1, "in").await;
+    let node_id = db
+        .upsert_relay_node_seen(75, "node-a", "hash-a", "192.0.2.1", "2026-01-01 00:00:00")
+        .await
+        .unwrap()
+        .unwrap();
+    let resource_id = db
+        .insert_socks5_resource(
+            "retention",
+            "retention.example",
+            1080,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE seq(value) AS (
+             SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 100005
+         )
+         INSERT INTO socks5_check_history(
+             resource_id,relay_node_id,status,checked_at
+         ) SELECT ?,?,'TIMEOUT','2025-01-01 00:00:00' FROM seq",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.prune_socks5_check_history("2026-01-01 00:00:00")
+            .await
+            .unwrap(),
+        10_000
+    );
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_check_history")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 90_005);
+    let mut deleted = 10_000;
+    loop {
+        let batch = db
+            .prune_socks5_check_history("2026-01-01 00:00:00")
+            .await
+            .unwrap();
+        assert!(batch <= 10_000);
+        deleted += batch;
+        if batch == 0 {
+            break;
+        }
+    }
+    assert_eq!(deleted, 100_005);
+}
+
+#[tokio::test]
+async fn credential_update_invalidates_in_flight_health_result() {
+    let db = repo().await;
+    seed_group_typed(&db, 76, 1, "in").await;
+    let node_id = db
+        .upsert_relay_node_seen(76, "node-a", "hash-a", "192.0.2.1", "2026-01-01 00:00:00")
+        .await
+        .unwrap()
+        .unwrap();
+    let resource_id = db
+        .insert_socks5_resource(
+            "revision",
+            "revision.example",
+            1080,
+            Some("old-user"),
+            Some("old-cipher"),
+            Some("old-nonce"),
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let (resource_generation, generation) = begin_health(&db, resource_id, node_id).await;
+    assert_eq!(
+        db.update_socks5_resource_full(
+            resource_id,
+            "revision",
+            "revision.example",
+            1080,
+            Some("new-user"),
+            Some("new-cipher"),
+            Some("new-nonce"),
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let stale = Socks5HealthRecord {
+        resource_id,
+        relay_node_id: node_id,
+        status: "ONLINE".into(),
+        tcp_latency_ms: Some(1),
+        handshake_latency_ms: Some(1),
+        connect_latency_ms: Some(1),
+        total_latency_ms: Some(3),
+        exit_ip: Some("198.51.100.8".into()),
+        country: None,
+        error_stage: None,
+        error_code: None,
+        safe_error_message: None,
+        consecutive_failures: 0,
+        checked_at: "2026-01-01 00:00:00".into(),
+        last_success_at: None,
+    };
+    assert!(!db
+        .record_socks5_health(&stale, resource_generation, generation)
+        .await
+        .unwrap());
+    assert!(db.list_socks5_health(resource_id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn disable_and_delete_races_fail_closed_without_orphans() {
+    let db = repo().await;
+    seed_group_typed(&db, 77, 1, "in").await;
+    let node_id = db
+        .upsert_relay_node_seen(77, "node-a", "hash-a", "192.0.2.1", "2026-01-01 00:00:00")
+        .await
+        .unwrap()
+        .unwrap();
+    let resource_id = db
+        .insert_socks5_resource(
+            "race",
+            "race.example",
+            1080,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let health = Socks5HealthRecord {
+        resource_id,
+        relay_node_id: node_id,
+        status: "ONLINE".into(),
+        tcp_latency_ms: Some(1),
+        handshake_latency_ms: Some(1),
+        connect_latency_ms: Some(1),
+        total_latency_ms: Some(3),
+        exit_ip: Some("198.51.100.8".into()),
+        country: None,
+        error_stage: None,
+        error_code: None,
+        safe_error_message: None,
+        consecutive_failures: 0,
+        checked_at: "2026-01-01 00:00:00".into(),
+        last_success_at: None,
+    };
+
+    let (revision, generation) = begin_health(&db, resource_id, node_id).await;
+    db.set_socks5_resource_enabled(resource_id, false)
+        .await
+        .unwrap();
+    assert!(!db
+        .record_socks5_health(&health, revision, generation)
+        .await
+        .unwrap());
+    assert_eq!(
+        db.find_socks5_resource(resource_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "DISABLED"
+    );
+
+    db.set_socks5_resource_enabled(resource_id, true)
+        .await
+        .unwrap();
+    let (revision, generation) = begin_health(&db, resource_id, node_id).await;
+    assert!(db
+        .record_socks5_health(&health, revision, generation)
+        .await
+        .unwrap());
+    let (revision, generation) = begin_health(&db, resource_id, node_id).await;
+    assert_eq!(db.delete_socks5_resource(resource_id).await.unwrap(), 1);
+    assert!(!db
+        .record_socks5_health(&health, revision, generation)
+        .await
+        .unwrap());
+    let health_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resource_health WHERE resource_id=?")
+            .bind(resource_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let history_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM socks5_check_history WHERE resource_id=?")
+            .bind(resource_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((health_count, history_count), (0, 0));
+}
+
+#[tokio::test]
+async fn stage3_database_constraints_reject_illegal_direct_writes() {
+    let db = repo().await;
+    sqlx::query("PRAGMA foreign_keys=ON")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    seed_group_typed(&db, 73, 1, "in").await;
+
+    for port in [0, 65_536] {
+        assert!(sqlx::query(
+            "INSERT INTO socks5_resources(name,host,port) VALUES('bad','bad.example',?)"
+        )
+        .bind(port)
+        .execute(&db.pool)
+        .await
+        .is_err());
+    }
+    let resource_id = db
+        .insert_socks5_resource(
+            "valid",
+            "valid.example",
+            1080,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(sqlx::query(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('duplicate','valid.example',1080)"
+    )
+    .execute(&db.pool)
+    .await
+    .is_err());
+    assert!(sqlx::query("INSERT INTO socks5_resources(name,host,port,username) VALUES('half','half.example',1080,'user')")
+        .execute(&db.pool).await.is_err());
+    assert!(
+        sqlx::query("UPDATE socks5_resources SET status='FORGED' WHERE id=?")
+            .bind(resource_id)
+            .execute(&db.pool)
+            .await
+            .is_err()
+    );
+
+    sqlx::query("INSERT INTO forward_rules(id,name,uid,listen_port,device_group_in,target_addr,target_port) VALUES(730,'r',1,17300,73,'127.0.0.1',80)")
+        .execute(&db.pool).await.unwrap();
+    assert!(sqlx::query("INSERT INTO socks5_rule_bindings(rule_id,socks5_resource_id,allow_no_auth) VALUES(730,999999,1)")
+        .execute(&db.pool).await.is_err());
+
+    let node_id = db
+        .upsert_relay_node_seen(73, "node", "hash", "192.0.2.1", "2026-01-01 00:00:00")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sqlx::query("INSERT INTO socks5_resource_health(resource_id,relay_node_id,status,checked_at) VALUES(999999,?,'ONLINE','2026-01-01 00:00:00')")
+        .bind(node_id).execute(&db.pool).await.is_err());
+    assert!(sqlx::query("INSERT INTO socks5_resource_health(resource_id,relay_node_id,status,checked_at) VALUES(?,999999,'ONLINE','2026-01-01 00:00:00')")
+        .bind(resource_id).execute(&db.pool).await.is_err());
+    assert!(sqlx::query("INSERT INTO socks5_resource_health(resource_id,relay_node_id,status,checked_at) VALUES(?,?,'FORGED','2026-01-01 00:00:00')")
+        .bind(resource_id).bind(node_id).execute(&db.pool).await.is_err());
+    assert!(sqlx::query("INSERT INTO socks5_check_history(resource_id,relay_node_id,status,checked_at) VALUES(?,?,'FORGED','2026-01-01 00:00:00')")
+        .bind(resource_id).bind(node_id).execute(&db.pool).await.is_err());
 }

@@ -12,7 +12,7 @@ RUN npm run build
 # compile relay-node and a node-only release does not compile relay-panel. The
 # runtime stages copy only their own binary.
 FROM rust:1-bookworm AS panel-build
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
@@ -21,7 +21,7 @@ RUN cargo build --release -p relay-panel
 
 # ---- Build stage for the Rust workspace (node only) ----
 FROM rust:1-bookworm AS node-build
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
@@ -30,7 +30,13 @@ RUN cargo build --release -p relay-node
 
 # ---- Panel runtime ----
 FROM debian:bookworm-slim AS panel
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+ARG OCI_VERSION=dev
+ARG OCI_REVISION=unknown
+LABEL org.opencontainers.image.version=$OCI_VERSION \
+      org.opencontainers.image.revision=$OCI_REVISION \
+      org.opencontainers.image.source="https://github.com/MoeShinX/relay-panel"
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=panel-build /app/target/release/relay-panel /app/relay-panel
@@ -46,6 +52,11 @@ CMD ["./relay-panel"]
 
 # ---- Node runtime ----
 FROM debian:bookworm-slim AS node
+ARG OCI_VERSION=dev
+ARG OCI_REVISION=unknown
+LABEL org.opencontainers.image.version=$OCI_VERSION \
+      org.opencontainers.image.revision=$OCI_REVISION \
+      org.opencontainers.image.source="https://github.com/MoeShinX/relay-panel"
 # v1.0.5: iproute2 provides the `ip` command used to resolve an interface's
 # IPv4 address when OUTBOUND_INTERFACE is set. Without it, multi-NIC egress
 # selection by interface name would fail. ca-certificates is for HTTPS to the
@@ -54,6 +65,7 @@ RUN apt-get -o Acquire::Retries=5 update && \
     apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates iproute2 && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+ENV RELAY_BUILD_VERSION=$OCI_VERSION
 COPY --from=node-build /app/target/release/relay-node /app/relay-node
 # ENTRYPOINT (not CMD) so `docker run image --version` appends the flag to the
 # binary instead of replacing it. With CMD, `docker run image --version` tries
@@ -68,7 +80,8 @@ ENTRYPOINT ["./relay-node"]
 # produce `linux/amd64` and `linux/arm64` images from their respective native
 # runners without QEMU or cross-compilation toolchains.
 FROM debian:bookworm-slim AS panel-release
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY release-dist/panel/relay-panel /app/relay-panel

@@ -32,6 +32,7 @@ pub struct RelayNodePublic {
     pub ram: Option<f64>,
     pub connections: Option<u64>,
     pub node_version: Option<String>,
+    pub config_protocol_version: Option<u64>,
     pub socks5_check_queue: Option<u64>,
     pub supports_socks5_check: bool,
 }
@@ -43,6 +44,7 @@ struct LiveMetrics {
     ram: Option<f64>,
     connections: Option<u64>,
     node_version: Option<String>,
+    config_protocol_version: Option<u64>,
     socks5_check_queue: Option<u64>,
 }
 
@@ -66,6 +68,13 @@ pub struct UpdateRelayNodeRequest {
     #[serde(default)]
     pub tags: Vec<String>,
     pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceRelayNodeIdentityRequest {
+    /// SHA-256 hex fingerprint of the replacement node's local instance key.
+    /// The raw key must never be sent to the Panel.
+    pub identity_hash: String,
 }
 
 fn error<T: Serialize>(code: i32, message: &str) -> ApiResponse<T> {
@@ -118,6 +127,7 @@ pub async fn list(
                 ram: metrics.ram,
                 connections: metrics.connections,
                 node_version: metrics.node_version,
+                config_protocol_version: metrics.config_protocol_version,
                 socks5_check_queue: metrics.socks5_check_queue,
                 supports_socks5_check: metrics.socks5_check_queue.is_some(),
             }
@@ -194,6 +204,60 @@ pub async fn update(
     }
 }
 
+pub async fn replace_identity(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<ReplaceRelayNodeIdentityRequest>,
+) -> Json<ApiResponse<()>> {
+    let identity_hash = request.identity_hash.trim().to_ascii_lowercase();
+    if identity_hash.len() != 64 || !identity_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Json(error(400, "Identity fingerprint 必须是 64 位 SHA-256 hex"));
+    }
+    let node = match state.db.find_relay_node(id).await {
+        Ok(Some(node)) => node,
+        Ok(None) => return Json(error(404, "Relay Node 不存在")),
+        Err(db_error) => {
+            tracing::error!("find relay node before identity replacement {id}: {db_error}");
+            return Json(error(500, "数据库错误"));
+        }
+    };
+
+    // Close both sides of the DB update to cover a reconnect racing the
+    // administrative rotation. Old callbacks also fail the fingerprint and
+    // WebSocket-session checks.
+    state
+        .node_connections
+        .close_node(node.device_group_id, &node.node_key)
+        .await;
+    match state
+        .db
+        .replace_relay_node_identity(id, &identity_hash)
+        .await
+    {
+        Ok(1) => {}
+        Ok(_) => return Json(error(404, "Relay Node 不存在")),
+        Err(db_error) => {
+            tracing::error!("replace relay node identity {id}: {db_error}");
+            return Json(error(500, "数据库错误"));
+        }
+    }
+    state
+        .node_connections
+        .close_node(node.device_group_id, &node.node_key)
+        .await;
+    crate::service::audit::record(
+        &state,
+        Some(admin.user_id),
+        "relay_node_identity_replace",
+        "relay_node",
+        id,
+        "physical identity fingerprint replaced",
+    )
+    .await;
+    Json(ApiResponse::success(()))
+}
+
 async fn load_live_metrics(state: &AppState) -> HashMap<(i64, String), LiveMetrics> {
     let mut result = HashMap::new();
     let rows = match state.db.scan_prefix("node_status:").await {
@@ -237,6 +301,9 @@ async fn load_live_metrics(state: &AppState) -> HashMap<(i64, String), LiveMetri
                     .get("node_version")
                     .and_then(|v| v.as_str())
                     .map(ToOwned::to_owned),
+                config_protocol_version: value
+                    .get("config_protocol_version")
+                    .and_then(|v| v.as_u64()),
                 socks5_check_queue: value
                     .get("socks5_check_queue_depth")
                     .and_then(|v| v.as_u64()),

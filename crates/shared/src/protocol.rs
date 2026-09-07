@@ -30,10 +30,12 @@ use serde::{Deserialize, Serialize};
 /// wire fields from ListenerConfig. A v0.4.6 node still expects those fields,
 /// so deserialization would fail or misread — the gate forces a coordinated
 /// upgrade. Also adds node_transport to the listener fingerprint.
-/// v5 = SOCKS5 relay: ListenerConfig gains explicit ingress and upstream
+/// v5 = SOCKS5 relay: ListenerConfig gains explicit ingress and upstream.
+/// v6 = Stage 3 health commands bind a WebSocket session and resource
+/// generation so reconnects and late results fail closed.
 /// descriptors, including short-lived runtime credentials. Older nodes cannot
 /// safely infer this behavior, so panel and node must upgrade together.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 5;
+pub const CONFIG_PROTOCOL_VERSION: u32 = 6;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -902,6 +904,15 @@ pub struct Socks5CheckRequest {
     pub msg_type: String,
     pub request_id: String,
     pub challenge: String,
+    /// Opaque identifier for the exact authenticated WebSocket session that
+    /// received this command. Results from an older reconnected session are
+    /// rejected by the panel.
+    pub session_id: String,
+    /// Resource revision captured when the check starts. Credential, endpoint,
+    /// or enabled-state changes invalidate older results across every node.
+    pub resource_generation: i64,
+    /// Monotonic generation for this exact Resource × Node matrix cell.
+    pub generation: i64,
     pub resource_id: i64,
     pub relay_node_id: i64,
     pub node_id: String,
@@ -929,12 +940,15 @@ impl std::fmt::Debug for Socks5CheckRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Socks5CheckResult {
     #[serde(rename = "type")]
     pub msg_type: String,
     pub request_id: String,
     pub challenge: String,
+    pub session_id: String,
+    pub resource_generation: i64,
+    pub generation: i64,
     pub resource_id: i64,
     pub relay_node_id: i64,
     pub node_id: String,
@@ -949,6 +963,25 @@ pub struct Socks5CheckResult {
     pub error_code: Option<String>,
     pub safe_error_message: Option<String>,
     pub checked_at: String,
+}
+
+impl std::fmt::Debug for Socks5CheckResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Socks5CheckResult")
+            .field("request_id", &self.request_id)
+            .field("challenge", &"***")
+            .field("session_id", &"***")
+            .field("resource_generation", &self.resource_generation)
+            .field("generation", &self.generation)
+            .field("resource_id", &self.resource_id)
+            .field("relay_node_id", &self.relay_node_id)
+            .field("node_id", &self.node_id)
+            .field("status", &self.status)
+            .field("total_latency_ms", &self.total_latency_ms)
+            .field("exit_ip", &self.exit_ip)
+            .field("error_code", &self.error_code)
+            .finish()
+    }
 }
 
 /// Compare a reported node_version against "0.4.9". Returns true if the node
@@ -1348,6 +1381,9 @@ mod tests {
             msg_type: "socks5_check".into(),
             request_id: "request".into(),
             challenge: "challenge".into(),
+            session_id: "session".into(),
+            resource_generation: 1,
+            generation: 1,
             resource_id: 1,
             relay_node_id: 2,
             node_id: "node-a".into(),
@@ -1365,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_listener_without_v5_ingress_and_upstream_is_rejected() {
+    fn legacy_listener_without_current_ingress_and_upstream_is_rejected() {
         let legacy = serde_json::json!({
             "rule_id": 1,
             "port": 10001,

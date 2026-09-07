@@ -64,6 +64,7 @@ export interface RelayNode {
   ram: number | null;
   connections: number | null;
   node_version: string | null;
+  config_protocol_version: number | null;
   socks5_check_queue: number | null;
   supports_socks5_check: boolean;
 }
@@ -87,8 +88,6 @@ export interface Socks5Health {
 }
 
 export interface Socks5CheckResult {
-  resource_id: number;
-  relay_node_id: number;
   status: Socks5Resource['status'];
   tcp_latency_ms: number | null;
   handshake_latency_ms: number | null;
@@ -115,7 +114,7 @@ export interface Socks5ImportPreview {
   invalid: number;
   duplicate: number;
   new: number;
-  invalid_lines: Array<{ line_number: number; raw_masked: string; error_reason: string }>;
+  invalid_lines: Array<{ line_number: number; error_code: string; raw_masked: string; error_reason: string }>;
 }
 
 export interface Socks5RelayRule {

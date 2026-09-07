@@ -51,11 +51,12 @@ impl Socks5CheckRuntime {
             .is_ok()
     }
 
-    pub fn submit(
+    pub async fn submit(
         self: &Arc<Self>,
         request: Socks5CheckRequest,
         config: NodeConfig,
         local_node_id: String,
+        node_identity_secret: String,
     ) {
         if request.node_id != local_node_id {
             tracing::warn!(
@@ -64,6 +65,18 @@ impl Socks5CheckRuntime {
             );
             return;
         }
+        if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
+            tokio::spawn(async move {
+                let _permit = permit;
+                let result = execute_check(&request, &local_node_id).await;
+                report(&config, &result, &node_identity_secret).await;
+            });
+            return;
+        }
+
+        // All execution slots are occupied. Only now count this task against
+        // the configured waiting queue, so concurrency=4, queue=20 really
+        // means 4 running + 20 queued (not 4 running + 16 queued).
         if !self.try_enqueue() {
             let result = failure_result(
                 &request,
@@ -74,7 +87,10 @@ impl Socks5CheckRuntime {
                 "SOCKS5 health-check queue is full",
                 Instant::now(),
             );
-            tokio::spawn(async move { report(&config, &result).await });
+            // Report overload inline on the WebSocket receiver task. This
+            // applies natural backpressure and, critically, avoids spawning
+            // one Tokio task for every rejected command during a flood.
+            report(&config, &result, &node_identity_secret).await;
             return;
         }
 
@@ -86,18 +102,29 @@ impl Socks5CheckRuntime {
                 return;
             };
             let result = execute_check(&request, &local_node_id).await;
-            report(&config, &result).await;
+            report(&config, &result, &node_identity_secret).await;
         });
     }
 }
 
-async fn report(config: &NodeConfig, result: &Socks5CheckResult) {
+async fn report(config: &NodeConfig, result: &Socks5CheckResult, node_identity_secret: &str) {
     let url = format!("{}/api/v1/node/socks5-check-result", config.panel_url);
-    let client = reqwest::Client::new();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!("cannot build SOCKS5 result client: {}", error);
+            return;
+        }
+    };
     for attempt in 0..3 {
         let response = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.token))
+            .header("X-Node-ID", &result.node_id)
+            .header("X-Node-Identity", node_identity_secret)
             .json(result)
             .send()
             .await;
@@ -567,11 +594,7 @@ async fn check_endpoint(
         );
     };
     let header = String::from_utf8_lossy(&response[..split]);
-    if !header
-        .lines()
-        .next()
-        .is_some_and(|line| line.contains(" 200 "))
-    {
+    if !header.lines().next().is_some_and(is_http_200_status_line) {
         return timed_failure(
             request,
             node_id,
@@ -646,6 +669,9 @@ async fn check_endpoint(
         msg_type: "socks5_check_result".into(),
         request_id: request.request_id.clone(),
         challenge: request.challenge.clone(),
+        session_id: request.session_id.clone(),
+        resource_generation: request.resource_generation,
+        generation: request.generation,
         resource_id: request.resource_id,
         relay_node_id: request.relay_node_id,
         node_id: node_id.to_owned(),
@@ -757,10 +783,15 @@ fn connect_reply_code(code: u8) -> &'static str {
     }
 }
 fn extract_ip(body: &str) -> Option<String> {
-    body.split(|c: char| c.is_whitespace() || matches!(c, ',' | '"' | '\'' | '[' | ']'))
-        .map(|v| v.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != '.' && c != ':'))
-        .find_map(|v| v.parse::<IpAddr>().ok())
-        .map(|ip| ip.to_string())
+    // The endpoint contract is deliberately strict: one plain-text IP and
+    // optional surrounding ASCII whitespace. Accepting the first IP hidden in
+    // HTML/JSON or followed by attacker-controlled text makes a compromised
+    // endpoint able to smuggle arbitrary response content into health state.
+    body.trim().parse::<IpAddr>().ok().map(|ip| ip.to_string())
+}
+fn is_http_200_status_line(line: &str) -> bool {
+    let mut parts = line.split_ascii_whitespace();
+    matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1")) && parts.next() == Some("200")
 }
 fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
     let mut cursor = 0usize;
@@ -862,6 +893,9 @@ fn failure_result(
         msg_type: "socks5_check_result".into(),
         request_id: request.request_id.clone(),
         challenge: request.challenge.clone(),
+        session_id: request.session_id.clone(),
+        resource_generation: request.resource_generation,
+        generation: request.generation,
         resource_id: request.resource_id,
         relay_node_id: request.relay_node_id,
         node_id: node_id.to_owned(),
@@ -888,7 +922,7 @@ mod tests {
     enum MockMode {
         Online,
         AuthFailed,
-        ConnectFailed,
+        ConnectFailed(u8),
         Timeout,
     }
 
@@ -933,9 +967,9 @@ mod tests {
             };
             let mut target = vec![0u8; address_len + 2];
             stream.read_exact(&mut target).await.unwrap();
-            if matches!(mode, MockMode::ConnectFailed) {
+            if let MockMode::ConnectFailed(reply_code) = mode {
                 stream
-                    .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .write_all(&[0x05, reply_code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                     .await
                     .unwrap();
                 return;
@@ -969,6 +1003,9 @@ mod tests {
             msg_type: "socks5_check".into(),
             request_id: "request-1".into(),
             challenge: "challenge-1".into(),
+            session_id: "session-1".into(),
+            resource_generation: 1,
+            generation: 1,
             resource_id: 7,
             relay_node_id: 9,
             node_id: "node-a".into(),
@@ -986,7 +1023,10 @@ mod tests {
         for (mode, expected) in [
             (MockMode::Online, Socks5HealthStatus::Online),
             (MockMode::AuthFailed, Socks5HealthStatus::AuthFailed),
-            (MockMode::ConnectFailed, Socks5HealthStatus::ConnectFailed),
+            (
+                MockMode::ConnectFailed(5),
+                Socks5HealthStatus::ConnectFailed,
+            ),
         ] {
             let (port, task) = mock_proxy(mode).await;
             let result = check_endpoint(
@@ -1000,6 +1040,28 @@ mod tests {
             if matches!(mode, MockMode::Online) {
                 assert_eq!(result.exit_ip.as_deref(), Some("198.51.100.8"));
             }
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn every_rfc1928_connect_failure_is_classified_as_connect_failed() {
+        for (reply_code, expected_code) in [
+            (3, "SOCKS_NETWORK_UNREACHABLE"),
+            (4, "SOCKS_HOST_UNREACHABLE"),
+            (5, "SOCKS_CONNECTION_REFUSED"),
+            (6, "SOCKS_TTL_EXPIRED"),
+        ] {
+            let (port, task) = mock_proxy(MockMode::ConnectFailed(reply_code)).await;
+            let result = check_endpoint(
+                &request(port, None),
+                "node-a",
+                "http://example.com/ip",
+                Instant::now(),
+            )
+            .await;
+            assert_eq!(result.status, Socks5HealthStatus::ConnectFailed);
+            assert_eq!(result.error_code.as_deref(), Some(expected_code));
             task.await.unwrap();
         }
     }
@@ -1038,6 +1100,16 @@ mod tests {
     fn parses_ipv4_and_ipv6_exit_values() {
         assert_eq!(extract_ip("1.2.3.4\n").as_deref(), Some("1.2.3.4"));
         assert_eq!(extract_ip("2001:db8::1").as_deref(), Some("2001:db8::1"));
+        assert!(extract_ip("<html>1.2.3.4</html>").is_none());
+        assert!(extract_ip("1.2.3.4 garbage").is_none());
+        assert!(extract_ip("1.2.3.4\n5.6.7.8").is_none());
+        assert!(extract_ip(r#"{"ip":"1.2.3.4"}"#).is_none());
+    }
+    #[test]
+    fn http_status_parser_does_not_accept_embedded_200() {
+        assert!(is_http_200_status_line("HTTP/1.1 200 OK"));
+        assert!(!is_http_200_status_line("HTTP/1.1 500 contains 200 OK"));
+        assert!(!is_http_200_status_line("NOTHTTP 200 OK"));
     }
     #[test]
     fn connect_request_supports_domain_and_ip_families() {
@@ -1054,17 +1126,38 @@ mod tests {
         assert!(decode_chunked(b"10\r\nshort\r\n").is_none());
     }
     #[test]
-    fn queue_is_bounded() {
-        let runtime = Socks5CheckRuntime::new(2, 7);
-        assert_eq!(runtime.queue_limit, 7);
-        assert_eq!(runtime.queue_depth(), 0);
-        for _ in 0..7 {
-            assert!(runtime.try_enqueue());
+    fn queue_is_bounded_under_each_required_thousand_command_burst() {
+        // The network classification tests above exercise each failure stage.
+        // Here every worker permit is deliberately held to model the worst-case
+        // scheduler pressure caused by 1,000 slow commands of each required
+        // profile. Queue admission must remain independent of where a worker is
+        // stalled.
+        for profile in [
+            "timeout-upstream",
+            "auth-failed",
+            "handshake-stall",
+            "connect-stall",
+        ] {
+            let runtime = Socks5CheckRuntime::new(4, 20);
+            let mut running = Vec::new();
+            for _ in 0..4 {
+                running.push(runtime.semaphore.clone().try_acquire_owned().unwrap());
+            }
+            assert_eq!(runtime.queue_limit, 20, "profile={profile}");
+            assert_eq!(runtime.queue_depth(), 0, "profile={profile}");
+            let mut queued = 0;
+            let mut busy = 0;
+            for _ in 0..996 {
+                if runtime.try_enqueue() {
+                    queued += 1;
+                } else {
+                    busy += 1;
+                }
+            }
+            assert_eq!(running.len(), 4, "profile={profile}");
+            assert_eq!(queued, 20, "profile={profile}");
+            assert_eq!(busy, 976, "profile={profile}");
+            assert_eq!(runtime.queue_depth(), 20, "profile={profile}");
         }
-        assert!(
-            !runtime.try_enqueue(),
-            "the eighth task must become NODE_BUSY"
-        );
-        assert_eq!(runtime.queue_depth(), 7);
     }
 }

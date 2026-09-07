@@ -55,6 +55,7 @@ pub struct Socks5ResourceRecord {
     pub detected_country: Option<String>,
     pub latency_ms: Option<i32>,
     pub consecutive_failures: i32,
+    pub health_generation: i64,
     pub last_check_at: Option<String>,
     pub last_success_at: Option<String>,
     pub created_at: String,
@@ -98,6 +99,8 @@ pub struct RelayNodeRecord {
     pub id: i64,
     pub device_group_id: i64,
     pub node_key: String,
+    #[serde(skip_serializing)]
+    pub identity_secret_hash: String,
     pub name: String,
     pub country: String,
     pub country_code: String,
@@ -140,6 +143,10 @@ pub struct Socks5LatestHealthRecord {
     pub relay_node_id: i64,
     pub relay_node_name: String,
     pub status: String,
+    pub total_latency_ms: Option<i32>,
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub consecutive_failures: i32,
     pub checked_at: String,
 }
 
@@ -731,11 +738,17 @@ pub trait Socks5Repository: Send + Sync {
         &self,
         device_group_id: i64,
         node_key: &str,
+        identity_secret_hash: &str,
         public_ip: &str,
         seen_at: &str,
-    ) -> Result<i64, DbError>;
+    ) -> Result<Option<i64>, DbError>;
     async fn list_relay_nodes(&self) -> Result<Vec<RelayNodeRecord>, DbError>;
     async fn find_relay_node(&self, id: i64) -> Result<Option<RelayNodeRecord>, DbError>;
+    async fn replace_relay_node_identity(
+        &self,
+        id: i64,
+        identity_secret_hash: &str,
+    ) -> Result<u64, DbError>;
     #[allow(clippy::too_many_arguments)]
     async fn update_relay_node(
         &self,
@@ -751,7 +764,21 @@ pub trait Socks5Repository: Send + Sync {
         tags: &str,
         enabled: bool,
     ) -> Result<u64, DbError>;
-    async fn record_socks5_health(&self, health: &Socks5HealthRecord) -> Result<(), DbError>;
+    /// Atomically advances the per-resource check generation. A result may
+    /// mutate health only while this generation remains current.
+    async fn begin_socks5_health_check(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+    ) -> Result<Option<(Socks5ResourceRecord, i64)>, DbError>;
+    /// Returns false when the resource was deleted or a newer check/update has
+    /// superseded this generation.
+    async fn record_socks5_health(
+        &self,
+        health: &Socks5HealthRecord,
+        resource_generation: i64,
+        generation: i64,
+    ) -> Result<bool, DbError>;
     async fn list_socks5_health(
         &self,
         resource_id: i64,

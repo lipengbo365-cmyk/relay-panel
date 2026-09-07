@@ -41,13 +41,14 @@ export default function RelayNodes() {
   const columns = useMemo(() => [
     { title: 'Name', dataIndex: 'name' },
     { title: 'Country', render: (_: unknown, row: RelayNode) => [row.country_code, row.country].filter(Boolean).join(' · ') || '-' },
-    { title: 'Public IP', dataIndex: 'public_ip', render: (value: string) => value || '-' },
+    { title: 'Node-reported IP', dataIndex: 'public_ip', render: (value: string) => value || '-' },
     { title: 'Provider', dataIndex: 'provider', render: (value: string) => value || '-' },
     { title: 'Online', render: (_: unknown, row: RelayNode) => <Tag color={row.online ? 'green' : 'red'}>{row.online ? 'ONLINE' : 'OFFLINE'}</Tag> },
     { title: 'Last Seen', dataIndex: 'last_seen_at' },
     { title: 'CPU', dataIndex: 'cpu', render: (value: number | null) => value == null ? '-' : `${value.toFixed(1)}%` },
     { title: 'RAM', dataIndex: 'ram', render: (value: number | null) => value == null ? '-' : `${value.toFixed(1)}%` },
     { title: 'Connections', dataIndex: 'connections', render: (value: number | null) => value ?? '-' },
+    { title: 'Node / Protocol', render: (_: unknown, row: RelayNode) => `${row.node_version || '-'} · v${row.config_protocol_version ?? '-'}` },
     { title: 'SOCKS5 Check Queue', render: (_: unknown, row: RelayNode) => row.supports_socks5_check ? row.socks5_check_queue ?? 0 : <Tag color="orange">Upgrade required</Tag> },
     { title: 'Tags', render: (_: unknown, row: RelayNode) => row.tags.length ? row.tags.map((tag) => <Tag key={tag}>{tag}</Tag>) : '-' },
     {

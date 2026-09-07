@@ -226,11 +226,13 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/admin/socks5-resources/import/preview",
-            axum::routing::post(socks5_import::preview),
+            axum::routing::post(socks5_import::preview)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
             "/admin/socks5-resources/import/confirm",
-            axum::routing::post(socks5_import::confirm),
+            axum::routing::post(socks5_import::confirm)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
             "/admin/socks5-resources/page",
@@ -252,6 +254,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/relay-nodes/{id}",
             axum::routing::put(relay_nodes::update),
+        )
+        .route(
+            "/admin/relay-nodes/{id}/identity",
+            axum::routing::put(relay_nodes::replace_identity),
         )
         .route(
             "/admin/socks5-rules",

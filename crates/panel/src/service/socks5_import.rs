@@ -33,6 +33,7 @@ impl ParsedImportLine {
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct ImportLineError {
     pub line_number: usize,
+    pub error_code: &'static str,
     pub raw_masked: String,
     pub error_reason: String,
 }
@@ -60,10 +61,14 @@ pub fn parse_import(input: &str, max_lines: usize) -> ParsedImport {
         if result.total > max_lines {
             result.invalid.push(ImportLineError {
                 line_number,
+                error_code: "LIMIT_EXCEEDED",
                 raw_masked: mask_raw(raw),
                 error_reason: format!("导入最多允许 {max_lines} 条非空记录"),
             });
-            continue;
+            // One sentinel is sufficient to reject the request. Continuing
+            // over millions of tiny lines would amplify a bounded HTTP body
+            // into an unbounded validation-error vector and response.
+            break;
         }
 
         match parse_line(line_number, raw) {
@@ -78,6 +83,7 @@ pub fn parse_import(input: &str, max_lines: usize) -> ParsedImport {
             }
             Err(reason) => result.invalid.push(ImportLineError {
                 line_number,
+                error_code: "INVALID_FORMAT",
                 raw_masked: mask_raw(raw),
                 error_reason: reason,
             }),
@@ -87,16 +93,22 @@ pub fn parse_import(input: &str, max_lines: usize) -> ParsedImport {
 }
 
 fn parse_line(line_number: usize, raw: &str) -> Result<ParsedImportLine, String> {
-    let without_scheme = if let Some(rest) = raw.strip_prefix("socks5://") {
-        rest
+    let (without_scheme, uri_form) = if let Some(rest) = raw.strip_prefix("socks5://") {
+        (rest, true)
     } else if raw.contains("://") {
         return Err("仅支持 socks5:// scheme".into());
     } else {
-        raw
+        (raw, false)
     };
 
-    let (username, password, endpoint) =
-        if let Some((auth, endpoint)) = without_scheme.rsplit_once('@') {
+    let (username, password, endpoint) = if !uri_form {
+        if let Some((endpoint, username, password)) = split_host_form(without_scheme) {
+            (
+                username.map(normalize_credential).transpose()?.flatten(),
+                password.map(ToOwned::to_owned),
+                endpoint,
+            )
+        } else if let Some((auth, endpoint)) = without_scheme.rsplit_once('@') {
             let (username, password) = auth
                 .split_once(':')
                 .ok_or_else(|| "认证部分必须是 user:password".to_string())?;
@@ -105,25 +117,21 @@ fn parse_line(line_number: usize, raw: &str) -> Result<ParsedImportLine, String>
                 Some(password.to_owned()),
                 endpoint,
             )
-        } else if !without_scheme.starts_with('[') {
-            let mut parts = without_scheme.splitn(4, ':');
-            let host = parts.next().unwrap_or_default();
-            let port = parts.next().ok_or_else(|| "缺少端口".to_string())?;
-            match (parts.next(), parts.next()) {
-                (None, None) => (None, None, without_scheme),
-                (Some(user), Some(password)) => {
-                    let endpoint_len = host.len() + 1 + port.len();
-                    (
-                        normalize_credential(user)?,
-                        Some(password.to_owned()),
-                        &without_scheme[..endpoint_len],
-                    )
-                }
-                _ => return Err("格式应为 host:port:user:password".into()),
-            }
         } else {
             (None, None, without_scheme)
-        };
+        }
+    } else if let Some((auth, endpoint)) = without_scheme.rsplit_once('@') {
+        let (username, password) = auth
+            .split_once(':')
+            .ok_or_else(|| "认证部分必须是 user:password".to_string())?;
+        (
+            normalize_credential(username)?,
+            Some(password.to_owned()),
+            endpoint,
+        )
+    } else {
+        (None, None, without_scheme)
+    };
 
     if username.is_some() != password.is_some() {
         return Err("用户名和密码必须同时提供".into());
@@ -142,6 +150,37 @@ fn parse_line(line_number: usize, raw: &str) -> Result<ParsedImportLine, String>
         username,
         password,
     })
+}
+
+/// Recognize the unambiguous legacy endpoint-first forms. Looking for a
+/// numeric port before considering `@` is what allows `@` inside the password
+/// of `host:port:user:password` without breaking `user:password@host:port`.
+fn split_host_form(value: &str) -> Option<(&str, Option<&str>, Option<&str>)> {
+    if value.starts_with('[') {
+        let close = value.find(']')?;
+        let suffix = value.get(close + 1..)?.strip_prefix(':')?;
+        let mut fields = suffix.splitn(3, ':');
+        let port = fields.next()?;
+        port.parse::<u16>().ok()?;
+        let endpoint_end = close + 2 + port.len();
+        return match (fields.next(), fields.next()) {
+            (None, None) => Some((&value[..endpoint_end], None, None)),
+            (Some(user), Some(password)) => {
+                Some((&value[..endpoint_end], Some(user), Some(password)))
+            }
+            _ => None,
+        };
+    }
+    let mut fields = value.splitn(4, ':');
+    let host = fields.next()?;
+    let port = fields.next()?;
+    port.parse::<u16>().ok()?;
+    let endpoint_end = host.len() + 1 + port.len();
+    match (fields.next(), fields.next()) {
+        (None, None) => Some((&value[..endpoint_end], None, None)),
+        (Some(user), Some(password)) => Some((&value[..endpoint_end], Some(user), Some(password))),
+        _ => None,
+    }
 }
 
 fn normalize_credential(value: &str) -> Result<Option<String>, String> {
@@ -204,25 +243,12 @@ pub fn normalize_host(host: &str) -> Result<String, String> {
 }
 
 pub fn mask_raw(raw: &str) -> String {
-    let raw = raw.trim();
-    if let Some((left, _)) = raw.rsplit_once('@') {
-        let scheme = if raw.starts_with("socks5://") {
-            "socks5://"
-        } else {
-            ""
-        };
-        let auth = left.strip_prefix(scheme).unwrap_or(left);
-        let user = auth.split_once(':').map(|v| v.0).unwrap_or("***");
-        let endpoint = raw.rsplit_once('@').map(|v| v.1).unwrap_or("");
-        return format!("{scheme}{user}:***@{endpoint}");
-    }
-    if !raw.starts_with('[') {
-        let parts: Vec<&str> = raw.splitn(4, ':').collect();
-        if parts.len() == 4 {
-            return format!("{}:{}:{}:***", parts[0], parts[1], parts[2]);
-        }
-    }
-    raw.to_owned()
+    let _ = raw;
+    // Invalid syntax is inherently ambiguous: a colon-delimited IPv6 suffix,
+    // malformed URI, or duplicate separator may place a password anywhere.
+    // Returning any substring risks disclosing it, so validation responses
+    // expose only the line number and this irreversible placeholder.
+    "***".to_owned()
 }
 
 fn display_host(host: &str) -> String {
@@ -270,9 +296,145 @@ mod tests {
 
     #[test]
     fn rejects_invalid_and_over_limit_rows_independently() {
-        let parsed = parse_import("ok.test:1080\nbad\nalso.test:70000\nlast.test:1080", 2);
+        let input = "ok.test:1080\nbad\nalso.test:70000\nlast.test:1080";
+        let parsed = parse_import(input, 10);
         assert_eq!(parsed.total, 4);
-        assert_eq!(parsed.valid.len(), 1);
-        assert_eq!(parsed.invalid.len(), 3);
+        assert_eq!(parsed.valid.len(), 2);
+        assert_eq!(parsed.invalid.len(), 2);
+
+        let over_limit = parse_import(input, 2);
+        assert_eq!(over_limit.total, 3);
+        assert_eq!(over_limit.valid.len(), 1);
+        assert_eq!(over_limit.invalid.len(), 2);
+        assert_eq!(
+            over_limit
+                .invalid
+                .iter()
+                .filter(|error| error.error_reason.contains("最多允许"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn parses_ipv4_ipv6_domain_crlf_unicode_and_reserved_password_chars() {
+        let parsed = parse_import(
+            "  192.0.2.1:1080  \r\n[2001:db8::1]:1080\r\nproxy.example:1080:用户:p:a@/\\#?%\r\nsocks5://user:p:a@/\\#?%25@host.example:1080\r\n",
+            100,
+        );
+        assert_eq!(parsed.total, 4);
+        assert!(parsed.invalid.is_empty(), "unexpected parse failure");
+        assert_eq!(parsed.valid[1].host, "2001:db8::1");
+        assert_eq!(parsed.valid[2].password.as_deref(), Some("p:a@/\\#?%"));
+        assert_eq!(parsed.valid[3].password.as_deref(), Some("p:a@/\\#?%25"));
+    }
+
+    #[test]
+    fn percent_encoding_is_preserved_without_ambiguous_decode() {
+        let parsed = parse_import("socks5://u%40name:p%3Aword@host.example:1080", 10);
+        assert!(parsed.invalid.is_empty());
+        assert_eq!(parsed.valid[0].username.as_deref(), Some("u%40name"));
+        assert_eq!(parsed.valid[0].password.as_deref(), Some("p%3Aword"));
+    }
+
+    #[test]
+    fn malformed_uri_and_oversized_rows_never_echo_secret_or_unbounded_input() {
+        let secret = "malformed-secret";
+        let parsed = parse_import(&format!("socks5://user:{secret}"), 10);
+        assert_eq!(parsed.invalid.len(), 1);
+        assert!(!parsed.invalid[0].raw_masked.contains(secret));
+
+        let huge = "x".repeat(10_000);
+        let parsed = parse_import(&huge, 10);
+        assert_eq!(parsed.invalid[0].raw_masked, "***");
+    }
+
+    #[test]
+    fn malformed_bracketed_rows_never_echo_credentials() {
+        let secret = "ipv6-secret";
+        let parsed = parse_import(&format!("[2001:db8::1]:bad:user:{secret}"), 10);
+        assert_eq!(parsed.invalid.len(), 1);
+        assert_eq!(parsed.invalid[0].raw_masked, "***");
+        assert!(!serde_json::to_string(&parsed.invalid)
+            .unwrap()
+            .contains(secret));
+    }
+
+    #[test]
+    fn excessive_tiny_lines_create_only_one_bounded_error() {
+        let input = "x\n".repeat(50_000);
+        let parsed = parse_import(&input, 10_000);
+        assert_eq!(parsed.total, 10_001);
+        assert_eq!(parsed.invalid.len(), 10_001);
+        assert_eq!(
+            parsed
+                .invalid
+                .iter()
+                .filter(|error| error.error_reason.contains("最多允许"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn parser_edge_cases_preserve_accounting() {
+        let parsed = parse_import(
+            "\n\t\n host.example:1080 \ninvalid\nhost.example:1080\n[2001:db8::1]:1080\n",
+            10,
+        );
+        assert_eq!(parsed.total, 4);
+        assert_eq!(parsed.valid.len(), 2);
+        assert_eq!(parsed.duplicates.len(), 1);
+        assert_eq!(parsed.invalid.len(), 1);
+        assert_eq!(
+            parsed.valid.len() + parsed.duplicates.len() + parsed.invalid.len(),
+            parsed.total
+        );
+    }
+
+    #[test]
+    fn invalid_rows_at_chunk_boundaries_preserve_accounting() {
+        for invalid_line in [499usize, 500, 501] {
+            let input = (1..=1_000)
+                .map(|line| {
+                    if line == invalid_line {
+                        "socks5://user:secret@bad host:1080".to_owned()
+                    } else {
+                        format!("proxy-{line}.example:1080")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let parsed = parse_import(&input, 10_000);
+            assert_eq!(parsed.total, 1_000);
+            assert_eq!(parsed.valid.len(), 999);
+            assert_eq!(parsed.invalid.len(), 1);
+            assert_eq!(parsed.invalid[0].line_number, invalid_line);
+            assert_eq!(parsed.invalid[0].error_code, "INVALID_FORMAT");
+            assert_eq!(parsed.invalid[0].raw_masked, "***");
+        }
+    }
+
+    #[test]
+    fn sixteen_mibibytes_of_invalid_tiny_lines_stops_at_fixed_limit() {
+        let input = "x\n".repeat(8 * 1024 * 1024);
+        let parsed = parse_import(&input, 10_000);
+        assert_eq!(parsed.total, 10_001);
+        assert_eq!(parsed.invalid.len(), 10_001);
+        assert_eq!(parsed.invalid.last().unwrap().error_code, "LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn password_space_and_unicode_are_preserved_without_echo_on_failure() {
+        let parsed = parse_import(
+            "proxy.example:1080:user:密 码 with spaces\nsocks5://用户:密 码@proxy2.example:1080",
+            10,
+        );
+        assert!(parsed.invalid.is_empty());
+        assert_eq!(
+            parsed.valid[0].password.as_deref(),
+            Some("密 码 with spaces")
+        );
+        assert_eq!(parsed.valid[1].password.as_deref(), Some("密 码"));
     }
 }

@@ -174,10 +174,11 @@ CREATE TABLE IF NOT EXISTS socks5_resources (
     isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'UNKNOWN'
-        CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
+        CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    health_generation BIGINT NOT NULL DEFAULT 0,
     last_check_at TEXT, last_success_at TEXT,
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
     updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
@@ -188,6 +189,11 @@ CREATE TABLE IF NOT EXISTS socks5_resources (
 CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter
     ON socks5_resources(enabled, status, country_code);
 CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
     ON socks5_resources(host, port, COALESCE(username, ''));
 
@@ -214,10 +220,11 @@ CREATE TABLE IF NOT EXISTS relay_nodes (
     id BIGSERIAL PRIMARY KEY,
     device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
     node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+    identity_secret_hash TEXT NOT NULL DEFAULT '',
     country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
     region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
-    bandwidth_mbps INTEGER NOT NULL DEFAULT 0, remark TEXT NOT NULL DEFAULT '',
+    bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps >= 0), remark TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]', enabled BOOLEAN NOT NULL DEFAULT TRUE,
     first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
@@ -226,6 +233,13 @@ CREATE TABLE IF NOT EXISTS relay_nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id);
 CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled);
+
+CREATE TABLE IF NOT EXISTS socks5_check_generations (
+    resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    generation BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY(resource_id, relay_node_id)
+);
 
 CREATE TABLE IF NOT EXISTS socks5_resource_health (
     resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
@@ -244,7 +258,7 @@ CREATE TABLE IF NOT EXISTS socks5_check_history (
     id BIGSERIAL PRIMARY KEY,
     resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
     relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
-    status TEXT NOT NULL, tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
+    status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')), tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
     connect_latency_ms INTEGER, total_latency_ms INTEGER, exit_ip TEXT, country TEXT,
     error_stage TEXT, error_code TEXT, safe_error_message TEXT, checked_at TEXT NOT NULL
 );
@@ -479,7 +493,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 30;
+pub const PG_SCHEMA_VERSION: i32 = 32;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1558,7 +1572,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
                 region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
                 isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'UNKNOWN'
-                    CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','DISABLED','UNKNOWN')),
+                CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
                 enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
@@ -1645,6 +1659,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
                 id BIGSERIAL PRIMARY KEY,
                 device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
                 node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+                identity_secret_hash TEXT NOT NULL DEFAULT '',
                 country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
                 region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
                 provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
@@ -1697,6 +1712,71 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .await?;
         tx.commit().await?;
         tracing::info!("PG migration 30: relay nodes and SOCKS5 health tables present");
+    }
+
+    if current < 31 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE socks5_resources ADD COLUMN IF NOT EXISTS health_generation BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(31) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 31: SOCKS5 health generation present");
+    }
+
+    if current < 32 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE relay_nodes ADD COLUMN IF NOT EXISTS identity_secret_hash TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_check_generations (
+                resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+                relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+                generation BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY(resource_id,relay_node_id)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE socks5_resources DROP CONSTRAINT IF EXISTS socks5_resources_status_check",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE socks5_resources ADD CONSTRAINT socks5_resources_status_check CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN'))",
+        )
+        .execute(&mut *tx)
+        .await?;
+        for statement in [
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code,id)",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status,id)",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled,id)",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms,id)",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at,id)",
+            "ALTER TABLE relay_nodes DROP CONSTRAINT IF EXISTS relay_nodes_bandwidth_mbps_check",
+            "ALTER TABLE relay_nodes ADD CONSTRAINT relay_nodes_bandwidth_mbps_check CHECK (bandwidth_mbps >= 0)",
+            "ALTER TABLE socks5_check_history DROP CONSTRAINT IF EXISTS socks5_check_history_status_check",
+            "ALTER TABLE socks5_check_history ADD CONSTRAINT socks5_check_history_status_check CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN'))",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(32) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 32: physical relay-node identity proof present");
     }
 
     Ok(())

@@ -76,6 +76,22 @@ pub async fn list_page(
     State(state): State<AppState>,
     Query(input): Query<PageQuery>,
 ) -> Json<ApiResponse<PageResponse>> {
+    if input.search.as_ref().is_some_and(|value| value.len() > 256)
+        || input.status.as_ref().is_some_and(|value| value.len() > 32)
+        || input
+            .country
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || input
+            .detected_country
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || input.tag.as_ref().is_some_and(|value| value.len() > 64)
+        || input.sort.as_ref().is_some_and(|value| value.len() > 32)
+        || input.order.as_ref().is_some_and(|value| value.len() > 8)
+    {
+        return Json(error(400, "查询参数过长"));
+    }
     let page = input.page.unwrap_or(1).max(1);
     let page_size = input.page_size.unwrap_or(50).clamp(1, 500);
     let query = Socks5ResourceQuery {
@@ -112,6 +128,10 @@ pub async fn list_page(
                     let mut public: Socks5ResourcePublic = row.into();
                     if let Some(health) = latest.get(&public.id) {
                         public.status = health.status.clone();
+                        public.latency_ms = health.total_latency_ms;
+                        public.detected_exit_ip = health.exit_ip.clone();
+                        public.detected_country = health.country.clone();
+                        public.consecutive_failures = health.consecutive_failures;
                         public.last_check_at = Some(health.checked_at.clone());
                         public.last_relay_node_id = Some(health.relay_node_id);
                         public.last_relay_node_name = Some(health.relay_node_name.clone());

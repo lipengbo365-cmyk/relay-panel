@@ -18,9 +18,11 @@ chains.
 - `socks5_resources.tags` is a JSON array represented consistently by the
   SQLite and PostgreSQL repositories.
 
-All migrations are additive. Back up the database before deployment and deploy
-Panel before the Stage 3 Nodes. Stage 2 images and the `v1.0.0-alpha1` source
-tag remain the rollback baseline.
+The alpha3 migrations preserve existing rows while adding physical-node
+fingerprints, resource revisions, per-Resource×Node generations, constraints,
+and indexes. Back up the database before deployment. Because config protocol 6
+is an exact-match gate, deploy Panel and every Node in one maintenance window.
+The frozen `v1.0.0-alpha2` tag remains the historical pre-audit build.
 
 ## Configuration
 
@@ -48,9 +50,11 @@ in Node memory only, and are never written to its cache.
 ## Check path and classification
 
 Panel registers a random request ID and challenge, sends one command to the
-selected physical Node, and accepts one token-authenticated result matching the
-request, challenge, resource, relational Node, and stable node key. Panel writes
-health before completing the waiting admin request.
+selected physical Node, and atomically consumes at most one result matching the
+request, challenge, resource revision, per-Resource×Node generation, relational
+Node, instance-key fingerprint, and current WebSocket session. A superseded
+result is discarded completely: it updates neither latest health nor history.
+Panel receive time in UTC is authoritative; Node wall-clock time is ignored.
 
 The Node performs `TCP_CONNECT`, `SOCKS5_NEGOTIATION`, `AUTHENTICATION`,
 `SOCKS5_CONNECT`, `INTERNET_REQUEST`, and `EXIT_IP_PARSE`. A successful check
@@ -60,6 +64,47 @@ Relay Node public IP, the result is `CONNECT_FAILED/EXIT_IP_MISMATCH`.
 An offline Relay Node returns `NODE_OFFLINE` without mutating SOCKS5 health.
 Queue rejection returns `NODE_BUSY` without mutating health. A failed check
 updates only the selected Resource × Node pair and never disables a resource.
+The resource list is explicitly a projection of the most recently received
+check and names that Relay Node; the detail view is the authoritative complete
+Resource × Node matrix.
+
+## Protocol 6 and physical-node identity
+
+Protocol 6 requires two independent proofs: the DeviceGroup bearer token and a
+random 256-bit instance key stored locally as
+`/opt/relay-node/node-identity-secret` with mode `0600`. The Node sends the raw
+key only as an HTTPS/WSS request header. Panel stores only its SHA-256
+fingerprint and never serializes that fingerprint in admin resource responses.
+The instance key is stable across ordinary restarts and container recreation
+only when `/opt/relay-node` is persisted.
+
+Lifecycle:
+
+- First registration atomically claims `(device_group_id,node_id)` by TOFU.
+- A restart with the same files is accepted; a different key is rejected.
+- Loss of the key or a reinstall fails closed. Panel never overwrites an
+  existing fingerprint during reconnect.
+- For replacement or rotation, stop the old Node, generate the replacement key,
+  calculate its SHA-256 fingerprint on the Node host, then call the admin-only
+  `PUT /api/v1/admin/relay-nodes/{id}/identity` with `identity_hash`. Never send
+  the raw key. The Panel closes the old WebSocket session before and after the
+  atomic fingerprint replacement.
+- Changing `node-id` creates a distinct physical-node record; it does not take
+  over the previous identity.
+
+Compatibility matrix:
+
+| Panel | Node | Result |
+|---|---|---|
+| v6 | v6 | Config, Stage 2 relay, and Stage 3 health allowed after token + instance-key authentication. |
+| v6 | v5 | HTTP config and WebSocket rejected with 426; no Stage 3 command is sent. |
+| v5 | v6 | Node treats the mismatch as permanent and removes listeners; no health command runs. |
+| v5 | v5 | Historical alpha2 behavior only; no alpha3 identity/session/generation guarantees. |
+
+History retention runs after accepted results and deletes at most 10,000 old
+rows per transaction. Repeated checks gradually drain a large backlog without
+holding one transaction across millions of deletes; latest-health rows are in a
+separate table and are never pruned.
 
 ## Rollback
 
