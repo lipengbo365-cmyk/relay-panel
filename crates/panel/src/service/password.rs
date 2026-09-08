@@ -93,6 +93,16 @@ pub fn generate_password() -> String {
     String::from_utf8(chars).expect("charset is ASCII")
 }
 
+/// Generate opaque Stage 4 relay credentials from the OS CSPRNG. The password
+/// contains 192 bits of entropy and uses URL-safe characters so the one-time
+/// SOCKS5 URL can be copied without percent-encoding surprises.
+pub fn generate_relay_credentials() -> (String, String) {
+    use base64::Engine;
+    let username = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes(9));
+    let password = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes(24));
+    (format!("r_{username}"), password)
+}
+
 pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
     bcrypt::hash(password, 12)
 }
@@ -162,6 +172,23 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
             assert!(seen.insert(generate_password()), "generated a duplicate");
+        }
+    }
+
+    #[test]
+    fn relay_credentials_are_opaque_url_safe_and_strong() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let (username, password) = generate_relay_credentials();
+            assert!(username.starts_with("r_"));
+            assert_eq!(password.len(), 32);
+            assert!(username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')));
+            assert!(password
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')));
+            assert!(seen.insert((username, password)));
         }
     }
 

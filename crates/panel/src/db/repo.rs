@@ -108,6 +108,7 @@ pub struct RelayNodeRecord {
     pub city: String,
     pub provider: String,
     pub public_ip: String,
+    pub advertise_host: String,
     pub bandwidth_mbps: i32,
     pub remark: String,
     pub tags: String,
@@ -172,6 +173,9 @@ pub struct Socks5CheckHistoryRecord {
 pub struct Socks5RuleConfigRecord {
     pub rule_id: i64,
     pub socks5_resource_id: i64,
+    pub relay_node_id: Option<i64>,
+    pub selection_mode: String,
+    pub relay_node_enabled: Option<bool>,
     pub remote_dns: bool,
     pub relay_username: Option<String>,
     pub relay_password_ciphertext: Option<String>,
@@ -200,10 +204,116 @@ pub struct Socks5RuleViewRecord {
     pub socks5_resource_id: i64,
     pub resource_name: String,
     pub detected_exit_ip: Option<String>,
+    pub detected_country: Option<String>,
+    pub relay_node_id: Option<i64>,
+    pub relay_node_name: Option<String>,
+    pub relay_node_country_code: Option<String>,
+    pub advertise_host: Option<String>,
+    pub relay_node_public_ip: Option<String>,
+    pub relay_node_enabled: Option<bool>,
+    pub selection_mode: String,
     pub relay_username: Option<String>,
     pub allow_no_auth: bool,
     pub remote_dns: bool,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RelayNodeCapacityRecord {
+    pub relay_node_id: i64,
+    pub device_group_id: i64,
+    pub port_range: String,
+    pub port_used: i64,
+    pub group_type: String,
+    pub group_capabilities: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5RecommendationHealthRecord {
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub status: String,
+    pub total_latency_ms: Option<i32>,
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub checked_at: String,
+    pub resource_revision: i64,
+    pub generation: i64,
+    pub current_generation: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SmartRelayCreateInput {
+    pub actor_id: i64,
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub name: String,
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub requested_port: Option<i32>,
+    pub expected_resource_revision: i64,
+    pub expected_health_generation: i64,
+    pub expected_health_checked_at: String,
+    pub selection_mode: String,
+    pub relay_username: String,
+    pub relay_password_ciphertext: String,
+    pub relay_password_nonce: String,
+    pub relay_password_key_version: i32,
+    pub health_ttl_seconds: i64,
+    pub required_protocol_version: u32,
+    pub max_cpu_percent: f64,
+    pub max_memory_percent: f64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct SmartRelayCreatedRecord {
+    pub rule_id: i64,
+    pub relay_node_id: i64,
+    pub resource_id: i64,
+    pub endpoint_host: String,
+    pub listen_port: i32,
+    pub relay_username: String,
+    pub exit_ip: String,
+    pub exit_country: Option<String>,
+    pub selection_mode: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SmartRelayReceiptRecord {
+    pub request_fingerprint: String,
+    pub rule_id: i64,
+    pub relay_node_id: i64,
+    pub resource_id: i64,
+    pub endpoint_host: String,
+    pub listen_port: i32,
+    pub relay_username: String,
+    pub exit_ip: String,
+    pub exit_country: Option<String>,
+    pub selection_mode: String,
+}
+
+impl SmartRelayReceiptRecord {
+    pub fn created(self) -> SmartRelayCreatedRecord {
+        SmartRelayCreatedRecord {
+            rule_id: self.rule_id,
+            relay_node_id: self.relay_node_id,
+            resource_id: self.resource_id,
+            endpoint_host: self.endpoint_host,
+            listen_port: self.listen_port,
+            relay_username: self.relay_username,
+            exit_ip: self.exit_ip,
+            exit_country: self.exit_country,
+            selection_mode: self.selection_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SmartRelayCreateOutcome {
+    Created(SmartRelayCreatedRecord),
+    Replay(SmartRelayCreatedRecord),
+    Rejected(&'static str),
+    QuotaExceeded,
 }
 
 // ── Resource scoping (v0.4.10 multi-user isolation) ──
@@ -692,6 +802,21 @@ pub trait Socks5Repository: Send + Sync {
         rule_id: i64,
     ) -> Result<Option<Socks5RuleConfigRecord>, DbError>;
     async fn list_socks5_rule_views(&self) -> Result<Vec<Socks5RuleViewRecord>, DbError>;
+    async fn list_relay_node_capacities(&self) -> Result<Vec<RelayNodeCapacityRecord>, DbError>;
+    async fn list_socks5_recommendation_health(
+        &self,
+        resource_id: i64,
+    ) -> Result<Vec<Socks5RecommendationHealthRecord>, DbError>;
+
+    async fn create_smart_relay(
+        &self,
+        input: &SmartRelayCreateInput,
+    ) -> Result<SmartRelayCreateOutcome, DbError>;
+    async fn find_smart_relay_receipt(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+    ) -> Result<Option<SmartRelayReceiptRecord>, DbError>;
 
     /// Atomically create the forward_rules row and its SOCKS5 extension.
     #[allow(clippy::too_many_arguments)]
@@ -759,6 +884,7 @@ pub trait Socks5Repository: Send + Sync {
         region: &str,
         city: &str,
         provider: &str,
+        advertise_host: &str,
         bandwidth_mbps: i32,
         remark: &str,
         tags: &str,

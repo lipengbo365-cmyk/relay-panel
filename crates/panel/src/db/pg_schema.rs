@@ -200,6 +200,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
 CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
     rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
     socks5_resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+    relay_node_id BIGINT,
+    selection_mode TEXT NOT NULL DEFAULT 'LEGACY'
+        CHECK (selection_mode IN ('LEGACY','RECOMMENDED','MANUAL')),
     remote_dns BOOLEAN NOT NULL DEFAULT TRUE,
     relay_username TEXT,
     relay_password_ciphertext TEXT,
@@ -215,6 +218,8 @@ CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
 );
 CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
     ON socks5_rule_bindings(socks5_resource_id);
+CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_node
+    ON socks5_rule_bindings(relay_node_id);
 
 CREATE TABLE IF NOT EXISTS relay_nodes (
     id BIGSERIAL PRIMARY KEY,
@@ -224,6 +229,7 @@ CREATE TABLE IF NOT EXISTS relay_nodes (
     country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
     region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
+    advertise_host TEXT NOT NULL DEFAULT '',
     bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps >= 0), remark TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]', enabled BOOLEAN NOT NULL DEFAULT TRUE,
     first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
@@ -248,6 +254,7 @@ CREATE TABLE IF NOT EXISTS socks5_resource_health (
     tcp_latency_ms INTEGER, handshake_latency_ms INTEGER, connect_latency_ms INTEGER,
     total_latency_ms INTEGER, exit_ip TEXT, country TEXT, error_stage TEXT,
     error_code TEXT, safe_error_message TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    resource_revision BIGINT NOT NULL DEFAULT 0, generation BIGINT NOT NULL DEFAULT 0,
     checked_at TEXT NOT NULL, last_success_at TEXT,
     PRIMARY KEY(resource_id, relay_node_id)
 );
@@ -264,6 +271,26 @@ CREATE TABLE IF NOT EXISTS socks5_check_history (
 );
 CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node ON socks5_check_history(resource_id, relay_node_id, checked_at DESC);
 CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at ON socks5_check_history(checked_at);
+
+CREATE TABLE IF NOT EXISTS relay_creation_receipts (
+    id BIGSERIAL PRIMARY KEY,
+    actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    rule_id BIGINT NOT NULL,
+    relay_node_id BIGINT NOT NULL,
+    resource_id BIGINT NOT NULL,
+    endpoint_host TEXT NOT NULL,
+    listen_port INTEGER NOT NULL,
+    relay_username TEXT NOT NULL,
+    exit_ip TEXT NOT NULL,
+    exit_country TEXT,
+    selection_mode TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    UNIQUE(actor_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created
+    ON relay_creation_receipts(created_at);
 
 CREATE TABLE IF NOT EXISTS statistics (
     id BIGSERIAL PRIMARY KEY,
@@ -493,7 +520,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 32;
+pub const PG_SCHEMA_VERSION: i32 = 33;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1777,6 +1804,73 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .await?;
         tx.commit().await?;
         tracing::info!("PG migration 32: physical relay-node identity proof present");
+    }
+
+    if current < 33 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "ALTER TABLE relay_nodes ADD COLUMN IF NOT EXISTS advertise_host TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE socks5_rule_bindings ADD COLUMN IF NOT EXISTS relay_node_id BIGINT",
+            "ALTER TABLE socks5_rule_bindings ADD COLUMN IF NOT EXISTS selection_mode TEXT NOT NULL DEFAULT 'LEGACY'",
+            "ALTER TABLE socks5_resource_health ADD COLUMN IF NOT EXISTS resource_revision BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE socks5_resource_health ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_node ON socks5_rule_bindings(relay_node_id)",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='socks5_rule_bindings_relay_node_fk') THEN
+                    ALTER TABLE socks5_rule_bindings ADD CONSTRAINT socks5_rule_bindings_relay_node_fk
+                    FOREIGN KEY(relay_node_id) REFERENCES relay_nodes(id) ON DELETE RESTRICT;
+                END IF;
+             END $$",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='socks5_rule_bindings_selection_mode_check') THEN
+                    ALTER TABLE socks5_rule_bindings ADD CONSTRAINT socks5_rule_bindings_selection_mode_check
+                    CHECK(selection_mode IN ('LEGACY','RECOMMENDED','MANUAL'));
+                END IF;
+             END $$",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_creation_receipts (
+                id BIGSERIAL PRIMARY KEY,
+                actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                rule_id BIGINT NOT NULL,
+                relay_node_id BIGINT NOT NULL,
+                resource_id BIGINT NOT NULL,
+                endpoint_host TEXT NOT NULL,
+                listen_port INTEGER NOT NULL,
+                relay_username TEXT NOT NULL,
+                exit_ip TEXT NOT NULL,
+                exit_country TEXT,
+                selection_mode TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')),
+                UNIQUE(actor_id,idempotency_key)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created ON relay_creation_receipts(created_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(33) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 33: Stage 4 smart relay binding present");
     }
 
     Ok(())

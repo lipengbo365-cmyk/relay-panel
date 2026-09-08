@@ -59,10 +59,24 @@ pub async fn build_node_config(
 /// Build node configuration and decrypt SOCKS5 credentials only at the final
 /// serialization boundary. A missing/invalid key skips SOCKS5 listeners while
 /// leaving legacy direct rules available.
+#[cfg(test)]
 pub async fn build_node_config_with_key(
     db: &dyn Repository,
     group_id: i64,
     credential_key: Option<&str>,
+) -> Result<NodeConfigResponse, DbError> {
+    build_node_config_for_node(db, group_id, credential_key, None).await
+}
+
+/// Build configuration for one authenticated physical relay node. A Stage 4
+/// binding is filtered before either inbound or upstream credentials are
+/// decrypted. `None` exists only for legacy tests/callers and can receive only
+/// unbound alpha3-compatible rules.
+pub async fn build_node_config_for_node(
+    db: &dyn Repository,
+    group_id: i64,
+    credential_key: Option<&str>,
+    physical_relay_node_id: Option<i64>,
 ) -> Result<NodeConfigResponse, DbError> {
     // 1. Group + "in" gate. Non-`in` groups (out / monitor / chained_outbound)
     //    never receive listeners — they are egress/observation only.
@@ -92,6 +106,13 @@ pub async fn build_node_config_with_key(
     let mut listeners = Vec::new();
     for rule in &rules {
         if let Some(binding) = db.find_socks5_rule_config(rule.id).await? {
+            if let Some(bound_node_id) = binding.relay_node_id {
+                if physical_relay_node_id != Some(bound_node_id)
+                    || binding.relay_node_enabled != Some(true)
+                {
+                    continue;
+                }
+            }
             if !binding.resource_enabled {
                 tracing::warn!(
                     rule_id = rule.id,
@@ -705,5 +726,85 @@ mod tests {
             paused_rule.listeners.is_empty(),
             "a paused SOCKS5 rule must remove the listener"
         );
+    }
+
+    #[tokio::test]
+    async fn stage4_rule_is_visible_only_to_its_bound_physical_node() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 20000).await;
+        for (id, node_key) in [(21_i64, "node-a"), (22_i64, "node-b")] {
+            sqlx::query(
+                "INSERT INTO relay_nodes
+                 (id,device_group_id,node_key,identity_secret_hash,name,public_ip,
+                  first_seen_at,last_seen_at)
+                 VALUES(?,10,?,?,'node','192.0.2.10',datetime('now'),datetime('now'))",
+            )
+            .bind(id)
+            .bind(node_key)
+            .bind("a".repeat(64))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let key = "11".repeat(32);
+        let cipher = CredentialCipher::from_config(Some(&key)).unwrap();
+        let (upstream_ciphertext, upstream_nonce, upstream_version) = cipher
+            .encrypt("upstream-secret", RESOURCE_PASSWORD_PURPOSE)
+            .unwrap();
+        let (relay_ciphertext, relay_nonce, relay_version) = cipher
+            .encrypt("relay-secret", RELAY_PASSWORD_PURPOSE)
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_resources
+             (id,name,host,port,username,password_ciphertext,password_nonce,
+              password_key_version,enabled)
+             VALUES(7,'upstream','198.51.100.7',1080,'up-user',?,?,?,1)",
+        )
+        .bind(upstream_ciphertext)
+        .bind(upstream_nonce)
+        .bind(upstream_version)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_rule_bindings
+             (rule_id,socks5_resource_id,relay_node_id,selection_mode,remote_dns,
+              relay_username,relay_password_ciphertext,relay_password_nonce,
+              relay_password_key_version,allow_no_auth)
+             VALUES(100,7,21,'RECOMMENDED',1,'relay-user',?,?,?,0)",
+        )
+        .bind(relay_ciphertext)
+        .bind(relay_nonce)
+        .bind(relay_version)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let node_a = build_node_config_for_node(&repo(&pool), 10, Some(&key), Some(21))
+            .await
+            .unwrap();
+        assert_eq!(node_a.listeners.len(), 1);
+        let serialized_a = serde_json::to_string(&node_a).unwrap();
+        assert!(serialized_a.contains("upstream-secret"));
+
+        let node_b = build_node_config_for_node(&repo(&pool), 10, Some(&key), Some(22))
+            .await
+            .unwrap();
+        assert!(node_b.listeners.is_empty());
+        let serialized_b = serde_json::to_string(&node_b).unwrap();
+        assert!(!serialized_b.contains("upstream-secret"));
+        assert!(!serialized_b.contains("relay-secret"));
+
+        sqlx::query("UPDATE relay_nodes SET enabled=0 WHERE id=21")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let disabled = build_node_config_for_node(&repo(&pool), 10, Some(&key), Some(21))
+            .await
+            .unwrap();
+        assert!(disabled.listeners.is_empty());
     }
 }

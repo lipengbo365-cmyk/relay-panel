@@ -324,18 +324,18 @@ pub async fn node_ws_handler(
     // TOFU registration is atomic in the repository. Once a node_key is
     // bound, a sibling holding only the shared group token cannot claim it.
     let seen_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    match state
+    let physical_relay_node_id = match state
         .db
         .upsert_relay_node_seen(group_id, &node_id, &identity_hash, "", &seen_at)
         .await
     {
-        Ok(Some(_)) => {}
+        Ok(Some(id)) => id,
         Ok(None) => return axum::http::StatusCode::FORBIDDEN.into_response(),
         Err(error) => {
             tracing::warn!("node websocket identity authentication failed: {}", error);
             return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
+    };
     // Clone the Arc<dyn Repository> so the WS task can keep using it after the
     // upgrade handler returns. The pool snapshot is shared read-only.
     let db = state.db.clone();
@@ -351,6 +351,7 @@ pub async fn node_ws_handler(
             db,
             state.node_connections,
             socks5_credential_key,
+            physical_relay_node_id,
         )
     })
 }
@@ -362,6 +363,7 @@ async fn handle_node_ws(
     db: std::sync::Arc<dyn crate::db::Repository>,
     node_connections: NodeConnections,
     socks5_credential_key: Option<String>,
+    physical_relay_node_id: i64,
 ) {
     tracing::info!(
         "websocket connected: group_id={} node_id={:?}",
@@ -377,8 +379,13 @@ async fn handle_node_ws(
     // Send initial config snapshot so a freshly-connected node has its config
     // immediately, without waiting for the first HTTP poll. None (DB error) →
     // skip the push; the node will get its config on the next HTTP poll.
-    if let Some(config) =
-        build_config_snapshot(db.as_ref(), group_id, socks5_credential_key.as_deref()).await
+    if let Some(config) = build_config_snapshot(
+        db.as_ref(),
+        group_id,
+        socks5_credential_key.as_deref(),
+        Some(physical_relay_node_id),
+    )
+    .await
     {
         if let Ok(config_json) = serde_json::to_string(&config) {
             let _ = sender.send(Message::Text(config_json.into())).await;
@@ -444,6 +451,7 @@ async fn build_config_snapshot(
     db: &dyn crate::db::Repository,
     group_id: i64,
     socks5_credential_key: Option<&str>,
+    physical_relay_node_id: Option<i64>,
 ) -> Option<NodeConfigResponse> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
@@ -455,10 +463,11 @@ async fn build_config_snapshot(
     // Returns None on DB error so the caller skips the snapshot push (rather
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
-    match crate::service::node_config::build_node_config_with_key(
+    match crate::service::node_config::build_node_config_for_node(
         db,
         group_id,
         socks5_credential_key,
+        physical_relay_node_id,
     )
     .await
     {

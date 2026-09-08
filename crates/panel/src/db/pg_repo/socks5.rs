@@ -1,11 +1,75 @@
 use super::PgRepository;
 use crate::db::error::DbError;
 use crate::db::repo::{
-    BulkImportOutcome, BulkSocks5Resource, RelayNodeRecord, Socks5CheckHistoryRecord,
-    Socks5HealthRecord, Socks5LatestHealthRecord, Socks5Repository, Socks5ResourceQuery,
-    Socks5ResourceRecord, Socks5RuleConfigRecord, Socks5RuleViewRecord,
+    BulkImportOutcome, BulkSocks5Resource, RelayNodeCapacityRecord, RelayNodeRecord,
+    SmartRelayCreateInput, SmartRelayCreateOutcome, SmartRelayCreatedRecord,
+    SmartRelayReceiptRecord, Socks5CheckHistoryRecord, Socks5HealthRecord,
+    Socks5LatestHealthRecord, Socks5RecommendationHealthRecord, Socks5Repository,
+    Socks5ResourceQuery, Socks5ResourceRecord, Socks5RuleConfigRecord, Socks5RuleViewRecord,
 };
 use async_trait::async_trait;
+
+fn validate_stage4_node_status(
+    raw: &str,
+    required_protocol_version: u32,
+    max_cpu_percent: f64,
+    max_memory_percent: f64,
+) -> Result<(), &'static str> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Err("NODE_OFFLINE");
+    };
+    let online = value
+        .get("last_seen")
+        .and_then(|value| value.as_str())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|seen| {
+            let age = chrono::Utc::now()
+                .signed_duration_since(seen.with_timezone(&chrono::Utc))
+                .num_seconds();
+            (0..=120).contains(&age)
+        });
+    if !online {
+        return Err("NODE_OFFLINE");
+    }
+    if value
+        .get("config_protocol_version")
+        .and_then(|value| value.as_u64())
+        != Some(u64::from(required_protocol_version))
+        || value.get("socks5_check_queue_depth").is_none()
+    {
+        return Err("NODE_UNSUPPORTED");
+    }
+    if value
+        .get("cpu")
+        .and_then(|value| value.as_f64())
+        .is_some_and(|cpu| cpu >= max_cpu_percent)
+        || value
+            .get("mem")
+            .and_then(|value| value.as_f64())
+            .is_some_and(|memory| memory >= max_memory_percent)
+    {
+        return Err("NODE_OVERLOADED");
+    }
+    Ok(())
+}
+
+fn stage4_health_fresh(checked_at: &str, ttl_seconds: i64) -> bool {
+    use chrono::TimeZone;
+    let checked = chrono::DateTime::parse_from_rfc3339(checked_at)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(checked_at, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .map(|value| chrono::Utc.from_utc_datetime(&value))
+        });
+    checked.is_some_and(|checked| {
+        let age = chrono::Utc::now()
+            .signed_duration_since(checked)
+            .num_seconds();
+        (0..=ttl_seconds).contains(&age)
+    })
+}
 
 fn apply_pg_resource_filters<'a>(
     builder: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
@@ -313,10 +377,41 @@ impl Socks5Repository for PgRepository {
         &self,
         rule_id: i64,
     ) -> Result<Option<Socks5RuleConfigRecord>, DbError> {
-        Ok(sqlx::query_as("SELECT b.rule_id,b.socks5_resource_id,b.remote_dns,b.relay_username,b.relay_password_ciphertext,b.relay_password_nonce,b.relay_password_key_version,b.allow_no_auth,r.name resource_name,r.host resource_host,r.port resource_port,r.username resource_username,r.password_ciphertext resource_password_ciphertext,r.password_nonce resource_password_nonce,r.password_key_version resource_password_key_version,r.enabled resource_enabled FROM socks5_rule_bindings b JOIN socks5_resources r ON r.id=b.socks5_resource_id WHERE b.rule_id=$1").bind(rule_id).fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT b.rule_id,b.socks5_resource_id,b.relay_node_id,b.selection_mode,n.enabled relay_node_enabled,b.remote_dns,b.relay_username,b.relay_password_ciphertext,b.relay_password_nonce,b.relay_password_key_version,b.allow_no_auth,r.name resource_name,r.host resource_host,r.port resource_port,r.username resource_username,r.password_ciphertext resource_password_ciphertext,r.password_nonce resource_password_nonce,r.password_key_version resource_password_key_version,r.enabled resource_enabled FROM socks5_rule_bindings b JOIN socks5_resources r ON r.id=b.socks5_resource_id LEFT JOIN relay_nodes n ON n.id=b.relay_node_id WHERE b.rule_id=$1").bind(rule_id).fetch_optional(&self.pool).await?)
     }
     async fn list_socks5_rule_views(&self) -> Result<Vec<Socks5RuleViewRecord>, DbError> {
-        Ok(sqlx::query_as("SELECT f.id rule_id,f.name,f.listen_port,f.device_group_in,g.connect_host,f.paused,f.traffic_used,b.socks5_resource_id,r.name resource_name,r.detected_exit_ip,b.relay_username,b.allow_no_auth,b.remote_dns,f.created_at FROM forward_rules f JOIN socks5_rule_bindings b ON b.rule_id=f.id JOIN socks5_resources r ON r.id=b.socks5_resource_id JOIN device_groups g ON g.id=f.device_group_in ORDER BY f.id DESC").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT f.id rule_id,f.name,f.listen_port,f.device_group_in,g.connect_host,f.paused,f.traffic_used,b.socks5_resource_id,r.name resource_name,r.detected_exit_ip,r.detected_country,b.relay_node_id,n.name relay_node_name,n.country_code relay_node_country_code,n.advertise_host,n.public_ip relay_node_public_ip,n.enabled relay_node_enabled,b.selection_mode,b.relay_username,b.allow_no_auth,b.remote_dns,f.created_at FROM forward_rules f JOIN socks5_rule_bindings b ON b.rule_id=f.id JOIN socks5_resources r ON r.id=b.socks5_resource_id LEFT JOIN relay_nodes n ON n.id=b.relay_node_id JOIN device_groups g ON g.id=f.device_group_in ORDER BY f.id DESC").fetch_all(&self.pool).await?)
+    }
+    async fn list_relay_node_capacities(&self) -> Result<Vec<RelayNodeCapacityRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT n.id relay_node_id,n.device_group_id,g.port_range,
+                    COALESCE(p.port_used,0)::BIGINT port_used,g.group_type,g.capabilities group_capabilities
+             FROM relay_nodes n JOIN device_groups g ON g.id=n.device_group_id
+             LEFT JOIN (
+                 SELECT device_group_in,COUNT(DISTINCT listen_port)::BIGINT port_used
+                 FROM forward_rules WHERE protocol IN ('tcp','tcp_udp') GROUP BY device_group_in
+             ) p ON p.device_group_in=n.device_group_id
+             ORDER BY n.id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+    async fn list_socks5_recommendation_health(
+        &self,
+        resource_id: i64,
+    ) -> Result<Vec<Socks5RecommendationHealthRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT h.resource_id,h.relay_node_id,h.status,h.total_latency_ms,h.exit_ip,h.country,
+                    h.checked_at,h.resource_revision,h.generation,
+                    COALESCE(g.generation,0) current_generation
+             FROM socks5_resource_health h
+             LEFT JOIN socks5_check_generations g
+               ON g.resource_id=h.resource_id AND g.relay_node_id=h.relay_node_id
+             WHERE h.resource_id=$1 ORDER BY h.relay_node_id",
+        )
+        .bind(resource_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
     async fn create_socks5_rule_full(
         &self,
@@ -372,6 +467,317 @@ impl Socks5Repository for PgRepository {
             .bind(allow_no_auth).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(Some(rule_id))
+    }
+
+    async fn create_smart_relay(
+        &self,
+        input: &SmartRelayCreateInput,
+    ) -> Result<SmartRelayCreateOutcome, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let idempotency_lock = format!("{}:{}", input.actor_id, input.idempotency_key);
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)")
+            .bind(&idempotency_lock)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM relay_creation_receipts WHERE id IN (
+                SELECT id FROM relay_creation_receipts
+                WHERE created_at < to_char(now() AT TIME ZONE 'UTC' - interval '7 days','YYYY-MM-DD HH24:MI:SS')
+                ORDER BY id LIMIT 10000
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        let replay: Option<SmartRelayCreatedRecord> = sqlx::query_as(
+            "SELECT rule_id,relay_node_id,resource_id,endpoint_host,listen_port,
+                    relay_username,exit_ip,exit_country,selection_mode
+             FROM relay_creation_receipts WHERE actor_id=$1 AND idempotency_key=$2",
+        )
+        .bind(input.actor_id)
+        .bind(&input.idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(replay) = replay {
+            let fingerprint: String = sqlx::query_scalar(
+                "SELECT request_fingerprint FROM relay_creation_receipts
+                 WHERE actor_id=$1 AND idempotency_key=$2",
+            )
+            .bind(input.actor_id)
+            .bind(&input.idempotency_key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if fingerprint != input.request_fingerprint {
+                tx.rollback().await?;
+                return Ok(SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED"));
+            }
+            tx.commit().await?;
+            return Ok(SmartRelayCreateOutcome::Replay(replay));
+        }
+
+        let resource: Option<(bool, i64)> = sqlx::query_as(
+            "SELECT enabled,health_generation FROM socks5_resources WHERE id=$1 FOR SHARE",
+        )
+        .bind(input.resource_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((resource_enabled, resource_revision)) = resource else {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("RESOURCE_NOT_FOUND"));
+        };
+        if !resource_enabled {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("RESOURCE_DISABLED"));
+        }
+        if resource_revision != input.expected_resource_revision {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("RESOURCE_CHANGED"));
+        }
+
+        let node: Option<(i64, String, bool, String, String, String)> = sqlx::query_as(
+            "SELECT device_group_id,node_key,enabled,identity_secret_hash,advertise_host,public_ip
+             FROM relay_nodes WHERE id=$1 FOR SHARE",
+        )
+        .bind(input.relay_node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((group_id, node_key, node_enabled, identity_hash, advertise_host, public_ip)) =
+            node
+        else {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("NODE_NOT_FOUND"));
+        };
+        if !node_enabled {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("NODE_DISABLED"));
+        }
+        if identity_hash.len() != 64 {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("NODE_IDENTITY_UNTRUSTED"));
+        }
+        let endpoint_host = if advertise_host.is_empty() {
+            public_ip
+        } else {
+            advertise_host
+        };
+        if endpoint_host.is_empty() {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected(
+                "NODE_ACCESS_HOST_MISSING",
+            ));
+        }
+        let status_key = format!("node_status:{group_id}:{node_key}");
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT value FROM kvs WHERE key=$1 FOR SHARE")
+                .bind(&status_key)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let status_result = status.as_deref().map_or(Err("NODE_OFFLINE"), |raw| {
+            validate_stage4_node_status(
+                raw,
+                input.required_protocol_version,
+                input.max_cpu_percent,
+                input.max_memory_percent,
+            )
+        });
+        if let Err(code) = status_result {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected(code));
+        }
+
+        let group: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT group_type,port_range,capabilities FROM device_groups WHERE id=$1 FOR SHARE",
+        )
+        .bind(group_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((group_type, port_range, capabilities)) = group else {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("NODE_NOT_FOUND"));
+        };
+        let tcp_capable = serde_json::from_str::<Vec<String>>(&capabilities).unwrap_or_default();
+        if group_type != "in"
+            || (!tcp_capable.is_empty()
+                && !tcp_capable
+                    .iter()
+                    .any(|value| value == "tcp" || value == "tcp_udp"))
+        {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("NODE_UNSUPPORTED"));
+        }
+
+        let health: Option<(String, Option<String>, Option<String>, String, i64, i64)> =
+            sqlx::query_as(
+                "SELECT status,exit_ip,country,checked_at,resource_revision,generation
+                 FROM socks5_resource_health WHERE resource_id=$1 AND relay_node_id=$2 FOR SHARE",
+            )
+            .bind(input.resource_id)
+            .bind(input.relay_node_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some((health_status, exit_ip, exit_country, checked_at, health_revision, generation)) =
+            health
+        else {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("HEALTH_MISSING"));
+        };
+        if health_status != "ONLINE" {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("HEALTH_NOT_ONLINE"));
+        }
+        if health_revision != resource_revision {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("RESOURCE_CHANGED"));
+        }
+        if generation != input.expected_health_generation
+            || checked_at != input.expected_health_checked_at
+        {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("RECOMMENDATION_STALE"));
+        }
+        let current_generation: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM socks5_check_generations
+             WHERE resource_id=$1 AND relay_node_id=$2 FOR SHARE",
+        )
+        .bind(input.resource_id)
+        .bind(input.relay_node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if current_generation != Some(generation) {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("RECOMMENDATION_STALE"));
+        }
+        if !stage4_health_fresh(&checked_at, input.health_ttl_seconds) {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("HEALTH_STALE"));
+        }
+        let Some(exit_ip) = exit_ip.filter(|value| value.parse::<std::net::IpAddr>().is_ok())
+        else {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("EXIT_IP_MISMATCH"));
+        };
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+        let (low, high) = crate::service::rules::resolve_auto_port_range(&port_range);
+        let used_ports: Vec<i32> = sqlx::query_scalar(
+            "SELECT listen_port FROM forward_rules
+             WHERE device_group_in=$1 AND protocol IN ('tcp','tcp_udp')",
+        )
+        .bind(group_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let used = used_ports
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let listen_port = match input.requested_port {
+            Some(port) if port < i32::from(low) || port > i32::from(high) => {
+                tx.rollback().await?;
+                return Ok(SmartRelayCreateOutcome::Rejected("PORT_OUT_OF_RANGE"));
+            }
+            Some(port) if used.contains(&port) => {
+                tx.rollback().await?;
+                return Ok(SmartRelayCreateOutcome::Rejected("PORT_CONFLICT"));
+            }
+            Some(port) => port,
+            None => match (low..=high)
+                .map(i32::from)
+                .find(|port| !used.contains(port))
+            {
+                Some(port) => port,
+                None => {
+                    tx.rollback().await?;
+                    return Ok(SmartRelayCreateOutcome::Rejected("NO_AVAILABLE_PORT"));
+                }
+            },
+        };
+
+        let rule_id: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO forward_rules
+             (name,uid,paused,listen_port,protocol,public_transport,node_transport,route_mode,
+              entry_transport,device_group_in,device_group_out,forward_mode,target_addr,target_port)
+             SELECT $1,$2,FALSE,$3,'tcp','raw','raw','direct','raw',$4,NULL,'direct','',0
+             WHERE (SELECT max_rules FROM users WHERE id=$2)=0 OR
+                   (SELECT COUNT(*) FROM forward_rules WHERE uid=$2)<
+                   (SELECT max_rules FROM users WHERE id=$2) RETURNING id",
+        )
+        .bind(&input.name)
+        .bind(input.actor_id)
+        .bind(listen_port)
+        .bind(group_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(rule_id) = rule_id else {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::QuotaExceeded);
+        };
+        sqlx::query(
+            "INSERT INTO socks5_rule_bindings
+             (rule_id,socks5_resource_id,relay_node_id,selection_mode,remote_dns,relay_username,
+              relay_password_ciphertext,relay_password_nonce,relay_password_key_version,allow_no_auth)
+             VALUES($1,$2,$3,$4,TRUE,$5,$6,$7,$8,FALSE)",
+        )
+        .bind(rule_id)
+        .bind(input.resource_id)
+        .bind(input.relay_node_id)
+        .bind(&input.selection_mode)
+        .bind(&input.relay_username)
+        .bind(&input.relay_password_ciphertext)
+        .bind(&input.relay_password_nonce)
+        .bind(input.relay_password_key_version)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO relay_creation_receipts
+             (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+              endpoint_host,listen_port,relay_username,exit_ip,exit_country,selection_mode)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+        )
+        .bind(input.actor_id)
+        .bind(&input.idempotency_key)
+        .bind(&input.request_fingerprint)
+        .bind(rule_id)
+        .bind(input.relay_node_id)
+        .bind(input.resource_id)
+        .bind(&endpoint_host)
+        .bind(listen_port)
+        .bind(&input.relay_username)
+        .bind(&exit_ip)
+        .bind(&exit_country)
+        .bind(&input.selection_mode)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SmartRelayCreateOutcome::Created(SmartRelayCreatedRecord {
+            rule_id,
+            relay_node_id: input.relay_node_id,
+            resource_id: input.resource_id,
+            endpoint_host,
+            listen_port,
+            relay_username: input.relay_username.clone(),
+            exit_ip,
+            exit_country,
+            selection_mode: input.selection_mode.clone(),
+        }))
+    }
+    async fn find_smart_relay_receipt(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+    ) -> Result<Option<SmartRelayReceiptRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT request_fingerprint,rule_id,relay_node_id,resource_id,endpoint_host,
+                    listen_port,relay_username,exit_ip,exit_country,selection_mode
+             FROM relay_creation_receipts
+             WHERE actor_id=$1 AND idempotency_key=$2
+               AND created_at >= to_char(now() AT TIME ZONE 'UTC' - interval '7 days',
+                                         'YYYY-MM-DD HH24:MI:SS')",
+        )
+        .bind(actor_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?)
     }
     async fn update_socks5_rule_full(
         &self,
@@ -488,13 +894,14 @@ impl Socks5Repository for PgRepository {
         region: &str,
         city: &str,
         provider: &str,
+        advertise_host: &str,
         bandwidth_mbps: i32,
         remark: &str,
         tags: &str,
         enabled: bool,
     ) -> Result<u64, DbError> {
-        Ok(sqlx::query("UPDATE relay_nodes SET name=$1,country=$2,country_code=$3,region=$4,city=$5,provider=$6,bandwidth_mbps=$7,remark=$8,tags=$9,enabled=$10,updated_at=to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS') WHERE id=$11")
-            .bind(name).bind(country).bind(country_code).bind(region).bind(city).bind(provider).bind(bandwidth_mbps)
+        Ok(sqlx::query("UPDATE relay_nodes SET name=$1,country=$2,country_code=$3,region=$4,city=$5,provider=$6,advertise_host=$7,bandwidth_mbps=$8,remark=$9,tags=$10,enabled=$11,updated_at=to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS') WHERE id=$12")
+            .bind(name).bind(country).bind(country_code).bind(region).bind(city).bind(provider).bind(advertise_host).bind(bandwidth_mbps)
             .bind(remark).bind(tags).bind(enabled).bind(id).execute(&self.pool).await?.rows_affected())
     }
     async fn begin_socks5_health_check(
@@ -561,11 +968,11 @@ impl Socks5Repository for PgRepository {
         } else {
             health.last_success_at.as_deref()
         };
-        sqlx::query("INSERT INTO socks5_resource_health(resource_id,relay_node_id,status,tcp_latency_ms,handshake_latency_ms,connect_latency_ms,total_latency_ms,exit_ip,country,error_stage,error_code,safe_error_message,consecutive_failures,checked_at,last_success_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(resource_id,relay_node_id) DO UPDATE SET status=excluded.status,tcp_latency_ms=excluded.tcp_latency_ms,handshake_latency_ms=excluded.handshake_latency_ms,connect_latency_ms=excluded.connect_latency_ms,total_latency_ms=excluded.total_latency_ms,exit_ip=excluded.exit_ip,country=excluded.country,error_stage=excluded.error_stage,error_code=excluded.error_code,safe_error_message=excluded.safe_error_message,consecutive_failures=excluded.consecutive_failures,checked_at=excluded.checked_at,last_success_at=COALESCE(excluded.last_success_at,socks5_resource_health.last_success_at)")
+        sqlx::query("INSERT INTO socks5_resource_health(resource_id,relay_node_id,status,tcp_latency_ms,handshake_latency_ms,connect_latency_ms,total_latency_ms,exit_ip,country,error_stage,error_code,safe_error_message,consecutive_failures,resource_revision,generation,checked_at,last_success_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(resource_id,relay_node_id) DO UPDATE SET status=excluded.status,tcp_latency_ms=excluded.tcp_latency_ms,handshake_latency_ms=excluded.handshake_latency_ms,connect_latency_ms=excluded.connect_latency_ms,total_latency_ms=excluded.total_latency_ms,exit_ip=excluded.exit_ip,country=excluded.country,error_stage=excluded.error_stage,error_code=excluded.error_code,safe_error_message=excluded.safe_error_message,consecutive_failures=excluded.consecutive_failures,resource_revision=excluded.resource_revision,generation=excluded.generation,checked_at=excluded.checked_at,last_success_at=COALESCE(excluded.last_success_at,socks5_resource_health.last_success_at)")
             .bind(health.resource_id).bind(health.relay_node_id).bind(&health.status).bind(health.tcp_latency_ms)
             .bind(health.handshake_latency_ms).bind(health.connect_latency_ms).bind(health.total_latency_ms)
             .bind(&health.exit_ip).bind(&health.country).bind(&health.error_stage).bind(&health.error_code)
-            .bind(&health.safe_error_message).bind(failures).bind(&health.checked_at).bind(last_success)
+            .bind(&health.safe_error_message).bind(failures).bind(resource_generation).bind(generation).bind(&health.checked_at).bind(last_success)
             .execute(&mut *tx).await?;
         sqlx::query("INSERT INTO socks5_check_history(resource_id,relay_node_id,status,tcp_latency_ms,handshake_latency_ms,connect_latency_ms,total_latency_ms,exit_ip,country,error_stage,error_code,safe_error_message,checked_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)")
             .bind(health.resource_id).bind(health.relay_node_id).bind(&health.status).bind(health.tcp_latency_ms)

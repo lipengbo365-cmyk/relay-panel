@@ -11,6 +11,7 @@ type NodeForm = {
   region: string;
   city: string;
   provider: string;
+  advertise_host: string;
   bandwidth_mbps: number;
   remark: string;
   tags_text: string;
@@ -42,6 +43,7 @@ export default function RelayNodes() {
     { title: 'Name', dataIndex: 'name' },
     { title: 'Country', render: (_: unknown, row: RelayNode) => [row.country_code, row.country].filter(Boolean).join(' · ') || '-' },
     { title: 'Node-reported IP', dataIndex: 'public_ip', render: (value: string) => value || '-' },
+    { title: 'Advertised Host', dataIndex: 'advertise_host', render: (value: string) => value || '-' },
     { title: 'Provider', dataIndex: 'provider', render: (value: string) => value || '-' },
     { title: 'Online', render: (_: unknown, row: RelayNode) => <Tag color={row.online ? 'green' : 'red'}>{row.online ? 'ONLINE' : 'OFFLINE'}</Tag> },
     { title: 'Last Seen', dataIndex: 'last_seen_at' },
@@ -59,6 +61,7 @@ export default function RelayNodes() {
           form.setFieldsValue({
             name: row.name, country: row.country, country_code: row.country_code,
             region: row.region, city: row.city, provider: row.provider,
+            advertise_host: row.advertise_host,
             bandwidth_mbps: row.bandwidth_mbps, remark: row.remark,
             tags_text: row.tags.join(', '), enabled: row.enabled,
           });
@@ -105,6 +108,7 @@ export default function RelayNodes() {
             <Form.Item name="city" label="City" style={{ flex: 1 }}><Input /></Form.Item>
           </Space.Compact>
           <Form.Item name="provider" label="Provider"><Input /></Form.Item>
+          <Form.Item name="advertise_host" label="Advertised Host" extra="Client-facing IPv4, IPv6, or DNS name. Leave blank to use the node-reported public IP."><Input placeholder="proxy-us.example.com" /></Form.Item>
           <Form.Item name="bandwidth_mbps" label="Bandwidth (Mbps)"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item>
           <Form.Item name="tags_text" label="Tags" extra="Comma separated"><Input /></Form.Item>
           <Form.Item name="remark" label="Remark"><Input.TextArea rows={2} /></Form.Item>

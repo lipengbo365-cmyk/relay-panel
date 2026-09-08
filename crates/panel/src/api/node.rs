@@ -128,18 +128,18 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
         return StatusCode::FORBIDDEN.into_response();
     };
     let seen_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    match state
+    let physical_relay_node_id = match state
         .db
         .upsert_relay_node_seen(group.id, node_id, &identity_hash, "", &seen_at)
         .await
     {
-        Ok(Some(_)) => {}
+        Ok(Some(id)) => id,
         Ok(None) => return StatusCode::FORBIDDEN.into_response(),
         Err(error) => {
             tracing::warn!("get_config: physical node authentication failed: {error}");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-    }
+    };
 
     // v0.3.6: delegate to the shared `build_node_config`. This path and the WS
     // push path (ws.rs) now use the SAME function.
@@ -149,10 +149,11 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     let credential_key = sensitive_config_allowed(&state, &headers)
         .then_some(state.config.socks5_credential_key.as_deref())
         .flatten();
-    match crate::service::node_config::build_node_config_with_key(
+    match crate::service::node_config::build_node_config_for_node(
         state.db.as_ref(),
         group.id,
         credential_key,
+        Some(physical_relay_node_id),
     )
     .await
     {
@@ -553,6 +554,9 @@ mod tests {
                 socks5_check_urls: vec!["https://api.ipify.org".into()],
                 socks5_check_concurrency: 50,
                 socks5_check_retention_days: 30,
+                relay_recommend_health_ttl_seconds: 600,
+                relay_recommend_max_cpu_percent: 95.0,
+                relay_recommend_max_memory_percent: 95.0,
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),

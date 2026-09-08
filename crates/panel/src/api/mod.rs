@@ -19,6 +19,7 @@ pub mod relay_nodes;
 pub mod restart;
 pub mod security_headers;
 pub mod site;
+pub mod smart_relay;
 pub mod socks5_health;
 pub mod socks5_import;
 pub mod socks5_resources;
@@ -249,6 +250,18 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/socks5-resources/{id}/check-history",
             axum::routing::get(socks5_health::list_history),
+        )
+        .route(
+            "/admin/socks5-resources/{id}/relay-recommendations",
+            axum::routing::get(smart_relay::recommendations),
+        )
+        .route(
+            "/admin/smart-relay/preview",
+            axum::routing::post(smart_relay::preview),
+        )
+        .route(
+            "/admin/smart-relay",
+            axum::routing::post(smart_relay::create),
         )
         .route("/admin/relay-nodes", axum::routing::get(relay_nodes::list))
         .route(

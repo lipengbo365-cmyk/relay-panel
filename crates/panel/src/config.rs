@@ -72,6 +72,13 @@ pub struct Config {
     pub socks5_check_concurrency: usize,
     /// Check-history retention window. Pruning is opportunistic after writes.
     pub socks5_check_retention_days: i64,
+    /// Maximum age of an ONLINE Resource × Node result that may be used by the
+    /// Stage 4 recommendation/create path.
+    pub relay_recommend_health_ttl_seconds: i64,
+    /// Critical load thresholds. Load remains a soft sorting factor below
+    /// these values; at or above them the candidate is marked overloaded.
+    pub relay_recommend_max_cpu_percent: f64,
+    pub relay_recommend_max_memory_percent: f64,
 }
 
 impl std::fmt::Debug for Config {
@@ -96,6 +103,18 @@ impl std::fmt::Debug for Config {
             .field(
                 "socks5_check_retention_days",
                 &self.socks5_check_retention_days,
+            )
+            .field(
+                "relay_recommend_health_ttl_seconds",
+                &self.relay_recommend_health_ttl_seconds,
+            )
+            .field(
+                "relay_recommend_max_cpu_percent",
+                &self.relay_recommend_max_cpu_percent,
+            )
+            .field(
+                "relay_recommend_max_memory_percent",
+                &self.relay_recommend_max_memory_percent,
             )
             .finish()
     }
@@ -165,6 +184,16 @@ impl Config {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(30)
             .clamp(1, 3650);
+        let relay_recommend_health_ttl_seconds =
+            std::env::var("RELAY_RECOMMEND_HEALTH_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(600)
+                .clamp(30, 86_400);
+        let relay_recommend_max_cpu_percent =
+            parse_percent_env("RELAY_RECOMMEND_MAX_CPU_PERCENT", 95.0);
+        let relay_recommend_max_memory_percent =
+            parse_percent_env("RELAY_RECOMMEND_MAX_MEMORY_PERCENT", 95.0);
 
         let cfg = Self {
             database_path,
@@ -181,6 +210,9 @@ impl Config {
             socks5_check_urls,
             socks5_check_concurrency,
             socks5_check_retention_days,
+            relay_recommend_health_ttl_seconds,
+            relay_recommend_max_cpu_percent,
+            relay_recommend_max_memory_percent,
         };
         cfg.validate();
         cfg
@@ -202,6 +234,15 @@ impl Config {
             std::process::exit(1);
         }
     }
+}
+
+fn parse_percent_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+        .clamp(1.0, 100.0)
 }
 
 /// v0.4.16: parse `GEOIP_ENABLED` into a boolean. Extracted as a pure function
@@ -244,6 +285,9 @@ mod tests {
             socks5_check_urls: vec!["https://api.ipify.org".into()],
             socks5_check_concurrency: 50,
             socks5_check_retention_days: 30,
+            relay_recommend_health_ttl_seconds: 600,
+            relay_recommend_max_cpu_percent: 95.0,
+            relay_recommend_max_memory_percent: 95.0,
         };
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("panel-key-secret"));

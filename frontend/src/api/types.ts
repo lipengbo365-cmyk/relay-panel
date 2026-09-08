@@ -53,6 +53,7 @@ export interface RelayNode {
   city: string;
   provider: string;
   public_ip: string;
+  advertise_host: string;
   bandwidth_mbps: number;
   remark: string;
   tags: string[];
@@ -128,10 +129,97 @@ export interface Socks5RelayRule {
   socks5_resource_id: number;
   resource_name: string;
   detected_exit_ip: string | null;
+  detected_country: string | null;
+  relay_node_id: number | null;
+  relay_node_name: string | null;
+  relay_node_country_code: string | null;
+  endpoint_host: string | null;
+  relay_node_enabled: boolean | null;
+  selection_mode: 'LEGACY' | 'RECOMMENDED' | 'MANUAL';
   relay_username_masked: string | null;
   allow_no_auth: boolean;
   remote_dns: boolean;
   created_at: string;
+}
+
+export interface RelayCandidate {
+  relay_node_id: number;
+  device_group_id: number;
+  relay_node_name: string;
+  country: string;
+  country_code: string;
+  region: string;
+  city: string;
+  provider: string;
+  advertise_host: string;
+  public_ip: string;
+  endpoint_host: string;
+  online: boolean;
+  identity_trusted: boolean;
+  protocol_version: number | null;
+  supports_socks5_relay: boolean;
+  eligible: boolean;
+  health_status: string;
+  health_checked_at: string | null;
+  health_age_seconds: number | null;
+  health_fresh: boolean;
+  health_generation: number | null;
+  health_resource_revision: number | null;
+  latency_ms: number | null;
+  detected_exit_ip: string | null;
+  detected_country: string | null;
+  node_cpu: number | null;
+  node_memory: number | null;
+  node_connections: number | null;
+  port_available: number;
+  port_total: number;
+  port_used: number;
+  country_match: 'MATCHED' | 'CROSS_COUNTRY' | 'UNKNOWN';
+  score: number;
+  rank: number;
+  recommended: boolean;
+  reasons: string[];
+  warnings: string[];
+}
+
+export interface RelayRecommendation {
+  resource_id: number;
+  resource_name: string;
+  resource_revision: number;
+  resource_enabled: boolean;
+  declared_country: string | null;
+  detected_country: string | null;
+  generated_at: string;
+  health_ttl_seconds: number;
+  candidates: RelayCandidate[];
+}
+
+export interface SmartRelayPreview {
+  eligible: boolean;
+  warnings: string[];
+  candidate: RelayCandidate;
+  port_mode: 'AUTO' | 'MANUAL';
+  manual_port: number | null;
+  resource_revision: number;
+  health_generation: number;
+  health_checked_at: string;
+}
+
+export interface SmartRelayCreated {
+  rule_id: number;
+  relay_node_id: number;
+  resource_id: number;
+  host: string;
+  port: number;
+  relay_username: string;
+  relay_password?: string;
+  protocol: 'SOCKS5';
+  exit_ip: string;
+  exit_country: string | null;
+  selection_mode: 'RECOMMENDED' | 'MANUAL';
+  deployment_status: 'CREATED' | 'DEPLOYING' | 'ACTIVE' | 'ERROR';
+  replayed: boolean;
+  password_shown_once: boolean;
 }
 
 export interface User {

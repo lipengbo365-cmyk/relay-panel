@@ -74,6 +74,13 @@ pub struct Socks5RulePublic {
     pub socks5_resource_id: i64,
     pub resource_name: String,
     pub detected_exit_ip: Option<String>,
+    pub detected_country: Option<String>,
+    pub relay_node_id: Option<i64>,
+    pub relay_node_name: Option<String>,
+    pub relay_node_country_code: Option<String>,
+    pub endpoint_host: Option<String>,
+    pub relay_node_enabled: Option<bool>,
+    pub selection_mode: String,
     pub relay_username_masked: Option<String>,
     pub allow_no_auth: bool,
     pub remote_dns: bool,
@@ -87,17 +94,46 @@ impl From<Socks5RuleViewRecord> for Socks5RulePublic {
             name: r.name,
             listen_port: r.listen_port,
             device_group_in: r.device_group_in,
-            proxy_address: format!("{}:{}", r.connect_host, r.listen_port),
+            proxy_address: format_endpoint(
+                r.advertise_host
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        r.relay_node_public_ip
+                            .as_deref()
+                            .filter(|value| !value.is_empty())
+                    })
+                    .unwrap_or(&r.connect_host),
+                r.listen_port,
+            ),
             paused: r.paused,
             traffic_used: r.traffic_used,
             socks5_resource_id: r.socks5_resource_id,
             resource_name: r.resource_name,
             detected_exit_ip: r.detected_exit_ip,
+            detected_country: r.detected_country,
+            relay_node_id: r.relay_node_id,
+            relay_node_name: r.relay_node_name,
+            relay_node_country_code: r.relay_node_country_code,
+            endpoint_host: r
+                .advertise_host
+                .filter(|value| !value.is_empty())
+                .or_else(|| r.relay_node_public_ip.filter(|value| !value.is_empty())),
+            relay_node_enabled: r.relay_node_enabled,
+            selection_mode: r.selection_mode,
             relay_username_masked: r.relay_username.as_deref().map(mask_username),
             allow_no_auth: r.allow_no_auth,
             remote_dns: r.remote_dns,
             created_at: r.created_at,
         }
+    }
+}
+
+fn format_endpoint(host: &str, port: i32) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 

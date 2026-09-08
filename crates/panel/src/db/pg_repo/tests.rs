@@ -11,6 +11,7 @@
 // The schema name embeds the test name + process id for uniqueness.
 
 use super::PgRepository;
+use crate::config::Config;
 use crate::db::error::DbError;
 use crate::db::pg_schema::{apply_pg_schema, run_pg_migrations};
 use crate::db::repo::*;
@@ -6260,4 +6261,302 @@ async fn pg_concurrent_relay_node_first_claim_accepts_exactly_one_identity() {
         .await
         .unwrap()
         .is_none());
+}
+
+async fn pg_seed_stage4_create(db: &PgRepository, port_range: &str) -> (i64, i64, String) {
+    sqlx::query("UPDATE users SET max_rules=0 WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid,port_range)
+         VALUES(940,'stage4-group','in','stage4-token',1,$1)",
+    )
+    .bind(port_range)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let checked_at = chrono::Utc::now().to_rfc3339();
+    let node_id = db
+        .upsert_relay_node_seen(
+            940,
+            "stage4-node",
+            &"a".repeat(64),
+            "192.0.2.44",
+            &checked_at,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE relay_nodes SET name='US-A',country_code='US' WHERE id=$1")
+        .bind(node_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let status = serde_json::json!({
+        "last_seen": checked_at,
+        "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+        "socks5_check_queue_depth": 0,
+        "cpu": 10.0,
+        "mem": 20.0,
+        "connections": 3
+    });
+    sqlx::query("INSERT INTO kvs(key,value) VALUES($1,$2)")
+        .bind("node_status:940:stage4-node")
+        .bind(status.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let resource_id: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources
+         (name,host,port,country_code,detected_country,detected_exit_ip,status,enabled,health_generation)
+         VALUES('stage4-upstream','198.51.100.7',1080,'JP','US','198.51.100.8','ONLINE',TRUE,1)
+         RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation) VALUES($1,$2,1)",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_resource_health
+         (resource_id,relay_node_id,status,total_latency_ms,exit_ip,country,checked_at,
+          resource_revision,generation)
+         VALUES($1,$2,'ONLINE',120,'198.51.100.8','US',$3,1,1)",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .bind(&checked_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    (resource_id, node_id, checked_at)
+}
+
+fn pg_stage4_input(
+    sequence: usize,
+    resource_id: i64,
+    node_id: i64,
+    checked_at: &str,
+) -> SmartRelayCreateInput {
+    SmartRelayCreateInput {
+        actor_id: 1,
+        idempotency_key: format!("10000000-0000-4000-8000-{sequence:012}"),
+        request_fingerprint: format!("fingerprint-{sequence}"),
+        name: format!("stage4-{sequence}"),
+        resource_id,
+        relay_node_id: node_id,
+        requested_port: None,
+        expected_resource_revision: 1,
+        expected_health_generation: 1,
+        expected_health_checked_at: checked_at.to_owned(),
+        selection_mode: "RECOMMENDED".into(),
+        relay_username: format!("r_{sequence}"),
+        relay_password_ciphertext: format!("cipher-{sequence}"),
+        relay_password_nonce: format!("nonce-{sequence}"),
+        relay_password_key_version: 1,
+        health_ttl_seconds: 600,
+        required_protocol_version: relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+        max_cpu_percent: 95.0,
+        max_memory_percent: 95.0,
+    }
+}
+
+#[tokio::test]
+async fn pg_stage4_one_hundred_concurrent_creates_are_atomic_and_port_safe() {
+    let Some(db) = repo("stage4_100_create").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "20000-20099").await;
+    let attempts = (0..100).map(|sequence| {
+        let worker = PgRepository::new(db.pool.clone());
+        let input = pg_stage4_input(sequence, resource_id, node_id, &checked_at);
+        async move { worker.create_smart_relay(&input).await.unwrap() }
+    });
+    let outcomes = futures_util::future::join_all(attempts).await;
+    assert!(outcomes
+        .iter()
+        .all(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_))));
+    let ports: Vec<i32> = sqlx::query_scalar(
+        "SELECT listen_port FROM forward_rules WHERE device_group_in=940 ORDER BY listen_port",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ports, (20000..=20099).collect::<Vec<_>>());
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM socks5_rule_bindings),
+                (SELECT COUNT(*) FROM relay_creation_receipts)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (100, 100));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_one_hundred_idempotent_requests_create_one_rule() {
+    let Some(db) = repo("stage4_100_idempotent").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "21000-21009").await;
+    let attempts = (0..100).map(|_| {
+        let worker = PgRepository::new(db.pool.clone());
+        let input = pg_stage4_input(7, resource_id, node_id, &checked_at);
+        async move { worker.create_smart_relay(&input).await.unwrap() }
+    });
+    let outcomes = futures_util::future::join_all(attempts).await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Replay(_)))
+            .count(),
+        99
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE name='stage4-7'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_recommendation_one_thousand_nodes_is_bounded_and_explained() {
+    let Some(db) = repo("stage4_recommend_1000").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid,port_range)
+         VALUES(601,'perf-group','in','perf-token',1,'30000-39999')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO relay_nodes
+             (device_group_id,node_key,identity_secret_hash,name,country_code,public_ip,
+              first_seen_at,last_seen_at)
+         SELECT 601,'perf-' || value,lpad(value::text,64,'0'),'Node ' || value,'US',
+                '192.0.2.1',$1,$1
+         FROM generate_series(1,1000) value",
+    )
+    .bind(&now)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let resource_id: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources
+         (name,host,port,country_code,detected_country,detected_exit_ip,status,enabled,
+          health_generation)
+         VALUES('perf-resource','198.51.100.7',1080,'US','US','198.51.100.8','ONLINE',TRUE,1)
+         RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation)
+         SELECT $1,id,1 FROM relay_nodes WHERE device_group_id=601",
+    )
+    .bind(resource_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_resource_health
+             (resource_id,relay_node_id,status,total_latency_ms,exit_ip,country,checked_at,
+              resource_revision,generation)
+         SELECT $1,id,'ONLINE',100 + (id % 100)::INTEGER,'198.51.100.8','US',$2,1,1
+         FROM relay_nodes WHERE device_group_id=601",
+    )
+    .bind(resource_id)
+    .bind(&now)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let status = serde_json::json!({
+        "last_seen": now,
+        "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+        "socks5_check_queue_depth": 0,
+        "cpu": 15.0,
+        "mem": 20.0,
+        "connections": 5
+    });
+    sqlx::query(
+        "INSERT INTO kvs(key,value)
+         SELECT 'node_status:601:' || node_key,$1 FROM relay_nodes WHERE device_group_id=601",
+    )
+    .bind(status.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let config = Config {
+        database_path: String::new(),
+        listen: "127.0.0.1:0".into(),
+        key: "test".into(),
+        jwt_secret: "test".into(),
+        public_dir: "public".into(),
+        public_panel_url: String::new(),
+        registration_enabled: false,
+        cors_origins: vec![],
+        geoip_enabled: false,
+        geoip_cache_ttl: 60,
+        socks5_credential_key: Some("11".repeat(32)),
+        socks5_check_urls: vec![],
+        socks5_check_concurrency: 10,
+        socks5_check_retention_days: 30,
+        relay_recommend_health_ttl_seconds: 600,
+        relay_recommend_max_cpu_percent: 95.0,
+        relay_recommend_max_memory_percent: 95.0,
+    };
+
+    let started = std::time::Instant::now();
+    let recommendation = crate::service::relay_recommendation::recommend(&db, &config, resource_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    println!("stage4 postgresql recommendation 1000 nodes: {elapsed:?}");
+    assert_eq!(recommendation.candidates.len(), 1000);
+    assert!(recommendation
+        .candidates
+        .iter()
+        .all(|candidate| candidate.eligible));
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "elapsed={elapsed:?}"
+    );
+
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+         SELECT h.resource_id,h.relay_node_id,h.status,h.total_latency_ms,h.exit_ip,h.country,
+                h.checked_at,h.resource_revision,h.generation,COALESCE(g.generation,0)
+         FROM socks5_resource_health h
+         LEFT JOIN socks5_check_generations g
+           ON g.resource_id=h.resource_id AND g.relay_node_id=h.relay_node_id
+         WHERE h.resource_id=$1 ORDER BY h.relay_node_id",
+    )
+    .bind(resource_id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(plan.iter().any(|line| line.contains("actual time=")));
+    assert!(plan.iter().any(|line| line.contains("rows=1000")));
+    cleanup(&db).await;
 }

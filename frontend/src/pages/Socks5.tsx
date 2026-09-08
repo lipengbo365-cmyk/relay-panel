@@ -35,6 +35,7 @@ import type {
   Socks5ResourcePage,
 } from '../api/types';
 import { formatBytes } from '../utils/format';
+import SmartRelayWizard from '../components/SmartRelayWizard';
 
 type ResourceForm = {
   name: string;
@@ -113,6 +114,7 @@ export default function Socks5() {
   const [editing, setEditing] = useState<Socks5Resource | null>(null);
   const [editingRule, setEditingRule] = useState<Socks5RelayRule | null>(null);
   const [credentialRule, setCredentialRule] = useState<Socks5RelayRule | null>(null);
+  const [smartRelayResource, setSmartRelayResource] = useState<Socks5Resource | null>(null);
   const [resourceChoices, setResourceChoices] = useState<ResourceChoice[]>([]);
   const resourceChoiceRequest = useRef(0);
   const [resourceForm] = Form.useForm<ResourceForm>();
@@ -429,6 +431,7 @@ export default function Socks5() {
           <Button size="small" icon={<ThunderboltOutlined />} onClick={() => {
             setCheckAll(false); setCheckIds([row.id]); setCheckResults([]); setCheckOpen(true);
           }}>Test</Button>
+          <Button size="small" type="primary" disabled={!row.enabled} onClick={() => setSmartRelayResource(row)}>Create Relay</Button>
           <Button size="small" onClick={() => void openDetail(row)}>详情</Button>
           <Button
             size="small"
@@ -467,13 +470,17 @@ export default function Socks5() {
         `${groupNames.get(row.device_group_in) ?? `#${row.device_group_in}`} · ${row.proxy_address}`,
     },
     { title: '上游资源', dataIndex: 'resource_name' },
+    { title: 'Relay Node', render: (_: unknown, row: Socks5RelayRule) => row.relay_node_name || (row.relay_node_id ? `#${row.relay_node_id}` : 'Legacy / Group') },
+    { title: 'Node Country', dataIndex: 'relay_node_country_code', render: (value: string | null) => value || '-' },
+    { title: 'Selection', dataIndex: 'selection_mode', render: (value: Socks5RelayRule['selection_mode']) => <Tag color={value === 'RECOMMENDED' ? 'blue' : undefined}>{value}</Tag> },
     { title: '出口 IP', dataIndex: 'detected_exit_ip', render: (value: string | null) => value || '-' },
+    { title: 'Exit Country', dataIndex: 'detected_country', render: (value: string | null) => value || '-' },
     { title: '入口账号', dataIndex: 'relay_username_masked', render: (value: string | null) => value || '-' },
     { title: '流量', dataIndex: 'traffic_used', render: (value: number) => formatBytes(value) },
     {
       title: '启用',
       render: (_: unknown, row: Socks5RelayRule) => (
-        <Switch checked={!row.paused} onChange={(value) => void toggleRule(row, value)} />
+        <Space><Switch checked={!row.paused} onChange={(value) => void toggleRule(row, value)} />{row.relay_node_enabled === false ? <Tag color="red">Unavailable: Node disabled</Tag> : row.paused ? <Tag>PAUSED</Tag> : <Tag color="green">CREATED</Tag>}</Space>
       ),
     },
     {
@@ -582,7 +589,7 @@ export default function Socks5() {
                   >
                     添加规则
                   </Button>
-                  <Table rowKey="rule_id" loading={loading} dataSource={rules} columns={ruleColumns} scroll={{ x: 900 }} />
+                  <Table rowKey="rule_id" loading={loading} dataSource={rules} columns={ruleColumns} scroll={{ x: 1500 }} />
                 </>
               ),
             },
@@ -754,14 +761,14 @@ export default function Socks5() {
 
       <Modal title={`SOCKS5 Resource · ${detail?.name ?? ''}`} width={960} open={detail !== null} footer={null}
         onCancel={() => { setDetail(null); setDetailHealth([]); setDetailHistory([]); }} destroyOnHidden>
-        {detail ? <Descriptions bordered size="small" column={2} items={[
+        {detail ? <><Button type="primary" icon={<ThunderboltOutlined />} disabled={!detail.enabled} onClick={() => setSmartRelayResource(detail)} style={{ marginBottom: 12 }}>Create Relay</Button><Descriptions bordered size="small" column={2} items={[
           { key: 'endpoint', label: 'Endpoint', children: `${detail.host}:${detail.port}` },
           { key: 'credential', label: 'Credential', children: detail.username_masked ? `${detail.username_masked} / ••••••••` : 'No auth' },
           { key: 'country', label: 'Country', children: detail.country_code || detail.country || '-' },
           { key: 'detected', label: 'Detected', children: <Space>{detail.detected_country || '-'}{countryMismatch(detail.country_code, detail.detected_country) ? <Tag color="orange">MISMATCH</Tag> : null}</Space> },
           { key: 'rules', label: 'Rules', children: rules.filter((rule) => rule.socks5_resource_id === detail.id).map((rule) => rule.name).join(', ') || '-' },
           { key: 'remark', label: 'Remark', children: detail.remark || '-' },
-        ]} /> : null}
+        ]} /></> : null}
         <Typography.Title level={5}>Node Health Matrix</Typography.Title>
         <Table size="small" pagination={false} rowKey="relay_node_id" dataSource={detailHealth} columns={[
           { title: 'Relay Node', render: (_: unknown, row: Socks5Health) => relayNodes.find((node) => node.id === row.relay_node_id)?.name ?? `#${row.relay_node_id}` },
@@ -776,6 +783,12 @@ export default function Socks5() {
           { title: 'Exit IP', dataIndex: 'exit_ip' }, { title: 'Error', dataIndex: 'error_code' }, { title: 'Checked At', dataIndex: 'checked_at' },
         ]} />
       </Modal>
+      <SmartRelayWizard
+        open={smartRelayResource !== null}
+        resource={smartRelayResource}
+        onClose={() => setSmartRelayResource(null)}
+        onCreated={() => void load()}
+      />
     </div>
   );
 }

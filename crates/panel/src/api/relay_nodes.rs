@@ -21,6 +21,7 @@ pub struct RelayNodePublic {
     pub city: String,
     pub provider: String,
     pub public_ip: String,
+    pub advertise_host: String,
     pub bandwidth_mbps: i32,
     pub remark: String,
     pub tags: Vec<String>,
@@ -61,6 +62,8 @@ pub struct UpdateRelayNodeRequest {
     pub city: String,
     #[serde(default)]
     pub provider: String,
+    #[serde(default)]
+    pub advertise_host: String,
     #[serde(default)]
     pub bandwidth_mbps: i32,
     #[serde(default)]
@@ -116,6 +119,7 @@ pub async fn list(
                 city: node.city,
                 provider: node.provider,
                 public_ip: node.public_ip,
+                advertise_host: node.advertise_host,
                 bandwidth_mbps: node.bandwidth_mbps,
                 remark: node.remark,
                 tags,
@@ -144,6 +148,10 @@ pub async fn update(
 ) -> Json<ApiResponse<RelayNodeRecord>> {
     request.name = request.name.trim().to_owned();
     request.country_code = request.country_code.trim().to_ascii_uppercase();
+    request.advertise_host = match normalize_advertise_host(&request.advertise_host) {
+        Ok(host) => host,
+        Err(message) => return Json(error(400, message)),
+    };
     if request.name.is_empty() || request.name.len() > 128 {
         return Json(error(400, "节点名称不能为空且不得超过 128 字符"));
     }
@@ -174,6 +182,7 @@ pub async fn update(
             request.region.trim(),
             request.city.trim(),
             request.provider.trim(),
+            &request.advertise_host,
             request.bandwidth_mbps,
             request.remark.trim(),
             &tags,
@@ -322,4 +331,90 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn normalize_advertise_host(raw: &str) -> Result<String, &'static str> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    let bracketed = value.starts_with('[') || value.ends_with(']');
+    if bracketed {
+        if !(value.starts_with('[') && value.ends_with(']')) {
+            return Err("Advertised Host 只能填写 IPv4、IPv6 或域名");
+        }
+        let inner = &value[1..value.len() - 1];
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+            return Ok(inner.to_owned());
+        }
+        return Err("Advertised Host 只能填写 IPv4、IPv6 或域名");
+    }
+    if value.len() > 253
+        || value.chars().any(char::is_whitespace)
+        || value.contains("//")
+        || value.contains('/')
+        || value.contains('@')
+        || value.contains('?')
+        || value.contains('#')
+    {
+        return Err("Advertised Host 只能填写 IPv4、IPv6 或域名");
+    }
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(value.to_owned());
+    }
+    if value.contains(':')
+        || !value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err("Advertised Host 只能填写 IPv4、IPv6 或域名");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_advertise_host;
+
+    #[test]
+    fn advertise_host_accepts_only_bare_ip_or_dns_and_normalizes_rendering_input() {
+        assert_eq!(
+            normalize_advertise_host(" 192.0.2.1 ").unwrap(),
+            "192.0.2.1"
+        );
+        assert_eq!(
+            normalize_advertise_host("[2001:db8::1]").unwrap(),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            normalize_advertise_host("Relay.EXAMPLE.com").unwrap(),
+            "relay.example.com"
+        );
+        assert_eq!(normalize_advertise_host("  ").unwrap(), "");
+    }
+
+    #[test]
+    fn advertise_host_rejects_urls_ports_credentials_and_malformed_brackets() {
+        for invalid in [
+            "https://relay.example.com",
+            "relay.example.com:1080",
+            "user@relay.example.com",
+            "relay.example.com/path",
+            "[relay.example.com]",
+            "[2001:db8::1",
+            "2001:db8::1]",
+            "bad..example.com",
+        ] {
+            assert!(
+                normalize_advertise_host(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
 }

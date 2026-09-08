@@ -247,6 +247,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
 CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
     rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
     socks5_resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+    relay_node_id INTEGER REFERENCES relay_nodes(id) ON DELETE RESTRICT,
+    selection_mode TEXT NOT NULL DEFAULT 'LEGACY'
+        CHECK (selection_mode IN ('LEGACY','RECOMMENDED','MANUAL')),
     remote_dns INTEGER NOT NULL DEFAULT 1,
     relay_username TEXT,
     relay_password_ciphertext TEXT,
@@ -263,6 +266,8 @@ CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
 
 CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
     ON socks5_rule_bindings(socks5_resource_id);
+CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_node
+    ON socks5_rule_bindings(relay_node_id);
 
 -- A physical relay-node identity. KVS remains the real-time metrics store;
 -- this table provides stable relational ids for health checks and metadata.
@@ -278,6 +283,7 @@ CREATE TABLE IF NOT EXISTS relay_nodes (
     city TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL DEFAULT '',
     public_ip TEXT NOT NULL DEFAULT '',
+    advertise_host TEXT NOT NULL DEFAULT '',
     bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps >= 0),
     remark TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
@@ -313,6 +319,8 @@ CREATE TABLE IF NOT EXISTS socks5_resource_health (
     error_code TEXT,
     safe_error_message TEXT,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    resource_revision INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
     checked_at TEXT NOT NULL,
     last_success_at TEXT,
     PRIMARY KEY(resource_id, relay_node_id)
@@ -343,6 +351,26 @@ CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node
     ON socks5_check_history(resource_id, relay_node_id, checked_at DESC);
 CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at
     ON socks5_check_history(checked_at);
+
+CREATE TABLE IF NOT EXISTS relay_creation_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    rule_id INTEGER NOT NULL,
+    relay_node_id INTEGER NOT NULL,
+    resource_id INTEGER NOT NULL,
+    endpoint_host TEXT NOT NULL,
+    listen_port INTEGER NOT NULL,
+    relay_username TEXT NOT NULL,
+    exit_ip TEXT NOT NULL,
+    exit_country TEXT,
+    selection_mode TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(actor_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created
+    ON relay_creation_receipts(created_at);
 
 CREATE TABLE IF NOT EXISTS statistics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2163,6 +2191,75 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     }
     migrate_sqlite_socks5_resource_status(pool).await?;
     tracing::info!("Migration 47: relay nodes and SOCKS5 health tables present");
+
+    // ── Migration 49: Stage 4 physical-node binding + smart relay receipts ──
+    add_column_if_missing(
+        pool,
+        "relay_nodes",
+        "advertise_host",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_rule_bindings",
+        "relay_node_id",
+        "INTEGER REFERENCES relay_nodes(id) ON DELETE RESTRICT",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_rule_bindings",
+        "selection_mode",
+        "TEXT NOT NULL DEFAULT 'LEGACY' CHECK(selection_mode IN ('LEGACY','RECOMMENDED','MANUAL'))",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_resource_health",
+        "resource_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_resource_health",
+        "generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_node ON socks5_rule_bindings(relay_node_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS relay_creation_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            idempotency_key TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            rule_id INTEGER NOT NULL,
+            relay_node_id INTEGER NOT NULL,
+            resource_id INTEGER NOT NULL,
+            endpoint_host TEXT NOT NULL,
+            listen_port INTEGER NOT NULL,
+            relay_username TEXT NOT NULL,
+            exit_ip TEXT NOT NULL,
+            exit_country TEXT,
+            selection_mode TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(actor_id,idempotency_key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created ON relay_creation_receipts(created_at)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 49: Stage 4 smart relay binding present");
 
     Ok(())
 }

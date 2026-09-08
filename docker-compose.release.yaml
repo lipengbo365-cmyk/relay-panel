@@ -17,7 +17,7 @@
 
 services:
   panel:
-    image: ${RELAYPANEL_PANEL_IMAGE:-relay-panel-socks5:v1.0.0-alpha1}
+    image: ${RELAYPANEL_PANEL_IMAGE:-relay-panel-socks5:v1.0.0-alpha4}
     ports:
       # RELAYPANEL_WEB_MODE controls how the panel port is published:
       #   direct         → 0.0.0.0:18888:18888  (public, default)
@@ -61,7 +61,7 @@ services:
   # separate forwarding server. To enable it on this host, use --profile node
   # and set NODE_TOKEN to a real inbound-group token from the panel UI.
   node:
-    image: ${RELAYPANEL_NODE_IMAGE:-relay-node-socks5:v1.0.0-alpha1}
+    image: ${RELAYPANEL_NODE_IMAGE:-relay-node-socks5:v1.0.0-alpha4}
     profiles:
       - node
     network_mode: host
