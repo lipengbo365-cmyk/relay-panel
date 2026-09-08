@@ -323,4 +323,11 @@ pub fn routes() -> Router<AppState> {
             "/node/diagnose_result",
             axum::routing::post(diagnose::receive_diagnose_result),
         )
+        // v1.2.9: node reports a FAILED self-upgrade (same auth). There is no
+        // success counterpart — a successful upgrade exits the process, and the
+        // node's new version arrives in the ordinary status report.
+        .route(
+            "/node/upgrade_result",
+            axum::routing::post(stats::receive_upgrade_result),
+        )
 }

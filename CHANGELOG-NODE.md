@@ -11,6 +11,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.2.4] - 2026-09-08
+
+Node only. Nothing on the wire changed (still protocol version 4), so this node
+runs against any current panel — but the panel only records what it reports
+from **1.2.9** onward.
+
+Worth taking if you use the one-click remote upgrade.
+
+### Added
+
+- **A failed self-upgrade is reported to the panel instead of only the local
+  log.** Everything that can go wrong in an upgrade goes wrong here — the
+  download (routinely, where GitHub is unreachable), the sha256 check, the
+  backup, the swap — and every one of those errors used to end at
+  `tracing::error!` on a machine nobody is watching. The panel had sent the
+  command and heard nothing since, so it could not tell a failed upgrade from a
+  slow one, and said so in the audit log for want of anything better.
+
+  The node now POSTs the reason to `/api/v1/node/upgrade_result`, authenticated
+  with its existing node token.
+
+  Only failures are reported, and the asymmetry is forced rather than chosen: a
+  successful upgrade ends by exiting so the supervisor re-execs the new binary,
+  so there is no process left to send a success — and none is needed, since the
+  node comes back and reports its new version in the ordinary status report.
+
+  Best-effort by construction: it runs on a path that is already broken, often
+  because the network is down, so it gets a short timeout and its own failure is
+  logged and dropped. The node keeps forwarding on the binary it still has.
+
 ## [1.2.3] - 2026-08-27
 
 Node only. Nothing on the wire changed (still protocol version 4), so this

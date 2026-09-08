@@ -22,18 +22,17 @@ pub fn validate_forward_mode(mode: &str) -> bool {
 
 /// Is `transport` accepted by the admin API in the current release?
 ///
-/// v0.4.1: `Raw` + `Ws` + `TlsSimple` (node terminates TLS via rustls).
-/// `Wss` is deprecated — existing wss rules are migrated to ws by Migration 18,
-/// and the admin API no longer accepts creating new wss rules.
+/// WS/TLS ingress was retired in node v1.0.8. Reject it before persisting
+/// a rule that the node cannot serve. Legacy records remain readable.
 ///
 /// Single source of truth for "what public_transport values may a rule store" —
 /// both create_rule and update_rule call this so they can't drift.
 pub fn is_public_transport_accepted(transport: PublicTransport) -> bool {
-    matches!(
-        transport,
-        PublicTransport::Raw | PublicTransport::Ws | PublicTransport::TlsSimple
-    )
+    matches!(transport, PublicTransport::Raw)
 }
+
+const RETIRED_TRANSPORT_ERROR: &str =
+    "public_transport: WS/TLS ingress is retired; use 'raw' and clear tunnel_profile_id";
 
 /// Validate the protocol × public_transport combination for v0.4.0.
 ///
@@ -381,9 +380,7 @@ pub async fn create_rule(
     }
 
     if !is_public_transport_accepted(req.public_transport) {
-        return Err(CreateRuleError::BadRequest(
-            "public_transport: only 'raw', 'ws' and 'tls_simple' are supported".into(),
-        ));
+        return Err(CreateRuleError::BadRequest(RETIRED_TRANSPORT_ERROR.into()));
     }
 
     if let Some(msg) = validate_protocol_transport(
@@ -595,9 +592,7 @@ pub async fn update_rule(
 
     if let Some(ref transport) = req.public_transport {
         if !is_public_transport_accepted(*transport) {
-            return Err(UpdateRuleError::BadRequest(
-                "public_transport: only 'raw', 'ws' and 'tls_simple' are supported".into(),
-            ));
+            return Err(UpdateRuleError::BadRequest(RETIRED_TRANSPORT_ERROR.into()));
         }
     }
 
@@ -724,6 +719,11 @@ pub async fn update_rule(
         .as_ref()
         .copied()
         .unwrap_or(existing_transport);
+    // A resume may omit public_transport and inherit a retired value. Keep
+    // pausing/renaming legacy rules possible, and allow an explicit raw conversion.
+    if req.paused == Some(false) && !is_public_transport_accepted(effective_transport) {
+        return Err(UpdateRuleError::BadRequest(RETIRED_TRANSPORT_ERROR.into()));
+    }
     let effective_pid = match req.tunnel_profile_id {
         Some(pid_opt) => pid_opt,
         None => existing.tunnel_profile_id,
@@ -961,6 +961,147 @@ pub async fn update_rule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::repo::RuleRepository;
+
+    #[test]
+    fn profile_update_distinguishes_omitted_null_and_id() {
+        for (json, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"tunnel_profile_id": null}), Some(None)),
+            (serde_json::json!({"tunnel_profile_id": 7}), Some(Some(7))),
+        ] {
+            let req: UpdateRuleRequest = serde_json::from_value(json).unwrap();
+            assert_eq!(req.tunnel_profile_id, expected);
+        }
+    }
+
+    async fn transport_test_db() -> (sqlx::SqlitePool, crate::db::sqlite_repo::SqliteRepository) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(crate::db::schema::SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET admin = 1 WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (1, 'entry', 'in', 'unused', 1)")
+            .execute(&pool).await.unwrap();
+        let repo = crate::db::sqlite_repo::SqliteRepository::new(pool.clone());
+        (pool, repo)
+    }
+
+    #[tokio::test]
+    async fn retired_transports_cannot_create_rules() {
+        let (pool, repo) = transport_test_db().await;
+        for transport in ["ws", "tls_simple"] {
+            sqlx::query(
+                "INSERT INTO tunnel_profiles (id, name, transport, uid) VALUES (1, 'legacy', ?, 1)",
+            )
+            .bind(transport)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let req: CreateRuleRequest = serde_json::from_value(serde_json::json!({
+                "name": "unsupported", "listen_port": 24001, "protocol": "tcp",
+                "device_group_in": 1, "forward_mode": "direct",
+                "public_transport": transport, "tunnel_profile_id": 1,
+                "target_addr": "127.0.0.1", "target_port": 80
+            }))
+            .unwrap();
+            assert!(matches!(create_rule(&repo, 1, true, &req).await,
+                Err(CreateRuleError::BadRequest(msg)) if msg.contains("retired")));
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "rejected requests must not write a rule");
+            sqlx::query("DELETE FROM tunnel_profiles")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_transports_reject_updates_and_resume_but_allow_cleanup() {
+        let (pool, repo) = transport_test_db().await;
+        let scope = ResourceScope::Owner(1);
+        for transport in [PublicTransport::Ws, PublicTransport::TlsSimple] {
+            sqlx::query(
+                "INSERT INTO tunnel_profiles (id, name, transport, uid) VALUES (1, 'legacy', ?, 1)",
+            )
+            .bind(transport.to_db_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO forward_rules (id, name, uid, listen_port, device_group_in, target_addr, target_port, public_transport, node_transport, tunnel_profile_id, paused) VALUES (1, 'legacy', 1, 24001, 1, '127.0.0.1', 80, ?, ?, 1, 1)")
+                .bind(transport.to_db_str()).bind(transport.to_db_str()).execute(&pool).await.unwrap();
+            for req in [
+                UpdateRuleRequest {
+                    public_transport: Some(transport),
+                    ..Default::default()
+                },
+                UpdateRuleRequest {
+                    paused: Some(false),
+                    ..Default::default()
+                },
+            ] {
+                assert!(matches!(update_rule(&repo, 1, &scope, &req).await,
+                    Err(UpdateRuleError::BadRequest(msg)) if msg.contains("retired")));
+                assert!(
+                    repo.find_rule_by_id(1, &scope)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .paused
+                );
+            }
+            let pause = UpdateRuleRequest {
+                paused: Some(true),
+                name: Some("old rule".into()),
+                ..Default::default()
+            };
+            update_rule(&repo, 1, &scope, &pause).await.unwrap();
+            let convert: UpdateRuleRequest = serde_json::from_value(serde_json::json!({
+                "public_transport": "raw", "tunnel_profile_id": null, "paused": false
+            }))
+            .unwrap();
+            update_rule(&repo, 1, &scope, &convert).await.unwrap();
+            let rule = repo.find_rule_by_id(1, &scope).await.unwrap().unwrap();
+            assert_eq!(rule.public_transport, "raw");
+            assert!(rule.tunnel_profile_id.is_none());
+            assert!(!rule.paused);
+            sqlx::query("DELETE FROM forward_rules")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM tunnel_profiles")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_forward_mode_creates_a_direct_rule() {
+        let (pool, repo) = transport_test_db().await;
+        let req: CreateRuleRequest = serde_json::from_value(serde_json::json!({
+            "name": "direct", "listen_port": 24002, "protocol": "tcp",
+            "device_group_in": 1, "target_addr": "127.0.0.1", "target_port": 80
+        }))
+        .unwrap();
+        create_rule(&repo, 1, true, &req).await.unwrap();
+        let mode: String = sqlx::query_scalar("SELECT forward_mode FROM forward_rules")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "direct");
+    }
 
     /// The valid combinations must all pass (return None). These are the ones
     /// the UI and the node actually support in v0.3.0-alpha.

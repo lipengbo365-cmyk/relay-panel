@@ -360,6 +360,12 @@ async fn connect_and_run(
                                     "websocket: self-upgrade to v{} requested; starting",
                                     version
                                 );
+                                // v1.2.4: owned copies for the detached task, so
+                                // it can report a failure back to the panel after
+                                // the WS loop has moved on (or reconnected).
+                                let panel_url = config.panel_url.clone();
+                                let token = config.token.clone();
+                                let my_node_id = node_id.to_string();
                                 tokio::spawn(async move {
                                     match crate::updater::self_upgrade(&version).await {
                                         Ok(()) => {
@@ -368,10 +374,24 @@ async fn connect_and_run(
                                             );
                                             std::process::exit(0);
                                         }
-                                        Err(e) => tracing::error!(
-                                            "self-upgrade failed: {} (keeping current binary)",
-                                            e
-                                        ),
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "self-upgrade failed: {} (keeping current binary)",
+                                                e
+                                            );
+                                            // The local log was previously the
+                                            // ONLY record of this. Tell the panel
+                                            // too, so the operator who pressed
+                                            // the button learns it didn't work.
+                                            crate::updater::report_failure(
+                                                &panel_url,
+                                                &token,
+                                                &my_node_id,
+                                                &version,
+                                                &e,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 });
                             }

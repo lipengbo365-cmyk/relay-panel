@@ -637,6 +637,90 @@ pub struct UpgradeNodeMessage {
     pub version: String,
 }
 
+/// v1.2.9 / node 1.2.4: node -> panel over the existing HTTP channel, sent
+/// after a self-upgrade attempt FAILED.
+///
+/// There is deliberately no success variant. A successful upgrade ends in
+/// `std::process::exit(0)` so the supervisor restarts the node into the new
+/// binary — the process that would send the report is gone before it could send
+/// one. Success is observable without it anyway: the node reconnects and
+/// reports its new version in the ordinary status report, which is exactly what
+/// the panel's "dispatched" audit entry already points at.
+///
+/// The FAILURE is what had nowhere to go. It was written to the node's local
+/// log and never left the machine, so an operator watching the panel saw a
+/// dispatch and then silence — indistinguishable from a slow success, forever.
+///
+/// Additive: a new struct on a new endpoint, no existing message changes, so
+/// `CONFIG_PROTOCOL_VERSION` stays 4 and an older node simply never posts one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeResult {
+    #[serde(rename = "type")]
+    pub msg_type: String, // "upgrade_result"
+    /// Which node this is about. The panel does NOT trust it as a name: it
+    /// looks the id up among the token's own group's status rows, so a node can
+    /// only ever speak for a node that group actually has.
+    pub node_id: String,
+    /// The version still running — the swap did not happen.
+    pub from_version: String,
+    /// The version the panel asked for.
+    pub target_version: String,
+    /// Why it failed. NODE-CONTROLLED TEXT that ends up in the audit log, so it
+    /// passes through [`sanitize_upgrade_error`] on arrival. The node sanitizes
+    /// it too, but the panel MUST NOT rely on that — this field comes off the
+    /// network.
+    pub error: String,
+}
+
+impl UpgradeResult {
+    pub fn new(node_id: String, from_version: String, target_version: String, error: &str) -> Self {
+        Self {
+            msg_type: "upgrade_result".into(),
+            node_id,
+            from_version,
+            target_version,
+            error: sanitize_upgrade_error(error),
+        }
+    }
+}
+
+/// Cap on a stored upgrade error, in CHARACTERS (not bytes — truncating UTF-8
+/// by bytes can split a multi-byte character, and these messages are routinely
+/// not ASCII).
+pub const MAX_UPGRADE_ERROR_LEN: usize = 300;
+
+/// Make a node-supplied error safe to store in an audit `detail`.
+///
+/// Control characters — newlines above all — are folded to spaces and runs of
+/// whitespace collapsed. An audit detail renders as one line per entry, so a
+/// message carrying its own newlines could otherwise draw fake rows into the
+/// log. The result is then capped at [`MAX_UPGRADE_ERROR_LEN`] characters,
+/// because the node decides this string's length and the audit table should
+/// not.
+pub fn sanitize_upgrade_error(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_UPGRADE_ERROR_LEN));
+    let mut last_was_space = false;
+    for ch in raw.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if ch == ' ' {
+            if last_was_space {
+                continue;
+            }
+            last_was_space = true;
+        } else {
+            last_was_space = false;
+        }
+        out.push(ch);
+    }
+    let out = out.trim();
+    if out.chars().count() > MAX_UPGRADE_ERROR_LEN {
+        let kept: String = out.chars().take(MAX_UPGRADE_ERROR_LEN).collect();
+        format!("{kept}...")
+    } else {
+        out.to_string()
+    }
+}
+
 impl DiagnoseRuleMessage {
     pub fn new(request_id: String, rule_id: i64, challenge: String) -> Self {
         Self {
@@ -836,8 +920,8 @@ pub struct CreateRuleRequest {
     /// target directly, no outbound group needed).
     #[serde(default)]
     pub device_group_out: Option<i64>,
-    /// "group" (default) = forward via outbound group; "direct" = inbound
-    /// connects to target_addr:target_port directly.
+    /// "direct" (default) = inbound connects to target_addr:target_port.
+    /// The panel rejects legacy outbound-group forwarding on new requests.
     #[serde(default = "default_forward_mode")]
     pub forward_mode: String,
     /// v0.4.0: forwarding topology. Defaults to Direct. The panel accepts
@@ -876,7 +960,7 @@ pub struct CreateRuleRequest {
 }
 
 fn default_forward_mode() -> String {
-    "group".to_string()
+    "direct".to_string()
 }
 
 /// Update an existing rule. All fields optional — only provided fields are
@@ -919,7 +1003,7 @@ pub struct UpdateRuleRequest {
     pub download_limit_mbps: Option<i32>,
     /// v0.4.7: bind (Some) or unbind (None) the rule's tunnel profile. Omitted
     /// = leave current binding.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_profile_update")]
     pub tunnel_profile_id: Option<Option<i64>>,
     /// v0.3.0: pause/resume a rule without deleting it. true = paused (the node
     /// stops forwarding — get_config filters `WHERE paused = 0`), false = active.
@@ -935,6 +1019,15 @@ pub struct UpdateRuleRequest {
     /// current. A non-zero value below `MIN_AUTO_RESTART_MINUTES` is rejected.
     #[serde(default)]
     pub auto_restart_minutes: Option<i32>,
+}
+
+// Missing field uses Default (None); an explicit JSON null means clear the
+// binding (Some(None)). Serde's default nested Option handling conflates them.
+fn deserialize_profile_update<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(Some)
 }
 
 // === Admin API — Groups ===
@@ -1458,5 +1551,50 @@ mod tests {
         assert!(node_supports_directed_diagnose(Some("0.4.14-rc1")));
         assert!(node_supports_directed_diagnose(Some("0.5.0")));
         assert!(node_supports_directed_diagnose(Some("1.0.0")));
+    }
+
+    /// The error text comes off the network and lands in an audit `detail`,
+    /// which renders one line per entry — a message carrying its own newlines
+    /// could otherwise draw rows that look like separate audited actions.
+    #[test]
+    fn sanitize_upgrade_error_folds_control_chars_into_single_spaces() {
+        assert_eq!(
+            sanitize_upgrade_error("download failed:\n\n  connection reset\r\n"),
+            "download failed: connection reset"
+        );
+        assert_eq!(sanitize_upgrade_error("a\tb\u{7}c"), "a b c");
+        assert_eq!(sanitize_upgrade_error("   padded   "), "padded");
+    }
+
+    /// The node decides this string's length, so the cap is the panel's, and it
+    /// counts CHARACTERS: truncating UTF-8 by bytes would split a multi-byte
+    /// character and store invalid text.
+    #[test]
+    fn sanitize_upgrade_error_caps_length_without_splitting_a_character() {
+        let long = "e".repeat(MAX_UPGRADE_ERROR_LEN + 50);
+        let out = sanitize_upgrade_error(&long);
+        assert_eq!(out.chars().count(), MAX_UPGRADE_ERROR_LEN + 3);
+        assert!(out.ends_with("..."));
+
+        // Multi-byte input truncated at exactly the cap, still valid UTF-8.
+        let wide = "\u{4e2d}".repeat(MAX_UPGRADE_ERROR_LEN + 10);
+        let out = sanitize_upgrade_error(&wide);
+        assert_eq!(
+            out.chars().filter(|c| *c == '\u{4e2d}').count(),
+            MAX_UPGRADE_ERROR_LEN
+        );
+
+        // Exactly at the cap is NOT truncated — no stray ellipsis.
+        let exact = "e".repeat(MAX_UPGRADE_ERROR_LEN);
+        assert_eq!(sanitize_upgrade_error(&exact), exact);
+    }
+
+    /// The constructor must sanitize, so a caller cannot bypass it by building
+    /// the message the obvious way.
+    #[test]
+    fn upgrade_result_new_sanitizes_the_error() {
+        let r = UpgradeResult::new("7".into(), "1.2.3".into(), "1.2.4".into(), "boom\nagain");
+        assert_eq!(r.error, "boom again");
+        assert_eq!(r.msg_type, "upgrade_result");
     }
 }
