@@ -721,6 +721,7 @@ export const enUS: Dict = {
   // when the command reaches the WS channel; the node can still fail to
   // download, verify, or swap, and never reports back.
   audit_upgrade_node: 'Node upgrade dispatched',
+  audit_upgrade_node_failed: 'Node upgrade failed',
   audit_create_redeem_codes: 'Generate codes',
   audit_void_redeem_code: 'Void code',
   audit_delete_redeem_codes: 'Delete codes',

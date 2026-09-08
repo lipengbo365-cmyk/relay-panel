@@ -27,6 +27,7 @@ const ACTIONS = [
   'delete_group',
   'rotate_group_token',
   'upgrade_node',
+  'upgrade_node_failed',
   'create_redeem_codes',
   'void_redeem_code',
   'delete_redeem_codes',
@@ -41,6 +42,7 @@ const ACTIONS = [
 /** Actions that destroy something get a red tag, so a delete stands out when
  *  skimming a page of mostly routine entries. */
 const DESTRUCTIVE = new Set<string>([
+  'upgrade_node_failed',
   'delete_user',
   'delete_rule',
   'delete_group',

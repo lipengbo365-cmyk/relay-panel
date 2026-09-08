@@ -10,8 +10,30 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [1.2.9] - 2026-09-08
 
-Panel-only maintenance release. Nodes remain on `node-v1.2.3`; no node upgrade,
-database migration or config protocol change is required.
+Maintenance release. The node ships alongside as `node-v1.2.4`; neither
+requires the other. No database migration, and the config protocol is unchanged
+at version 4.
+
+### Added
+
+- **A node that fails to upgrade itself now says so.** Pressing "upgrade" sent a
+  command and wrote an audit entry saying it had been dispatched — which was all
+  the panel could honestly claim, because everything that can actually fail
+  happens afterwards on the node (downloading the binary, verifying its sha256,
+  backing up, swapping) and the node reported none of it back. The failure was
+  written to the node's local log, on a machine whose whole problem is that
+  nobody is watching it, so from the panel a failed upgrade and a slow one
+  looked identical, permanently.
+
+  A node running 1.2.4 or later now posts the failure to the panel, which
+  records it as `upgrade_node_failed` in the audit log with the reason. Success
+  still needs no report: the upgrade ends by restarting the node, which comes
+  back and reports its new version in the ordinary status report.
+
+  The endpoint is additive and authenticated by the node token, so the config
+  protocol stays at version 4 and an older node simply never posts. The error
+  text is node-controlled, so the panel folds control characters out of it and
+  caps its length before it reaches the audit log.
 
 ### Fixed
 

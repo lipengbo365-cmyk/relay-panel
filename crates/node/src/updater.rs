@@ -53,6 +53,62 @@ pub fn install_method() -> &'static str {
     }
 }
 
+/// v1.2.4: tell the panel a self-upgrade attempt failed.
+///
+/// Only failures are reported, and the asymmetry is forced rather than chosen:
+/// a successful upgrade ends with the caller calling `std::process::exit(0)`,
+/// so there is no process left to send a success. Nor is one needed — the node
+/// comes back up and reports its new version in the ordinary status report,
+/// which is what the panel's audit entry tells the operator to look at.
+///
+/// A failure had nowhere to go before this. It was logged locally on a machine
+/// whose whole problem is that nobody is watching it, so from the panel a
+/// failed upgrade and a slow one looked identical, permanently.
+///
+/// Best-effort by construction: this runs on the failure path of an upgrade
+/// that already went wrong, frequently because the network is unreachable, so
+/// it gets a short timeout and its own error is logged and dropped. Never
+/// propagate from here — the node's job now is to keep forwarding on the binary
+/// it still has.
+pub async fn report_failure(
+    panel_url: &str,
+    token: &str,
+    node_id: &str,
+    target_version: &str,
+    error: &str,
+) {
+    let result = relay_shared::protocol::UpgradeResult::new(
+        node_id.to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        target_version.to_string(),
+        error,
+    );
+    let url = format!("{}/api/v1/node/upgrade_result", panel_url);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("upgrade_result: build client: {}", e);
+            return;
+        }
+    };
+    match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&result)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!("upgrade_result: reported failure to panel");
+        }
+        Ok(r) => tracing::warn!("upgrade_result: panel returned HTTP {}", r.status()),
+        Err(e) => tracing::warn!("upgrade_result: post failed: {}", e),
+    }
+}
+
 /// Map the compiled target arch to the release asset suffix.
 fn asset_arch() -> Option<&'static str> {
     match std::env::consts::ARCH {

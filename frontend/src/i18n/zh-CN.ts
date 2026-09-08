@@ -718,6 +718,7 @@ export const zhCN = {
   // 了，实际可能根本没升上去（国内节点下载失败是常态）。结果要去「节点状态」
   // 页核对版本号。
   audit_upgrade_node: '下发节点升级',
+  audit_upgrade_node_failed: '节点升级失败',
   audit_create_redeem_codes: '生成卡密',
   audit_void_redeem_code: '作废卡密',
   audit_delete_redeem_codes: '删除卡密',

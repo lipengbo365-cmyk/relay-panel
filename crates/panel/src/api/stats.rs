@@ -611,6 +611,300 @@ pub async fn upgrade_node(
     Json(ApiResponse::success(()))
 }
 
+/// POST /api/v1/node/upgrade_result — a node reports that a self-upgrade it was
+/// told to perform FAILED.
+///
+/// Authenticated by NODE_TOKEN, like `/node/diagnose_result`. There is no
+/// success counterpart: a successful upgrade exits the process, and the node's
+/// new version arrives in the ordinary status report instead.
+///
+/// Authorization is the group token PLUS an existence check: the reported
+/// `node_id` must already have a status row under the token's own group. The id
+/// arrives as node-controlled text and is written into the audit `target_id`,
+/// so resolving it against real rows keeps one group's token from filing a
+/// report about another group's node — and keeps invented ids out of the log
+/// entirely.
+pub async fn receive_upgrade_result(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<UpgradeResult>,
+) -> Json<ApiResponse<()>> {
+    let Some(token) = crate::api::node::extract_node_token(&headers) else {
+        return Json(ApiResponse {
+            code: 401,
+            message: "Invalid token".into(),
+            data: None,
+        });
+    };
+    let group = match state.db.find_by_token(&token).await {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return Json(ApiResponse {
+                code: 401,
+                message: "Invalid token".into(),
+                data: None,
+            })
+        }
+        Err(e) => {
+            tracing::error!("upgrade_result: find_by_token failed: {}", e);
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
+        }
+    };
+
+    // The node must be one this group actually has. Both key shapes are
+    // accepted for the same reason the diagnose path accepts both: a node that
+    // reports no node_id stores its status under the legacy per-group key.
+    let status_key = if req.node_id.is_empty() {
+        format!("node_status:{}", group.id)
+    } else {
+        format!("node_status:{}:{}", group.id, req.node_id)
+    };
+    match state.db.get(&status_key).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Json(ApiResponse {
+                code: 404,
+                message: "node not found in this group".into(),
+                data: None,
+            })
+        }
+        Err(e) => {
+            tracing::error!("upgrade_result: kvs get failed: {}", e);
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
+        }
+    }
+
+    // Re-sanitize rather than trust the node's own pass: this string came off
+    // the network, and the node that sent it is by definition malfunctioning.
+    let reason = sanitize_upgrade_error(&req.error);
+    let from = sanitize_upgrade_error(&req.from_version);
+    let target = sanitize_upgrade_error(&req.target_version);
+    tracing::warn!(
+        group_id = group.id,
+        node_id = %req.node_id,
+        from = %from,
+        target = %target,
+        "node reported a failed self-upgrade: {}",
+        reason
+    );
+
+    // actor is None ("system"): no admin is present on this request. The admin
+    // who pressed the button is already on the `upgrade_node` entry that
+    // preceded this one.
+    crate::service::audit::record(
+        &state,
+        None,
+        "upgrade_node_failed",
+        "node",
+        &req.node_id,
+        &format!(
+            "分组 {} · {from} → {target} 升级失败：{reason}",
+            crate::service::audit::group_label(&state, group.id).await
+        ),
+    )
+    .await;
+
+    Json(ApiResponse::success(()))
+}
+
+#[cfg(test)]
+mod upgrade_result_tests {
+    use super::*;
+    use crate::api::system::ReleaseCache;
+    use crate::api::ws::NodeConnections;
+    use crate::config::Config;
+    use crate::db::repo::AuditEntry;
+    use crate::db::schema::SCHEMA_SQL;
+    use crate::db::sqlite_repo::SqliteRepository;
+    use axum::http::HeaderMap;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
+
+    const TOKEN: &str = "group-token-for-tests";
+
+    async fn state_with_group() -> AppState {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (9, 'HK entry', 'in', ?, 1)",
+        )
+        .bind(TOKEN)
+        .execute(&pool)
+        .await
+        .unwrap();
+        AppState {
+            db: Arc::new(SqliteRepository::new(pool)),
+            config: Config {
+                database_path: "sqlite::memory:".into(),
+                listen: "127.0.0.1:0".into(),
+                key: "test-key".into(),
+                jwt_secret: "test-secret".into(),
+                public_dir: "public".into(),
+                public_panel_url: String::new(),
+                registration_enabled: false,
+                cors_origins: vec![],
+                geoip_enabled: false,
+                geoip_cache_ttl: 604_800,
+            },
+            release_cache: ReleaseCache::new(),
+            node_connections: NodeConnections::new(),
+            diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
+            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    fn auth(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    fn result_for(node_id: &str, error: &str) -> UpgradeResult {
+        UpgradeResult::new(node_id.into(), "1.2.3".into(), "1.2.4".into(), error)
+    }
+
+    async fn audit_rows(state: &AppState) -> Vec<AuditEntry> {
+        state
+            .db
+            .query_audit_log(Some("upgrade_node_failed"), 10, 0)
+            .await
+            .unwrap()
+    }
+
+    /// A report about a node the group does not have is refused. The id arrives
+    /// as node-controlled text and is written into the audit `target_id`, so
+    /// resolving it against a real status row is what stops one group's token
+    /// from filing a report against another group's node — or an invented one.
+    #[tokio::test]
+    async fn a_node_without_a_status_row_in_this_group_is_rejected() {
+        let state = state_with_group().await;
+        // A status row exists, but under a DIFFERENT group.
+        state.db.set("node_status:4:nodeA", "{}").await.unwrap();
+
+        let resp = receive_upgrade_result(
+            State(state.clone()),
+            auth(TOKEN),
+            Json(result_for("nodeA", "download failed")),
+        )
+        .await;
+
+        assert_eq!(resp.0.code, 404);
+        assert!(
+            audit_rows(&state).await.is_empty(),
+            "a rejected report must not write an audit entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_token_is_rejected_before_anything_is_written() {
+        let state = state_with_group().await;
+        state.db.set("node_status:9:nodeA", "{}").await.unwrap();
+
+        let resp = receive_upgrade_result(
+            State(state.clone()),
+            auth("not-a-real-token"),
+            Json(result_for("nodeA", "download failed")),
+        )
+        .await;
+
+        assert_eq!(resp.0.code, 401);
+        assert!(audit_rows(&state).await.is_empty());
+    }
+
+    /// The happy path records the group's NAME (v1.2.8's rule) and the reason,
+    /// under a "system" actor — no admin is present on this request.
+    #[tokio::test]
+    async fn a_reported_failure_is_recorded_with_the_group_name_and_reason() {
+        let state = state_with_group().await;
+        state.db.set("node_status:9:nodeA", "{}").await.unwrap();
+
+        let resp = receive_upgrade_result(
+            State(state.clone()),
+            auth(TOKEN),
+            Json(result_for("nodeA", "sha256 mismatch")),
+        )
+        .await;
+        assert_eq!(resp.0.code, 0);
+
+        let rows = audit_rows(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_id, "nodeA");
+        assert_eq!(rows[0].actor_name, "system");
+        assert!(
+            rows[0].detail.contains("HK entry (#9)"),
+            "{}",
+            rows[0].detail
+        );
+        assert!(rows[0].detail.contains("1.2.3"));
+        assert!(rows[0].detail.contains("1.2.4"));
+        assert!(rows[0].detail.contains("sha256 mismatch"));
+    }
+
+    /// The panel re-sanitizes rather than trusting the node's own pass: this
+    /// field comes off the network, and the node that sent it is by definition
+    /// malfunctioning. An audit detail renders one line per entry, so a
+    /// newline-bearing reason could otherwise draw rows that look like separate
+    /// audited actions.
+    #[tokio::test]
+    async fn a_hand_forged_multiline_reason_cannot_add_lines_to_the_audit_log() {
+        let state = state_with_group().await;
+        state.db.set("node_status:9:nodeA", "{}").await.unwrap();
+
+        // Bypasses UpgradeResult::new, exactly as a hostile poster would.
+        let forged = UpgradeResult {
+            msg_type: "upgrade_result".into(),
+            node_id: "nodeA".into(),
+            from_version: "1.2.3".into(),
+            target_version: "1.2.4".into(),
+            error: "boom\n2026-01-01 admin deleted everything".into(),
+        };
+        let _ = receive_upgrade_result(State(state.clone()), auth(TOKEN), Json(forged)).await;
+
+        let rows = audit_rows(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].detail.contains('\n'), "{}", rows[0].detail);
+    }
+
+    /// The node decides this string's length; the audit table should not have
+    /// to store whatever it sends.
+    #[tokio::test]
+    async fn an_oversized_reason_is_capped_before_it_is_stored() {
+        let state = state_with_group().await;
+        state.db.set("node_status:9:nodeA", "{}").await.unwrap();
+
+        let huge = "x".repeat(10_000);
+        let forged = UpgradeResult {
+            msg_type: "upgrade_result".into(),
+            node_id: "nodeA".into(),
+            from_version: "1.2.3".into(),
+            target_version: "1.2.4".into(),
+            error: huge,
+        };
+        let _ = receive_upgrade_result(State(state.clone()), auth(TOKEN), Json(forged)).await;
+
+        let rows = audit_rows(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].detail.chars().count() < MAX_UPGRADE_ERROR_LEN + 200,
+            "detail was {} chars",
+            rows[0].detail.chars().count()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_status_key;
