@@ -836,8 +836,8 @@ pub struct CreateRuleRequest {
     /// target directly, no outbound group needed).
     #[serde(default)]
     pub device_group_out: Option<i64>,
-    /// "group" (default) = forward via outbound group; "direct" = inbound
-    /// connects to target_addr:target_port directly.
+    /// "direct" (default) = inbound connects to target_addr:target_port.
+    /// The panel rejects legacy outbound-group forwarding on new requests.
     #[serde(default = "default_forward_mode")]
     pub forward_mode: String,
     /// v0.4.0: forwarding topology. Defaults to Direct. The panel accepts
@@ -876,7 +876,7 @@ pub struct CreateRuleRequest {
 }
 
 fn default_forward_mode() -> String {
-    "group".to_string()
+    "direct".to_string()
 }
 
 /// Update an existing rule. All fields optional — only provided fields are
@@ -919,7 +919,7 @@ pub struct UpdateRuleRequest {
     pub download_limit_mbps: Option<i32>,
     /// v0.4.7: bind (Some) or unbind (None) the rule's tunnel profile. Omitted
     /// = leave current binding.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_profile_update")]
     pub tunnel_profile_id: Option<Option<i64>>,
     /// v0.3.0: pause/resume a rule without deleting it. true = paused (the node
     /// stops forwarding — get_config filters `WHERE paused = 0`), false = active.
@@ -938,6 +938,15 @@ pub struct UpdateRuleRequest {
 }
 
 // === Admin API — Groups ===
+// Missing field uses Default (None); an explicit JSON null means clear the
+// binding (Some(None)). Serde's default nested Option handling conflates them.
+fn deserialize_profile_update<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateGroupRequest {
     pub name: String,

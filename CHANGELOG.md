@@ -8,6 +8,26 @@ independent `v*` / `node-v*` tracks since this release).
 
 ---
 
+## [1.2.9] - 2026-09-08
+
+Panel-only maintenance release. Nodes remain on `node-v1.2.3`; no node upgrade,
+database migration or config protocol change is required.
+
+### Fixed
+
+- Rule creation and explicit transport updates now reject retired WS / TLS Simple
+  ingress with an actionable error. Previously the API could save these rules
+  successfully even though current nodes skip their listeners.
+- Resuming a legacy WS / TLS Simple rule is rejected even when the request omits
+  its transport. Existing rules can still be paused, renamed, or converted to
+  raw TCP forwarding by clearing the old transport profile.
+- API clients that omit `forward_mode` now get direct forwarding by default.
+  Previously the default was the retired group mode, causing an otherwise valid
+  rule-creation request to be rejected.
+- Sending `tunnel_profile_id: null` now clears the rule's old transport profile.
+  Omitting the field still preserves it; previously both requests preserved the
+  binding, preventing API clients from converting legacy rules to raw transport.
+
 ## [1.2.8] - 2026-08-27
 
 Panel only. The node ships separately as `node-v1.2.3` — take that one if you

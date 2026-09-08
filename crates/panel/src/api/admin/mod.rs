@@ -1947,11 +1947,9 @@ mod tests {
         .unwrap();
     }
 
-    /// v0.4.11 PR1: a regular user CAN now bind admin-created custom WS/TLS Simple
-    /// templates (AvailableTemplates scope). This is intentional — regular users
-    /// can select any available template for their rules.
+    /// Retired ingress is rejected even with a valid admin-owned custom template.
     #[tokio::test]
-    async fn create_rule_rejects_non_builtin_profile_for_non_admin_owner() {
+    async fn create_rule_rejects_retired_custom_profile_for_user() {
         let (state, pool) = test_state().await;
         add_user(&pool, 2, "alice", false).await;
         add_group(&pool, 20, 1, "shared-in").await; // admin-owned inbound (v0.4.12 PR1)
@@ -1963,14 +1961,13 @@ mod tests {
             Json(rule_req_with_profile("r", 12000, 20, None, Some(50))),
         )
         .await;
-        // v0.4.11 PR1: allowed — regular users can bind admin-created ws/tls_simple templates
-        assert_eq!(resp.code, 0, "{}", resp.message);
+        assert_eq!(resp.code, 400, "{}", resp.message);
+        assert!(resp.message.contains("retired"));
     }
 
-    /// v0.4.11 PR1: admin creating rule for non-admin owner CAN bind custom profile.
-    /// The AvailableTemplates scope includes admin-created custom templates.
+    /// Builtin templates do not bypass the node's retired-transport restriction.
     #[tokio::test]
-    async fn create_rule_allows_builtin_profile_for_non_admin_owner() {
+    async fn create_rule_rejects_retired_builtin_profile_for_user() {
         let (state, pool) = test_state().await;
         add_user(&pool, 2, "alice", false).await;
         add_group(&pool, 20, 1, "shared-in").await; // admin-owned inbound (v0.4.12 PR1)
@@ -1982,12 +1979,13 @@ mod tests {
             Json(rule_req_with_profile("r", 12001, 20, None, Some(51))),
         )
         .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
+        assert_eq!(resp.code, 400, "{}", resp.message);
+        assert!(resp.message.contains("retired"));
     }
 
-    /// v0.4.11 PR1: admin can bind custom profile when creating rule for themselves.
+    /// Administrators cannot create a retired-transport rule either.
     #[tokio::test]
-    async fn create_rule_admin_can_bind_custom_profile() {
+    async fn create_rule_admin_cannot_bind_retired_custom_profile() {
         let (state, pool) = test_state().await;
         // user id=1 is the seeded admin
         add_group(&pool, 20, 1, "admin-in").await;
@@ -1999,26 +1997,27 @@ mod tests {
             Json(rule_req_with_profile("r", 12002, 20, None, Some(50))),
         )
         .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
+        assert_eq!(resp.code, 400, "{}", resp.message);
+        assert!(resp.message.contains("retired"));
     }
 
-    /// v0.4.11 PR1: admin can bind custom profile when creating rule for non-admin.
+    /// Acting on behalf of another owner does not bypass transport validation.
     #[tokio::test]
-    async fn create_rule_admin_rejects_custom_profile_for_non_admin_owner() {
+    async fn create_rule_admin_rejects_retired_profile_for_other_owner() {
         let (state, pool) = test_state().await;
         add_user(&pool, 2, "alice", false).await;
         add_group(&pool, 20, 1, "shared-in").await; // admin-owned inbound (v0.4.12 PR1)
         add_profile(&pool, 50, "custom", false, 1).await;
 
         // Admin creates a rule owned by alice, binds the custom profile.
-        // v0.4.11 PR1: allowed — AvailableTemplates includes admin-created custom templates.
         let Json(resp) = create_rule(
             auth(1, true),
             State(state.clone()),
             Json(rule_req_with_profile("r", 12003, 20, Some(2), Some(50))),
         )
         .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
+        assert_eq!(resp.code, 400, "{}", resp.message);
+        assert!(resp.message.contains("retired"));
     }
 
     /// C7: a regular user re-pointing their rule's device_group_in at ANOTHER
