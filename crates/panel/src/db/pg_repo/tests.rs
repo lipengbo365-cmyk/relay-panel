@@ -6339,6 +6339,80 @@ async fn pg_seed_stage4_create(db: &PgRepository, port_range: &str) -> (i64, i64
     (resource_id, node_id, checked_at)
 }
 
+async fn pg_add_stage4_node(
+    db: &PgRepository,
+    group_id: i64,
+    node_key: &str,
+    resource_id: i64,
+    checked_at: &str,
+    port_range: &str,
+) -> i64 {
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid,port_range)
+         VALUES($1,$2,'in',$3,1,$4)",
+    )
+    .bind(group_id)
+    .bind(format!("stage4-group-{group_id}"))
+    .bind(format!("stage4-token-{group_id}"))
+    .bind(port_range)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let node_id = db
+        .upsert_relay_node_seen(
+            group_id,
+            node_key,
+            &format!("{group_id:064}"),
+            "192.0.2.45",
+            checked_at,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE relay_nodes SET name=$1,country_code='US' WHERE id=$2")
+        .bind(format!("US-{group_id}"))
+        .bind(node_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let status = serde_json::json!({
+        "last_seen": checked_at,
+        "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+        "socks5_check_queue_depth": 0,
+        "cpu": 10.0,
+        "mem": 20.0,
+        "connections": 0
+    });
+    sqlx::query("INSERT INTO kvs(key,value) VALUES($1,$2)")
+        .bind(format!("node_status:{group_id}:{node_key}"))
+        .bind(status.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation)
+         VALUES($1,$2,1)",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_resource_health
+         (resource_id,relay_node_id,status,total_latency_ms,exit_ip,country,checked_at,
+          resource_revision,generation)
+         VALUES($1,$2,'ONLINE',120,'198.51.100.8','US',$3,1,1)",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .bind(checked_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    node_id
+}
+
 fn pg_stage4_input(
     sequence: usize,
     resource_id: i64,
@@ -6432,6 +6506,374 @@ async fn pg_stage4_one_hundred_idempotent_requests_create_one_rule() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_cross_group_quota_is_user_serialized() {
+    let Some(db) = repo("stage4_cross_group_quota").await else {
+        return;
+    };
+    let (resource_id, node_a, checked_at) = pg_seed_stage4_create(&db, "22000-22099").await;
+    let node_b = pg_add_stage4_node(
+        &db,
+        941,
+        "stage4-node-b",
+        resource_id,
+        &checked_at,
+        "22000-22099",
+    )
+    .await;
+    sqlx::query("UPDATE users SET max_rules=1 WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let left = PgRepository::new(db.pool.clone());
+    let right = PgRepository::new(db.pool.clone());
+    let input_a = pg_stage4_input(21, resource_id, node_a, &checked_at);
+    let input_b = pg_stage4_input(22, resource_id, node_b, &checked_at);
+    let (outcome_a, outcome_b) = tokio::join!(
+        left.create_smart_relay(&input_a),
+        right.create_smart_relay(&input_b)
+    );
+    let outcomes = [outcome_a.unwrap(), outcome_b.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::QuotaExceeded))
+            .count(),
+        1
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_n_plus_one_across_groups_never_exceeds_quota() {
+    let Some(db) = repo("stage4_n_plus_one_quota").await else {
+        return;
+    };
+    let (resource_id, node_a, checked_at) = pg_seed_stage4_create(&db, "23000-23100").await;
+    let node_b = pg_add_stage4_node(
+        &db,
+        941,
+        "stage4-node-b",
+        resource_id,
+        &checked_at,
+        "23000-23100",
+    )
+    .await;
+    sqlx::query("UPDATE users SET max_rules=8 WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let attempts = (0..9).map(|sequence| {
+        let worker = PgRepository::new(db.pool.clone());
+        let node_id = if sequence % 2 == 0 { node_a } else { node_b };
+        let input = pg_stage4_input(100 + sequence, resource_id, node_id, &checked_at);
+        async move { worker.create_smart_relay(&input).await.unwrap() }
+    });
+    let outcomes = futures_util::future::join_all(attempts).await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_)))
+            .count(),
+        8
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::QuotaExceeded))
+            .count(),
+        1
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 8);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_smart_and_normal_socks5_share_quota_lock_order() {
+    let Some(db) = repo("stage4_mixed_create_quota").await else {
+        return;
+    };
+    let (resource_id, _node_a, checked_at) = pg_seed_stage4_create(&db, "24000-24099").await;
+    let node_b = pg_add_stage4_node(
+        &db,
+        941,
+        "stage4-node-b",
+        resource_id,
+        &checked_at,
+        "24000-24099",
+    )
+    .await;
+    sqlx::query("UPDATE users SET max_rules=1 WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let smart_repo = PgRepository::new(db.pool.clone());
+    let normal_repo = PgRepository::new(db.pool.clone());
+    let smart = pg_stage4_input(301, resource_id, node_b, &checked_at);
+    let (smart_outcome, normal_outcome) = tokio::join!(
+        smart_repo.create_smart_relay(&smart),
+        normal_repo.create_socks5_rule_full(
+            "normal",
+            1,
+            24001,
+            940,
+            resource_id,
+            true,
+            None,
+            None,
+            None,
+            1,
+            true,
+            true,
+        )
+    );
+    let smart_created = matches!(smart_outcome.unwrap(), SmartRelayCreateOutcome::Created(_));
+    let normal_created = normal_outcome.unwrap().is_some();
+    assert_ne!(smart_created, normal_created);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_multi_user_multi_group_stress_has_no_deadlock_or_quota_escape() {
+    let Some(db) = repo("stage4_multi_user_stress").await else {
+        return;
+    };
+    let (resource_id, node_a, checked_at) = pg_seed_stage4_create(&db, "25000-25199").await;
+    let node_b = pg_add_stage4_node(
+        &db,
+        941,
+        "stage4-node-b",
+        resource_id,
+        &checked_at,
+        "25000-25199",
+    )
+    .await;
+    for user_id in 10_i64..20_i64 {
+        sqlx::query("INSERT INTO users(id,username,password,max_rules) VALUES($1,$2,'x',5)")
+            .bind(user_id)
+            .bind(format!("stage4-user-{user_id}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let attempts = (0..100).map(|sequence| {
+        let worker = PgRepository::new(db.pool.clone());
+        let actor_id = 10 + (sequence / 10) as i64;
+        let node_id = if sequence % 2 == 0 { node_a } else { node_b };
+        let mut input = pg_stage4_input(1000 + sequence, resource_id, node_id, &checked_at);
+        input.actor_id = actor_id;
+        input.name = format!("stress-{actor_id}-{sequence}");
+        async move { worker.create_smart_relay(&input).await.unwrap() }
+    });
+    let outcomes = futures_util::future::join_all(attempts).await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_)))
+            .count(),
+        50
+    );
+    for user_id in 10_i64..20_i64 {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=$1")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 5, "user {user_id} exceeded or lost quota slots");
+    }
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_deleted_rule_recreates_only_for_the_original_fingerprint() {
+    let Some(db) = repo("stage4_deleted_recreate").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "26000-26009").await;
+    let input = pg_stage4_input(401, resource_id, node_id, &checked_at);
+    let first_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("unexpected first outcome: {other:?}"),
+    };
+    db.delete_rule(first_rule, &ResourceScope::All)
+        .await
+        .unwrap();
+    assert!(db
+        .find_smart_relay_receipt(1, &input.idempotency_key)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.find_smart_relay_idempotency_fingerprint(1, &input.idempotency_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(input.request_fingerprint.as_str())
+    );
+    let replacement_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("unexpected replacement outcome: {other:?}"),
+    };
+    assert_ne!(first_rule, replacement_rule);
+    db.delete_rule(replacement_rule, &ResourceScope::All)
+        .await
+        .unwrap();
+    let mut changed = input.clone();
+    changed.request_fingerprint = "changed-after-delete".into();
+    assert!(matches!(
+        db.create_smart_relay(&changed).await.unwrap(),
+        SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_delete_in_progress_cannot_produce_a_stale_replay() {
+    let Some(db) = repo("stage4_delete_replay_race").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "26500-26509").await;
+    let input = pg_stage4_input(451, resource_id, node_id, &checked_at);
+    let rule_id = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("unexpected create outcome: {other:?}"),
+    };
+    let mut delete_tx = db.pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM forward_rules WHERE id=$1")
+        .bind(rule_id)
+        .execute(&mut *delete_tx)
+        .await
+        .unwrap();
+    let worker = PgRepository::new(db.pool.clone());
+    let create = tokio::spawn(async move { worker.create_smart_relay(&input).await.unwrap() });
+    tokio::task::yield_now().await;
+    delete_tx.commit().await.unwrap();
+    assert!(matches!(
+        create.await.unwrap(),
+        SmartRelayCreateOutcome::Created(_)
+    ));
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_migration_34_cleans_orphans_preserves_fingerprints_and_adds_cascade() {
+    let Some(db) = repo("migration_34_receipts").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "27000-27009").await;
+    let input = pg_stage4_input(501, resource_id, node_id, &checked_at);
+    let live_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("unexpected create outcome: {other:?}"),
+    };
+    let fresh_fk_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_constraint
+         WHERE conname='relay_creation_receipts_rule_fk'
+           AND conrelid='relay_creation_receipts'::regclass
+           AND confdeltype='c'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        fresh_fk_count, 1,
+        "fresh PostgreSQL schema must carry the cascade FK"
+    );
+    sqlx::query(
+        "ALTER TABLE relay_creation_receipts
+         DROP CONSTRAINT relay_creation_receipts_rule_fk",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TABLE relay_creation_idempotency_keys")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version=34")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_receipts
+         (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+          endpoint_host,listen_port,relay_username,exit_ip,selection_mode)
+         VALUES(1,'orphan-key','orphan-fingerprint',999999,$1,$2,
+                'node.example',27001,'relay','192.0.2.1','RECOMMENDED')",
+    )
+    .bind(node_id)
+    .bind(resource_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    run_pg_migrations(&db.pool).await.unwrap();
+    let orphan_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM relay_creation_receipts r
+         WHERE NOT EXISTS(SELECT 1 FROM forward_rules f WHERE f.id=r.rule_id)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_count, 0);
+    let ledger_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_idempotency_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger_count, 2);
+    let fk_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_constraint
+         WHERE conname='relay_creation_receipts_rule_fk'
+           AND conrelid='relay_creation_receipts'::regclass
+           AND confdeltype='c'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(fk_count, 1);
+    sqlx::query("DELETE FROM forward_rules WHERE id=$1")
+        .bind(live_rule)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let live_receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts WHERE idempotency_key=$1")
+            .bind(&input.idempotency_key)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(live_receipts, 0);
+    run_pg_migrations(&db.pool).await.unwrap();
     cleanup(&db).await;
 }
 

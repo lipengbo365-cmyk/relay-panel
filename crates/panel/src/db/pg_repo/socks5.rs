@@ -429,14 +429,7 @@ impl Socks5Repository for PgRepository {
         enabled: bool,
     ) -> Result<Option<i64>, DbError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(device_group_in)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("SELECT 1 FROM users WHERE id=$1 FOR UPDATE")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
+        super::lock_rule_creation_scope(&mut tx, &[device_group_in], uid).await?;
         let resource_ok: Option<i32> =
             sqlx::query_scalar("SELECT 1 FROM socks5_resources WHERE id=$1 AND enabled=TRUE")
                 .bind(socks5_resource_id)
@@ -475,7 +468,12 @@ impl Socks5Repository for PgRepository {
     ) -> Result<SmartRelayCreateOutcome, DbError> {
         let mut tx = self.pool.begin().await?;
         let idempotency_lock = format!("{}:{}", input.actor_id, input.idempotency_key);
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)")
+        // Two-int advisory keys use a separate namespace from the one-bigint
+        // node-group locks. Keeping lock classes disjoint prevents a crafted
+        // idempotency hash from becoming an accidental group lock and creating
+        // an AB/BA cycle between two smart-relay transactions.
+        sqlx::query("SELECT pg_advisory_xact_lock($1,hashtext($2))")
+            .bind(0x534B_4934_i32)
             .bind(&idempotency_lock)
             .execute(&mut *tx)
             .await?;
@@ -488,30 +486,70 @@ impl Socks5Repository for PgRepository {
         )
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "DELETE FROM relay_creation_idempotency_keys WHERE (actor_id,idempotency_key) IN (
+                SELECT actor_id,idempotency_key FROM relay_creation_idempotency_keys
+                WHERE created_at < to_char(now() AT TIME ZONE 'UTC' - interval '7 days','YYYY-MM-DD HH24:MI:SS')
+                ORDER BY created_at LIMIT 10000
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        let receipt_fingerprint: Option<String> = sqlx::query_scalar(
+            "SELECT request_fingerprint FROM relay_creation_receipts
+             WHERE actor_id=$1 AND idempotency_key=$2",
+        )
+        .bind(input.actor_id)
+        .bind(&input.idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if receipt_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| fingerprint != input.request_fingerprint)
+        {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED"));
+        }
         let replay: Option<SmartRelayCreatedRecord> = sqlx::query_as(
-            "SELECT rule_id,relay_node_id,resource_id,endpoint_host,listen_port,
-                    relay_username,exit_ip,exit_country,selection_mode
-             FROM relay_creation_receipts WHERE actor_id=$1 AND idempotency_key=$2",
+            "SELECT r.rule_id,r.relay_node_id,r.resource_id,r.endpoint_host,r.listen_port,
+                    r.relay_username,r.exit_ip,r.exit_country,r.selection_mode
+             FROM relay_creation_receipts r
+             INNER JOIN forward_rules f ON f.id=r.rule_id
+             WHERE r.actor_id=$1 AND r.idempotency_key=$2
+             FOR KEY SHARE OF f",
         )
         .bind(input.actor_id)
         .bind(&input.idempotency_key)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(replay) = replay {
-            let fingerprint: String = sqlx::query_scalar(
-                "SELECT request_fingerprint FROM relay_creation_receipts
-                 WHERE actor_id=$1 AND idempotency_key=$2",
-            )
-            .bind(input.actor_id)
-            .bind(&input.idempotency_key)
-            .fetch_one(&mut *tx)
-            .await?;
-            if fingerprint != input.request_fingerprint {
-                tx.rollback().await?;
-                return Ok(SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED"));
-            }
             tx.commit().await?;
             return Ok(SmartRelayCreateOutcome::Replay(replay));
+        }
+        // A legacy orphan can exist only before migration 34 or after external
+        // FK enforcement was disabled. It is never a valid replay target.
+        sqlx::query(
+            "DELETE FROM relay_creation_receipts
+             WHERE actor_id=$1 AND idempotency_key=$2",
+        )
+        .bind(input.actor_id)
+        .bind(&input.idempotency_key)
+        .execute(&mut *tx)
+        .await?;
+        let key_fingerprint: Option<String> = sqlx::query_scalar(
+            "SELECT request_fingerprint FROM relay_creation_idempotency_keys
+             WHERE actor_id=$1 AND idempotency_key=$2",
+        )
+        .bind(input.actor_id)
+        .bind(&input.idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if key_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| fingerprint != input.request_fingerprint)
+        {
+            tx.rollback().await?;
+            return Ok(SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED"));
         }
 
         let resource: Option<(bool, i64)> = sqlx::query_as(
@@ -565,6 +603,12 @@ impl Socks5Repository for PgRepository {
                 "NODE_ACCESS_HOST_MISSING",
             ));
         }
+
+        // Canonical rule-create lock order is group advisory lock, then user
+        // row lock. The group lock protects the listen-port namespace; the
+        // user lock serializes max_rules checks across different groups.
+        super::lock_rule_creation_scope(&mut tx, &[group_id], input.actor_id).await?;
+
         let status_key = format!("node_status:{group_id}:{node_key}");
         let status: Option<String> =
             sqlx::query_scalar("SELECT value FROM kvs WHERE key=$1 FOR SHARE")
@@ -656,10 +700,6 @@ impl Socks5Repository for PgRepository {
             return Ok(SmartRelayCreateOutcome::Rejected("EXIT_IP_MISMATCH"));
         };
 
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(group_id)
-            .execute(&mut *tx)
-            .await?;
         let (low, high) = crate::service::rules::resolve_auto_port_range(&port_range);
         let used_ports: Vec<i32> = sqlx::query_scalar(
             "SELECT listen_port FROM forward_rules
@@ -729,6 +769,19 @@ impl Socks5Repository for PgRepository {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
+            "INSERT INTO relay_creation_idempotency_keys
+             (actor_id,idempotency_key,request_fingerprint,created_at)
+             VALUES($1,$2,$3,to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'))
+             ON CONFLICT(actor_id,idempotency_key) DO UPDATE
+             SET created_at=EXCLUDED.created_at
+             WHERE relay_creation_idempotency_keys.request_fingerprint=EXCLUDED.request_fingerprint",
+        )
+        .bind(input.actor_id)
+        .bind(&input.idempotency_key)
+        .bind(&input.request_fingerprint)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "INSERT INTO relay_creation_receipts
              (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
               endpoint_host,listen_port,relay_username,exit_ip,exit_country,selection_mode)
@@ -766,10 +819,31 @@ impl Socks5Repository for PgRepository {
         actor_id: i64,
         idempotency_key: &str,
     ) -> Result<Option<SmartRelayReceiptRecord>, DbError> {
-        Ok(sqlx::query_as(
-            "SELECT request_fingerprint,rule_id,relay_node_id,resource_id,endpoint_host,
-                    listen_port,relay_username,exit_ip,exit_country,selection_mode
-             FROM relay_creation_receipts
+        let mut tx = self.pool.begin().await?;
+        let receipt = sqlx::query_as(
+            "SELECT r.request_fingerprint,r.rule_id,r.relay_node_id,r.resource_id,r.endpoint_host,
+                    r.listen_port,r.relay_username,r.exit_ip,r.exit_country,r.selection_mode
+             FROM relay_creation_receipts r
+             INNER JOIN forward_rules f ON f.id=r.rule_id
+             WHERE r.actor_id=$1 AND r.idempotency_key=$2
+               AND r.created_at >= to_char(now() AT TIME ZONE 'UTC' - interval '7 days',
+                                           'YYYY-MM-DD HH24:MI:SS')
+             FOR KEY SHARE OF f",
+        )
+        .bind(actor_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(receipt)
+    }
+    async fn find_smart_relay_idempotency_fingerprint(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT request_fingerprint FROM relay_creation_idempotency_keys
              WHERE actor_id=$1 AND idempotency_key=$2
                AND created_at >= to_char(now() AT TIME ZONE 'UTC' - interval '7 days',
                                          'YYYY-MM-DD HH24:MI:SS')",

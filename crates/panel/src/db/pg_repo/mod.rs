@@ -24,7 +24,7 @@
 // traffic counter is monotonic-additive so the worst case is a momentarily
 // stale read, never a lost write (the UPDATE itself is atomic).
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 mod announcements;
 mod groups;
@@ -50,6 +50,31 @@ impl PgRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
+
+/// Serialize every quota-aware rule create with one canonical lock order.
+/// Group locks protect listen-port namespaces; the user row lock protects the
+/// cross-group `actual_rules <= max_rules` invariant. Sorting makes the helper
+/// safe for a future create operation spanning more than one inbound group.
+async fn lock_rule_creation_scope(
+    tx: &mut Transaction<'_, Postgres>,
+    group_ids: &[i64],
+    uid: i64,
+) -> Result<(), sqlx::Error> {
+    let mut ordered_groups = group_ids.to_vec();
+    ordered_groups.sort_unstable();
+    ordered_groups.dedup();
+    for group_id in ordered_groups {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(group_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query("SELECT 1 FROM users WHERE id=$1 FOR UPDATE")
+        .bind(uid)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 // Helper: build a PG placeholder list `$1, $2, ..., $n` for n binds. Used by

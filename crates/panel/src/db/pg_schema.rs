@@ -277,7 +277,8 @@ CREATE TABLE IF NOT EXISTS relay_creation_receipts (
     actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     idempotency_key TEXT NOT NULL,
     request_fingerprint TEXT NOT NULL,
-    rule_id BIGINT NOT NULL,
+    rule_id BIGINT NOT NULL CONSTRAINT relay_creation_receipts_rule_fk
+        REFERENCES forward_rules(id) ON DELETE CASCADE,
     relay_node_id BIGINT NOT NULL,
     resource_id BIGINT NOT NULL,
     endpoint_host TEXT NOT NULL,
@@ -291,6 +292,16 @@ CREATE TABLE IF NOT EXISTS relay_creation_receipts (
 );
 CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created
     ON relay_creation_receipts(created_at);
+
+CREATE TABLE IF NOT EXISTS relay_creation_idempotency_keys (
+    actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    PRIMARY KEY(actor_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_creation_idempotency_keys_created
+    ON relay_creation_idempotency_keys(created_at);
 
 CREATE TABLE IF NOT EXISTS statistics (
     id BIGSERIAL PRIMARY KEY,
@@ -520,7 +531,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 33;
+pub const PG_SCHEMA_VERSION: i32 = 34;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1871,6 +1882,64 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .await?;
         tx.commit().await?;
         tracing::info!("PG migration 33: Stage 4 smart relay binding present");
+    }
+
+    if current < 34 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_creation_idempotency_keys (
+                actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')),
+                PRIMARY KEY(actor_id,idempotency_key)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_relay_creation_idempotency_keys_created
+             ON relay_creation_idempotency_keys(created_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO relay_creation_idempotency_keys
+             (actor_id,idempotency_key,request_fingerprint,created_at)
+             SELECT actor_id,idempotency_key,request_fingerprint,created_at
+             FROM relay_creation_receipts
+             ON CONFLICT(actor_id,idempotency_key) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM relay_creation_receipts r
+             WHERE NOT EXISTS (SELECT 1 FROM forward_rules f WHERE f.id=r.rule_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname='relay_creation_receipts_rule_fk'
+                      AND conrelid='relay_creation_receipts'::regclass
+                ) THEN
+                    ALTER TABLE relay_creation_receipts
+                    ADD CONSTRAINT relay_creation_receipts_rule_fk
+                    FOREIGN KEY(rule_id) REFERENCES forward_rules(id) ON DELETE CASCADE;
+                END IF;
+             END $$",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(34) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 34: smart relay receipt lifecycle integrity present");
     }
 
     Ok(())

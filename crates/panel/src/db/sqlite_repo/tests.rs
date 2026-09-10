@@ -6899,6 +6899,53 @@ async fn stage4_sqlite_idempotency_and_toctou_revalidation_fail_closed() {
 }
 
 #[tokio::test]
+async fn stage4_sqlite_deleted_rule_reuses_only_the_same_idempotent_intent() {
+    let db = repo().await;
+    let (resource_id, node_id, checked_at) = seed_stage4_create(&db, "21100-21109").await;
+    let input = stage4_input(11, resource_id, node_id, &checked_at);
+    let first_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("expected initial create, got {other:?}"),
+    };
+    db.delete_rule(first_rule, &ResourceScope::All)
+        .await
+        .unwrap();
+    assert!(db
+        .find_smart_relay_receipt(input.actor_id, &input.idempotency_key)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.find_smart_relay_idempotency_fingerprint(input.actor_id, &input.idempotency_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(input.request_fingerprint.as_str())
+    );
+
+    let replacement_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("expected replacement create, got {other:?}"),
+    };
+    assert_ne!(replacement_rule, first_rule);
+    db.delete_rule(replacement_rule, &ResourceScope::All)
+        .await
+        .unwrap();
+    let mut different_intent = input.clone();
+    different_intent.request_fingerprint = "different-after-delete".into();
+    assert!(matches!(
+        db.create_smart_relay(&different_intent).await.unwrap(),
+        SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+    ));
+    let final_rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE name=?")
+        .bind(&input.name)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(final_rules, 0);
+}
+
+#[tokio::test]
 async fn stage4_sqlite_one_hundred_idempotent_requests_create_one_rule() {
     let db = repo().await;
     let (resource_id, node_id, checked_at) = seed_stage4_create(&db, "22000-22009").await;

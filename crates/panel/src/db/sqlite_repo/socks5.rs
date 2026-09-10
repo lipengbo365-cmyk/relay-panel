@@ -618,28 +618,63 @@ impl Socks5Repository for SqliteRepository {
             )
             .execute(&mut *conn)
             .await?;
+            sqlx::query(
+                "DELETE FROM relay_creation_idempotency_keys WHERE rowid IN (
+                    SELECT rowid FROM relay_creation_idempotency_keys
+                    WHERE created_at < datetime('now','-7 days') ORDER BY created_at LIMIT 10000
+                 )",
+            )
+            .execute(&mut *conn)
+            .await?;
+            let receipt_fingerprint: Option<String> = sqlx::query_scalar(
+                "SELECT request_fingerprint FROM relay_creation_receipts
+                 WHERE actor_id=? AND idempotency_key=?",
+            )
+            .bind(input.actor_id)
+            .bind(&input.idempotency_key)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if receipt_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint != input.request_fingerprint)
+            {
+                return Ok::<_, sqlx::Error>(Err("IDEMPOTENCY_KEY_REUSED"));
+            }
             let replay: Option<SmartRelayCreatedRecord> = sqlx::query_as(
-                "SELECT rule_id,relay_node_id,resource_id,endpoint_host,listen_port,
-                        relay_username,exit_ip,exit_country,selection_mode
-                 FROM relay_creation_receipts WHERE actor_id=? AND idempotency_key=?",
+                "SELECT r.rule_id,r.relay_node_id,r.resource_id,r.endpoint_host,r.listen_port,
+                        r.relay_username,r.exit_ip,r.exit_country,r.selection_mode
+                 FROM relay_creation_receipts r
+                 INNER JOIN forward_rules f ON f.id=r.rule_id
+                 WHERE r.actor_id=? AND r.idempotency_key=?",
             )
             .bind(input.actor_id)
             .bind(&input.idempotency_key)
             .fetch_optional(&mut *conn)
             .await?;
             if let Some(replay) = replay {
-                let fingerprint: String = sqlx::query_scalar(
-                    "SELECT request_fingerprint FROM relay_creation_receipts
-                     WHERE actor_id=? AND idempotency_key=?",
-                )
-                .bind(input.actor_id)
-                .bind(&input.idempotency_key)
-                .fetch_one(&mut *conn)
-                .await?;
-                if fingerprint != input.request_fingerprint {
-                    return Ok::<_, sqlx::Error>(Err("IDEMPOTENCY_KEY_REUSED"));
-                }
                 return Ok(Ok(SmartRelayCreateOutcome::Replay(replay)));
+            }
+            sqlx::query(
+                "DELETE FROM relay_creation_receipts
+                 WHERE actor_id=? AND idempotency_key=?",
+            )
+            .bind(input.actor_id)
+            .bind(&input.idempotency_key)
+            .execute(&mut *conn)
+            .await?;
+            let key_fingerprint: Option<String> = sqlx::query_scalar(
+                "SELECT request_fingerprint FROM relay_creation_idempotency_keys
+                 WHERE actor_id=? AND idempotency_key=?",
+            )
+            .bind(input.actor_id)
+            .bind(&input.idempotency_key)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if key_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint != input.request_fingerprint)
+            {
+                return Ok::<_, sqlx::Error>(Err("IDEMPOTENCY_KEY_REUSED"));
             }
 
             let resource: Option<(bool, i64)> = sqlx::query_as(
@@ -818,6 +853,19 @@ impl Socks5Repository for SqliteRepository {
             .execute(&mut *conn)
             .await?;
             sqlx::query(
+                "INSERT INTO relay_creation_idempotency_keys
+                 (actor_id,idempotency_key,request_fingerprint,created_at)
+                 VALUES(?,?,?,datetime('now'))
+                 ON CONFLICT(actor_id,idempotency_key) DO UPDATE
+                 SET created_at=excluded.created_at
+                 WHERE relay_creation_idempotency_keys.request_fingerprint=excluded.request_fingerprint",
+            )
+            .bind(input.actor_id)
+            .bind(&input.idempotency_key)
+            .bind(&input.request_fingerprint)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
                 "INSERT INTO relay_creation_receipts
                  (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
                   endpoint_host,listen_port,relay_username,exit_ip,exit_country,selection_mode)
@@ -869,10 +917,41 @@ impl Socks5Repository for SqliteRepository {
         actor_id: i64,
         idempotency_key: &str,
     ) -> Result<Option<SmartRelayReceiptRecord>, DbError> {
-        Ok(sqlx::query_as(
-            "SELECT request_fingerprint,rule_id,relay_node_id,resource_id,endpoint_host,
-                    listen_port,relay_username,exit_ip,exit_country,selection_mode
-             FROM relay_creation_receipts
+        let mut conn = self.pool.acquire().await?;
+        // Hold a read transaction through the JOIN so a concurrent rule delete
+        // either linearizes before this lookup (no replay) or after it. SQLite's
+        // writer commit cannot pass the read lock in between.
+        sqlx::query("BEGIN").execute(&mut *conn).await?;
+        let receipt = sqlx::query_as(
+            "SELECT r.request_fingerprint,r.rule_id,r.relay_node_id,r.resource_id,r.endpoint_host,
+                    r.listen_port,r.relay_username,r.exit_ip,r.exit_country,r.selection_mode
+             FROM relay_creation_receipts r
+             INNER JOIN forward_rules f ON f.id=r.rule_id
+             WHERE r.actor_id=? AND r.idempotency_key=?
+               AND r.created_at >= datetime('now','-7 days')",
+        )
+        .bind(actor_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *conn)
+        .await;
+        match receipt {
+            Ok(receipt) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(receipt)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error.into())
+            }
+        }
+    }
+    async fn find_smart_relay_idempotency_fingerprint(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT request_fingerprint FROM relay_creation_idempotency_keys
              WHERE actor_id=? AND idempotency_key=?
                AND created_at >= datetime('now','-7 days')",
         )

@@ -214,7 +214,20 @@ pub async fn create(
             )));
         }
         Ok(Some(_)) => return Json(error(409, "IDEMPOTENCY_KEY_REUSED")),
-        Ok(None) => {}
+        Ok(None) => match state
+            .db
+            .find_smart_relay_idempotency_fingerprint(admin.user_id, &request.idempotency_key)
+            .await
+        {
+            Ok(Some(fingerprint)) if fingerprint != request_fingerprint => {
+                return Json(error(409, "IDEMPOTENCY_KEY_REUSED"));
+            }
+            Ok(_) => {}
+            Err(db_error) => {
+                tracing::error!("smart relay idempotency fingerprint lookup: {db_error}");
+                return Json(error(500, "DATABASE_ERROR"));
+            }
+        },
         Err(db_error) => {
             tracing::error!("smart relay idempotency lookup: {db_error}");
             return Json(error(500, "DATABASE_ERROR"));

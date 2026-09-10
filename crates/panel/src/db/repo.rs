@@ -817,6 +817,11 @@ pub trait Socks5Repository: Send + Sync {
         actor_id: i64,
         idempotency_key: &str,
     ) -> Result<Option<SmartRelayReceiptRecord>, DbError>;
+    async fn find_smart_relay_idempotency_fingerprint(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, DbError>;
 
     /// Atomically create the forward_rules row and its SOCKS5 extension.
     #[allow(clippy::too_many_arguments)]

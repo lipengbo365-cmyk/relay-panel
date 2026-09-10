@@ -357,7 +357,7 @@ CREATE TABLE IF NOT EXISTS relay_creation_receipts (
     actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     idempotency_key TEXT NOT NULL,
     request_fingerprint TEXT NOT NULL,
-    rule_id INTEGER NOT NULL,
+    rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
     relay_node_id INTEGER NOT NULL,
     resource_id INTEGER NOT NULL,
     endpoint_host TEXT NOT NULL,
@@ -371,6 +371,20 @@ CREATE TABLE IF NOT EXISTS relay_creation_receipts (
 );
 CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created
     ON relay_creation_receipts(created_at);
+
+-- Keeps the request fingerprint for the seven-day idempotency window even
+-- when deleting a rule cascades its live replay receipt. This lets an
+-- identical request create a replacement while a different request using the
+-- same key remains a conflict.
+CREATE TABLE IF NOT EXISTS relay_creation_idempotency_keys (
+    actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY(actor_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_creation_idempotency_keys_created
+    ON relay_creation_idempotency_keys(created_at);
 
 CREATE TABLE IF NOT EXISTS statistics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2261,6 +2275,139 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 49: Stage 4 smart relay binding present");
 
+    // ── Migration 50: smart-relay receipt lifecycle integrity ──
+    migrate_sqlite_relay_receipt_integrity(pool).await?;
+
+    Ok(())
+}
+
+async fn migrate_sqlite_relay_receipt_integrity(
+    pool: &sqlx::SqlitePool,
+) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let migration = async {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_creation_idempotency_keys (
+                actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY(actor_id,idempotency_key)
+            )",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_relay_creation_idempotency_keys_created
+             ON relay_creation_idempotency_keys(created_at)",
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        // Preserve the fingerprint before removing legacy orphan receipts.
+        sqlx::query(
+            "INSERT OR IGNORE INTO relay_creation_idempotency_keys
+             (actor_id,idempotency_key,request_fingerprint,created_at)
+             SELECT actor_id,idempotency_key,request_fingerprint,created_at
+             FROM relay_creation_receipts",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "DELETE FROM relay_creation_receipts
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM forward_rules
+                 WHERE forward_rules.id=relay_creation_receipts.rule_id
+             )",
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        let has_rule_fk: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('relay_creation_receipts')
+             WHERE \"table\"='forward_rules' AND \"from\"='rule_id' AND on_delete='CASCADE'",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        if has_rule_fk == 0 {
+            sqlx::query(
+                "CREATE TABLE relay_creation_receipts_v50 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+                    relay_node_id INTEGER NOT NULL,
+                    resource_id INTEGER NOT NULL,
+                    endpoint_host TEXT NOT NULL,
+                    listen_port INTEGER NOT NULL,
+                    relay_username TEXT NOT NULL,
+                    exit_ip TEXT NOT NULL,
+                    exit_country TEXT,
+                    selection_mode TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(actor_id,idempotency_key)
+                )",
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                "INSERT INTO relay_creation_receipts_v50
+                 (id,actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,
+                  resource_id,endpoint_host,listen_port,relay_username,exit_ip,exit_country,
+                  selection_mode,created_at)
+                 SELECT id,actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,
+                        resource_id,endpoint_host,listen_port,relay_username,exit_ip,exit_country,
+                        selection_mode,created_at
+                 FROM relay_creation_receipts",
+            )
+            .execute(&mut *conn)
+            .await?;
+            let old_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts")
+                .fetch_one(&mut *conn)
+                .await?;
+            let new_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts_v50")
+                    .fetch_one(&mut *conn)
+                    .await?;
+            if old_count != new_count {
+                return Err(sqlx::Error::Protocol(
+                    "relay receipt migration row-count mismatch".into(),
+                ));
+            }
+            sqlx::query("DROP TABLE relay_creation_receipts")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query(
+                "ALTER TABLE relay_creation_receipts_v50 RENAME TO relay_creation_receipts",
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                "CREATE INDEX idx_relay_creation_receipts_created
+                 ON relay_creation_receipts(created_at)",
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    migration?;
+    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&mut *conn)
+        .await?;
+    if violations != 0 {
+        return Err(sqlx::Error::Protocol(
+            "relay receipt migration left foreign-key violations".into(),
+        ));
+    }
+    tracing::info!("Migration 50: smart relay receipt lifecycle integrity present");
     Ok(())
 }
 
@@ -2460,6 +2607,143 @@ mod tests {
             .expect("schema");
         run_migrations(&pool).await.expect("migrations on fresh db");
         pool
+    }
+
+    #[tokio::test]
+    async fn migration_50_removes_orphans_adds_rule_fk_and_is_idempotent() {
+        let pool = fresh_pool().await;
+        let fresh_rule_fk: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('relay_creation_receipts')
+             WHERE \"table\"='forward_rules' AND \"from\"='rule_id' AND on_delete='CASCADE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            fresh_rule_fk, 1,
+            "fresh SQLite schema must carry the cascade FK"
+        );
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE relay_creation_receipts")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE relay_creation_idempotency_keys")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE relay_creation_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                rule_id INTEGER NOT NULL,
+                relay_node_id INTEGER NOT NULL,
+                resource_id INTEGER NOT NULL,
+                endpoint_host TEXT NOT NULL,
+                listen_port INTEGER NOT NULL,
+                relay_username TEXT NOT NULL,
+                exit_ip TEXT NOT NULL,
+                exit_country TEXT,
+                selection_mode TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(actor_id,idempotency_key)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users(id,username,password,max_rules,admin)
+             VALUES(1,'migration-50','x',0,1)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups(id,name,group_type,token,uid)
+             VALUES(1,'migration-50','in','migration-50',1)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules(id,name,uid,listen_port,device_group_in,target_addr,target_port)
+             VALUES(1,'live',1,10001,1,'127.0.0.1',80)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (key, fingerprint, rule_id) in [
+            ("live-key", "live-fingerprint", 1_i64),
+            ("orphan-key", "orphan-fingerprint", 999_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO relay_creation_receipts
+                 (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+                  endpoint_host,listen_port,relay_username,exit_ip,selection_mode)
+                 VALUES(1,?,?,?,1,1,'node.example',10001,'relay','192.0.2.1','RECOMMENDED')",
+            )
+            .bind(key)
+            .bind(fingerprint)
+            .bind(rule_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_migrations(&pool).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let orphan_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM relay_creation_receipts r
+             WHERE NOT EXISTS(SELECT 1 FROM forward_rules f WHERE f.id=r.rule_id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphan_count, 0);
+        let ledger_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_idempotency_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            ledger_count, 2,
+            "both historical fingerprints survive migration"
+        );
+        let rule_fk: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('relay_creation_receipts')
+             WHERE \"table\"='forward_rules' AND \"from\"='rule_id' AND on_delete='CASCADE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rule_fk, 1);
+        sqlx::query("DELETE FROM forward_rules WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0);
+        run_migrations(&pool).await.unwrap();
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 
     /// Assert a column exists on a table (via pragma_table_info).
