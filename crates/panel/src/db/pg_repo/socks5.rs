@@ -477,30 +477,59 @@ impl Socks5Repository for PgRepository {
             .bind(&idempotency_lock)
             .execute(&mut *tx)
             .await?;
+        let idempotency_cutoff: String = sqlx::query_scalar(
+            "SELECT to_char(now() AT TIME ZONE 'UTC' - interval '7 days',
+                            'YYYY-MM-DD HH24:MI:SS')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query(
             "DELETE FROM relay_creation_receipts WHERE id IN (
                 SELECT id FROM relay_creation_receipts
-                WHERE created_at < to_char(now() AT TIME ZONE 'UTC' - interval '7 days','YYYY-MM-DD HH24:MI:SS')
+                WHERE created_at < $1
                 ORDER BY id LIMIT 10000
              )",
         )
+        .bind(&idempotency_cutoff)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
             "DELETE FROM relay_creation_idempotency_keys WHERE (actor_id,idempotency_key) IN (
                 SELECT actor_id,idempotency_key FROM relay_creation_idempotency_keys
-                WHERE created_at < to_char(now() AT TIME ZONE 'UTC' - interval '7 days','YYYY-MM-DD HH24:MI:SS')
+                WHERE created_at < $1
                 ORDER BY created_at LIMIT 10000
              )",
         )
+        .bind(&idempotency_cutoff)
+        .execute(&mut *tx)
+        .await?;
+        // Global pruning is storage maintenance only. Expire the current key
+        // independently so bounded cleanup can never decide idempotency.
+        sqlx::query(
+            "DELETE FROM relay_creation_receipts
+             WHERE actor_id=$1 AND idempotency_key=$2 AND created_at < $3",
+        )
+        .bind(input.actor_id)
+        .bind(&input.idempotency_key)
+        .bind(&idempotency_cutoff)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM relay_creation_idempotency_keys
+             WHERE actor_id=$1 AND idempotency_key=$2 AND created_at < $3",
+        )
+        .bind(input.actor_id)
+        .bind(&input.idempotency_key)
+        .bind(&idempotency_cutoff)
         .execute(&mut *tx)
         .await?;
         let receipt_fingerprint: Option<String> = sqlx::query_scalar(
             "SELECT request_fingerprint FROM relay_creation_receipts
-             WHERE actor_id=$1 AND idempotency_key=$2",
+             WHERE actor_id=$1 AND idempotency_key=$2 AND created_at >= $3",
         )
         .bind(input.actor_id)
         .bind(&input.idempotency_key)
+        .bind(&idempotency_cutoff)
         .fetch_optional(&mut *tx)
         .await?;
         if receipt_fingerprint
@@ -516,10 +545,12 @@ impl Socks5Repository for PgRepository {
              FROM relay_creation_receipts r
              INNER JOIN forward_rules f ON f.id=r.rule_id
              WHERE r.actor_id=$1 AND r.idempotency_key=$2
+               AND r.created_at >= $3
              FOR KEY SHARE OF f",
         )
         .bind(input.actor_id)
         .bind(&input.idempotency_key)
+        .bind(&idempotency_cutoff)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(replay) = replay {
@@ -538,10 +569,11 @@ impl Socks5Repository for PgRepository {
         .await?;
         let key_fingerprint: Option<String> = sqlx::query_scalar(
             "SELECT request_fingerprint FROM relay_creation_idempotency_keys
-             WHERE actor_id=$1 AND idempotency_key=$2",
+             WHERE actor_id=$1 AND idempotency_key=$2 AND created_at >= $3",
         )
         .bind(input.actor_id)
         .bind(&input.idempotency_key)
+        .bind(&idempotency_cutoff)
         .fetch_optional(&mut *tx)
         .await?;
         if key_fingerprint

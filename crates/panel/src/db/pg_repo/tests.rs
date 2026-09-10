@@ -6442,6 +6442,43 @@ fn pg_stage4_input(
     }
 }
 
+async fn pg_seed_stage4_expired_ledger_backlog(
+    db: &PgRepository,
+    input: &SmartRelayCreateInput,
+    total_rows: i64,
+    target_fingerprint: &str,
+    target_created_at: &str,
+) {
+    assert!(total_rows > 0);
+    sqlx::query(
+        "INSERT INTO relay_creation_idempotency_keys
+         (actor_id,idempotency_key,request_fingerprint,created_at)
+         SELECT $1,'ttl-filler-' || n,'expired-filler','2000-01-01 00:00:00'
+         FROM generate_series(1,$2) n",
+    )
+    .bind(input.actor_id)
+    .bind(total_rows - 1)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_idempotency_keys
+         (actor_id,idempotency_key,request_fingerprint,created_at) VALUES($1,$2,$3,$4)",
+    )
+    .bind(input.actor_id)
+    .bind(&input.idempotency_key)
+    .bind(target_fingerprint)
+    .bind(target_created_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_idempotency_keys")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, total_rows);
+}
+
 #[tokio::test]
 async fn pg_stage4_one_hundred_concurrent_creates_are_atomic_and_port_safe() {
     let Some(db) = repo("stage4_100_create").await else {
@@ -6509,6 +6546,335 @@ async fn pg_stage4_one_hundred_idempotent_requests_create_one_rule() {
     cleanup(&db).await;
 }
 
+#[tokio::test]
+async fn pg_stage4_expired_ledger_backlog_never_decides_idempotency() {
+    for (total_rows, sequence, port_range) in [
+        (10_001_i64, 701_usize, "28000-28009"),
+        (20_001_i64, 702_usize, "28100-28109"),
+    ] {
+        let name = format!("stage4_ttl_backlog_{total_rows}");
+        let Some(db) = repo(&name).await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, port_range).await;
+        let input = pg_stage4_input(sequence, resource_id, node_id, &checked_at);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &input,
+            total_rows,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        let mut third_intent = input.clone();
+        third_intent.request_fingerprint = "third-intent".into();
+        assert!(matches!(
+            db.create_smart_relay(&third_intent).await.unwrap(),
+            SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+        ));
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Replay(_)
+        ));
+        cleanup(&db).await;
+    }
+}
+
+#[tokio::test]
+async fn pg_stage4_valid_ledger_survives_expired_backlog() {
+    let Some(db) = repo("stage4_valid_ledger_backlog").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28200-28209").await;
+    let input = pg_stage4_input(703, resource_id, node_id, &checked_at);
+    pg_seed_stage4_expired_ledger_backlog(
+        &db,
+        &input,
+        10_001,
+        "valid-intent",
+        "2999-01-01 00:00:00",
+    )
+    .await;
+    assert!(matches!(
+        db.create_smart_relay(&input).await.unwrap(),
+        SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+    ));
+
+    let mut matching = input;
+    matching.request_fingerprint = "valid-intent".into();
+    assert!(matches!(
+        db.create_smart_relay(&matching).await.unwrap(),
+        SmartRelayCreateOutcome::Created(_)
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_ttl_boundary_is_inclusive() {
+    let Some(db) = repo("stage4_ttl_boundary").await else {
+        return;
+    };
+    let cutoff = "2026-01-08 00:00:00";
+    for (key, modifier) in [
+        ("boundary-before", "-1 second"),
+        ("boundary-exact", "+0 seconds"),
+        ("boundary-after", "+1 second"),
+    ] {
+        sqlx::query(
+            "INSERT INTO relay_creation_idempotency_keys
+             (actor_id,idempotency_key,request_fingerprint,created_at)
+             VALUES(1,$1,'boundary',to_char(to_timestamp($2,'YYYY-MM-DD HH24:MI:SS') + $3::interval,
+                                             'YYYY-MM-DD HH24:MI:SS'))",
+        )
+        .bind(key)
+        .bind(cutoff)
+        .bind(modifier)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let active: Vec<String> = sqlx::query_scalar(
+        "SELECT idempotency_key FROM relay_creation_idempotency_keys
+         WHERE created_at >= $1 ORDER BY idempotency_key",
+    )
+    .bind(cutoff)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(active, vec!["boundary-after", "boundary-exact"]);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_expired_receipt_backlog_cannot_force_a_conflict() {
+    let Some(db) = repo("stage4_expired_receipt_backlog").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28300-28309").await;
+    let input = pg_stage4_input(709, resource_id, node_id, &checked_at);
+    sqlx::query(
+        "INSERT INTO forward_rules
+         (name,uid,listen_port,protocol,device_group_in,target_addr,target_port)
+         SELECT 'ttl-receipt-filler-' || n,1,n,'tcp',940,'',0
+         FROM generate_series(1,10000) n",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_receipts
+         (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+          endpoint_host,listen_port,relay_username,exit_ip,selection_mode,created_at)
+         SELECT 1,'receipt-filler-' || f.id,'expired-receipt',f.id,$1,$2,
+                '192.0.2.44',f.listen_port,'relay','198.51.100.8','RECOMMENDED',
+                '2000-01-01 00:00:00'
+         FROM forward_rules f WHERE f.name LIKE 'ttl-receipt-filler-%'",
+    )
+    .bind(node_id)
+    .bind(resource_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let old_rule: i64 = sqlx::query_scalar(
+        "INSERT INTO forward_rules
+         (name,uid,listen_port,protocol,device_group_in,target_addr,target_port)
+         VALUES('expired-receipt-target',1,28300,'tcp',940,'',0) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_receipts
+         (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+          endpoint_host,listen_port,relay_username,exit_ip,selection_mode,created_at)
+         VALUES(1,$1,'expired-intent',$2,$3,$4,'192.0.2.44',28300,'relay',
+                '198.51.100.8','RECOMMENDED','2000-01-02 00:00:00')",
+    )
+    .bind(&input.idempotency_key)
+    .bind(old_rule)
+    .bind(node_id)
+    .bind(resource_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_idempotency_keys
+         (actor_id,idempotency_key,request_fingerprint,created_at)
+         VALUES(1,$1,'expired-intent','2000-01-02 00:00:00')",
+    )
+    .bind(&input.idempotency_key)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let new_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("expected create after expired receipt, got {other:?}"),
+    };
+    assert_ne!(new_rule, old_rule);
+    let receipt_rule: i64 = sqlx::query_scalar(
+        "SELECT rule_id FROM relay_creation_receipts
+         WHERE actor_id=1 AND idempotency_key=$1",
+    )
+    .bind(&input.idempotency_key)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(receipt_rule, new_rule);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_cleanup_rollback_is_not_part_of_ttl_correctness() {
+    {
+        let Some(db) = repo("stage4_ttl_quota_rollback").await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28400-28409").await;
+        let input = pg_stage4_input(704, resource_id, node_id, &checked_at);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &input,
+            10_001,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+        sqlx::query("UPDATE users SET max_rules=1 WHERE id=1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO forward_rules(name,uid,listen_port,device_group_in,target_addr,target_port) VALUES('quota-blocker',1,28409,940,'',0)")
+            .execute(&db.pool).await.unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::QuotaExceeded
+        ));
+        sqlx::query("DELETE FROM forward_rules WHERE name='quota-blocker'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        cleanup(&db).await;
+    }
+
+    {
+        let Some(db) = repo("stage4_ttl_port_rollback").await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28500-28509").await;
+        let mut input = pg_stage4_input(705, resource_id, node_id, &checked_at);
+        input.requested_port = Some(28505);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &input,
+            10_001,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+        sqlx::query("INSERT INTO forward_rules(name,uid,listen_port,device_group_in,target_addr,target_port) VALUES('port-blocker',1,28505,940,'',0)")
+            .execute(&db.pool).await.unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Rejected("PORT_CONFLICT")
+        ));
+        sqlx::query("DELETE FROM forward_rules WHERE name='port-blocker'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        cleanup(&db).await;
+    }
+
+    {
+        let Some(db) = repo("stage4_ttl_conflict_rollback").await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28600-28609").await;
+        let expired = pg_stage4_input(706, resource_id, node_id, &checked_at);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &expired,
+            10_001,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+        let valid = pg_stage4_input(707, resource_id, node_id, &checked_at);
+        sqlx::query("INSERT INTO relay_creation_idempotency_keys(actor_id,idempotency_key,request_fingerprint,created_at) VALUES($1,$2,$3,'2999-01-01 00:00:00')")
+            .bind(valid.actor_id)
+            .bind(&valid.idempotency_key)
+            .bind("valid-intent")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&valid).await.unwrap(),
+            SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+        ));
+        assert!(matches!(
+            db.create_smart_relay(&expired).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        cleanup(&db).await;
+    }
+
+    {
+        let Some(db) = repo("stage4_ttl_forced_rollback").await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28700-28709").await;
+        let input = pg_stage4_input(708, resource_id, node_id, &checked_at);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &input,
+            10_001,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+        sqlx::query(
+            "CREATE FUNCTION fail_ttl_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'forced ttl receipt failure'; END $$",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_ttl_receipt BEFORE INSERT ON relay_creation_receipts
+             FOR EACH ROW EXECUTE FUNCTION fail_ttl_receipt()",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(db.create_smart_relay(&input).await.is_err());
+        sqlx::query("DROP TRIGGER fail_ttl_receipt ON relay_creation_receipts")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION fail_ttl_receipt()")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        cleanup(&db).await;
+    }
+}
 #[tokio::test]
 async fn pg_stage4_cross_group_quota_is_user_serialized() {
     let Some(db) = repo("stage4_cross_group_quota").await else {

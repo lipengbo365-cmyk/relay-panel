@@ -610,28 +610,55 @@ impl Socks5Repository for SqliteRepository {
         }
 
         let operation = async {
+            let idempotency_cutoff: String =
+                sqlx::query_scalar("SELECT datetime('now','-7 days')")
+                    .fetch_one(&mut *conn)
+                    .await?;
             sqlx::query(
                 "DELETE FROM relay_creation_receipts WHERE id IN (
                     SELECT id FROM relay_creation_receipts
-                    WHERE created_at < datetime('now','-7 days') ORDER BY id LIMIT 10000
+                    WHERE created_at < ? ORDER BY id LIMIT 10000
                  )",
             )
+            .bind(&idempotency_cutoff)
             .execute(&mut *conn)
             .await?;
             sqlx::query(
                 "DELETE FROM relay_creation_idempotency_keys WHERE rowid IN (
                     SELECT rowid FROM relay_creation_idempotency_keys
-                    WHERE created_at < datetime('now','-7 days') ORDER BY created_at LIMIT 10000
+                    WHERE created_at < ? ORDER BY created_at LIMIT 10000
                  )",
             )
+            .bind(&idempotency_cutoff)
+            .execute(&mut *conn)
+            .await?;
+            // Global pruning is storage maintenance only. Expire the current
+            // key independently so bounded cleanup cannot decide idempotency.
+            sqlx::query(
+                "DELETE FROM relay_creation_receipts
+                 WHERE actor_id=? AND idempotency_key=? AND created_at < ?",
+            )
+            .bind(input.actor_id)
+            .bind(&input.idempotency_key)
+            .bind(&idempotency_cutoff)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                "DELETE FROM relay_creation_idempotency_keys
+                 WHERE actor_id=? AND idempotency_key=? AND created_at < ?",
+            )
+            .bind(input.actor_id)
+            .bind(&input.idempotency_key)
+            .bind(&idempotency_cutoff)
             .execute(&mut *conn)
             .await?;
             let receipt_fingerprint: Option<String> = sqlx::query_scalar(
                 "SELECT request_fingerprint FROM relay_creation_receipts
-                 WHERE actor_id=? AND idempotency_key=?",
+                 WHERE actor_id=? AND idempotency_key=? AND created_at >= ?",
             )
             .bind(input.actor_id)
             .bind(&input.idempotency_key)
+            .bind(&idempotency_cutoff)
             .fetch_optional(&mut *conn)
             .await?;
             if receipt_fingerprint
@@ -645,10 +672,11 @@ impl Socks5Repository for SqliteRepository {
                         r.relay_username,r.exit_ip,r.exit_country,r.selection_mode
                  FROM relay_creation_receipts r
                  INNER JOIN forward_rules f ON f.id=r.rule_id
-                 WHERE r.actor_id=? AND r.idempotency_key=?",
+                 WHERE r.actor_id=? AND r.idempotency_key=? AND r.created_at >= ?",
             )
             .bind(input.actor_id)
             .bind(&input.idempotency_key)
+            .bind(&idempotency_cutoff)
             .fetch_optional(&mut *conn)
             .await?;
             if let Some(replay) = replay {
@@ -664,10 +692,11 @@ impl Socks5Repository for SqliteRepository {
             .await?;
             let key_fingerprint: Option<String> = sqlx::query_scalar(
                 "SELECT request_fingerprint FROM relay_creation_idempotency_keys
-                 WHERE actor_id=? AND idempotency_key=?",
+                 WHERE actor_id=? AND idempotency_key=? AND created_at >= ?",
             )
             .bind(input.actor_id)
             .bind(&input.idempotency_key)
+            .bind(&idempotency_cutoff)
             .fetch_optional(&mut *conn)
             .await?;
             if key_fingerprint
@@ -918,9 +947,9 @@ impl Socks5Repository for SqliteRepository {
         idempotency_key: &str,
     ) -> Result<Option<SmartRelayReceiptRecord>, DbError> {
         let mut conn = self.pool.acquire().await?;
-        // Hold a read transaction through the JOIN so a concurrent rule delete
-        // either linearizes before this lookup (no replay) or after it. SQLite's
-        // writer commit cannot pass the read lock in between.
+        // The single INNER JOIN reads receipt and live rule from one consistent
+        // snapshot. A concurrent delete after that snapshot can linearize after
+        // replay; a delete committed before a new replay makes the JOIN empty.
         sqlx::query("BEGIN").execute(&mut *conn).await?;
         let receipt = sqlx::query_as(
             "SELECT r.request_fingerprint,r.rule_id,r.relay_node_id,r.resource_id,r.endpoint_host,

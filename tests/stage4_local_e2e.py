@@ -541,7 +541,7 @@ def main() -> None:
             rules_left = connection.execute(
                 "SELECT COUNT(*) FROM forward_rules WHERE id=?", (rule_id,)
             ).fetchone()[0]
-        assert receipts == 1 and rules_left == 0
+        assert receipts == 0 and rules_left == 0
 
         print(
             json.dumps(
