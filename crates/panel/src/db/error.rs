@@ -12,6 +12,7 @@
 /// A unified database error that abstracts over SQLite and PostgreSQL error
 /// codes. Every Repository method returns `Result<T, DbError>`.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum DbError {
     /// UNIQUE constraint violation. SQLite code "2067", PostgreSQL "23505".
     UniqueViolation,
@@ -30,6 +31,18 @@ pub enum DbError {
     /// A required row was not found (for fetch_one-or-None patterns that are
     /// expected to succeed).
     NotFound,
+    /// Optimistic policy update used a stale revision.
+    RevisionConflict,
+    /// A conditional state/fence transition did not match the current row.
+    InvalidTransition,
+    /// A CHECK/NOT NULL invariant rejected the requested persistence change.
+    ConstraintViolation,
+    /// An active idempotency key was reused with a different fingerprint.
+    IdempotencyConflict,
+    /// Retryable database failures (serialization, deadlock, lock/busy).
+    DatabaseTransient,
+    /// Non-retryable database failure whose raw text must not escape storage.
+    DatabasePermanent,
     /// Any other database error. The inner sqlx::Error is retained for
     /// logging but should NOT be serialized into an API response.
     Other(sqlx::Error),
@@ -43,6 +56,12 @@ impl std::fmt::Display for DbError {
             DbError::QuotaExceeded => write!(f, "active rule quota exceeded"),
             DbError::ForeignKeyViolation => write!(f, "foreign key constraint violation"),
             DbError::NotFound => write!(f, "not found"),
+            DbError::RevisionConflict => write!(f, "revision conflict"),
+            DbError::InvalidTransition => write!(f, "invalid transition"),
+            DbError::ConstraintViolation => write!(f, "constraint violation"),
+            DbError::IdempotencyConflict => write!(f, "idempotency conflict"),
+            DbError::DatabaseTransient => write!(f, "transient database error"),
+            DbError::DatabasePermanent => write!(f, "permanent database error"),
             DbError::Other(e) => write!(f, "database error: {}", e),
         }
     }
@@ -68,8 +87,17 @@ impl From<sqlx::Error> for DbError {
                 Some("23505") => return DbError::UniqueViolation,
                 // SQLite SQLITE_CONSTRAINT_FOREIGNKEY
                 Some("787") => return DbError::ForeignKeyViolation,
-                // PostgreSQL SQLSTATE 23503 (foreign_key_violation)
-                Some("23503") => return DbError::ForeignKeyViolation,
+                // PostgreSQL SQLSTATE 23503 (foreign_key_violation) and
+                // PostgreSQL 18's 23001 for an ON DELETE RESTRICT violation.
+                Some("23503") | Some("23001") => return DbError::ForeignKeyViolation,
+                // SQLite CHECK / NOT NULL and PostgreSQL integrity checks.
+                Some("275") | Some("1299") | Some("23502") | Some("23514") => {
+                    return DbError::ConstraintViolation;
+                }
+                // SQLite BUSY/LOCKED plus PostgreSQL transaction/lock failures.
+                Some("5") | Some("6") | Some("40001") | Some("40P01") | Some("55P03") => {
+                    return DbError::DatabaseTransient;
+                }
                 _ => {}
             }
         }

@@ -31,6 +31,12 @@ use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
 use serde::Serialize;
 
 use super::error::DbError;
+use super::health_orchestration::{
+    ConditionalWriteOutcome, HealthItemTransition, HealthJobCreateOutcome,
+    HealthJobIdempotencyOutcome, HealthJobItemRecord, HealthJobRecord, HealthPairLeaseRecord,
+    HealthPolicyPatch, HealthPolicyRecord, NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem,
+    NewHealthPolicy, PairLeaseAcquireOutcome, PairLeaseAcquireRequest,
+};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Socks5ResourceRecord {
@@ -923,6 +929,107 @@ pub trait Socks5Repository: Send + Sync {
     async fn prune_socks5_check_history(&self, cutoff: &str) -> Result<u64, DbError>;
 }
 
+// ── Stage 5 durable health orchestration persistence ──
+
+#[async_trait]
+pub trait HealthOrchestrationRepository: Send + Sync {
+    async fn create_health_policy(&self, input: &NewHealthPolicy) -> Result<i64, DbError>;
+    async fn find_health_policy(&self, id: i64) -> Result<Option<HealthPolicyRecord>, DbError>;
+    async fn update_health_policy(
+        &self,
+        id: i64,
+        expected_revision: i64,
+        patch: &HealthPolicyPatch,
+        now_ms: i64,
+    ) -> Result<HealthPolicyRecord, DbError>;
+
+    async fn create_health_job(
+        &self,
+        job: &NewHealthJob,
+        items: &[NewHealthJobItem],
+    ) -> Result<HealthJobCreateOutcome, DbError>;
+    async fn create_health_job_idempotent(
+        &self,
+        job: &NewHealthJob,
+        items: &[NewHealthJobItem],
+        key: &NewHealthJobIdempotency,
+    ) -> Result<HealthJobCreateOutcome, DbError>;
+    async fn lookup_health_job_idempotency(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        now_ms: i64,
+    ) -> Result<HealthJobIdempotencyOutcome, DbError>;
+    async fn find_health_job(&self, id: &str) -> Result<Option<HealthJobRecord>, DbError>;
+    async fn list_health_job_items(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn transition_health_job_item(
+        &self,
+        transition: &HealthItemTransition,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn cancel_health_job(&self, job_id: &str, now_ms: i64) -> Result<bool, DbError>;
+    async fn finalize_health_job(&self, job_id: &str, now_ms: i64) -> Result<bool, DbError>;
+    async fn retry_failed_health_pairs(
+        &self,
+        parent_job_id: &str,
+    ) -> Result<Vec<(i64, i64)>, DbError>;
+
+    async fn acquire_health_pair_lease(
+        &self,
+        request: PairLeaseAcquireRequest<'_>,
+    ) -> Result<PairLeaseAcquireOutcome, DbError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn renew_health_pair_lease(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        item_id: i64,
+        lease_owner: &str,
+        expected_pair_fence: i64,
+        lease_expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn release_health_pair_lease(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        item_id: i64,
+        lease_owner: &str,
+        expected_pair_fence: i64,
+        now_ms: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn find_health_pair_lease(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+    ) -> Result<Option<HealthPairLeaseRecord>, DbError>;
+
+    async fn list_terminal_health_job_prune_candidates(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DbError>;
+    async fn prune_terminal_health_jobs(&self, cutoff_ms: i64, limit: i64) -> Result<u64, DbError>;
+    async fn list_released_health_pair_lease_prune_candidates(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, i64)>, DbError>;
+    async fn prune_released_health_pair_leases(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<u64, DbError>;
+    async fn prune_expired_health_job_idempotency(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<u64, DbError>;
+}
+
 // ── Group (device_groups) ──
 
 #[async_trait]
@@ -1766,6 +1873,7 @@ pub trait Repository:
     + RedeemRepository
     + AnnouncementRepository
     + Socks5Repository
+    + HealthOrchestrationRepository
     + Send
     + Sync
 {

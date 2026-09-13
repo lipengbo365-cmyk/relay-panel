@@ -28,6 +28,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 mod announcements;
 mod groups;
+mod health_orchestration;
 mod kvs;
 mod orders;
 mod profiles;

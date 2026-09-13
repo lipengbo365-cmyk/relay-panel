@@ -531,7 +531,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 34;
+pub const PG_SCHEMA_VERSION: i32 = 35;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -656,7 +656,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
 
     // Already at (or beyond) the version this build understands — nothing to do.
     if current >= PG_SCHEMA_VERSION {
-        return Ok(());
+        return validate_pg_health_schema(pool).await;
     }
 
     if current < 2 {
@@ -1942,6 +1942,79 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 34: smart relay receipt lifecycle integrity present");
     }
 
+    if current < 35 {
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema=current_schema() AND table_name = ANY($1)",
+        )
+        .bind(crate::db::health_schema::HEALTH_TABLES.as_slice())
+        .fetch_one(pool)
+        .await?;
+        if existing != 0 {
+            return Err(sqlx::Error::Protocol(
+                "PostgreSQL migration 35 found unversioned Stage 5.1 schema".into(),
+            ));
+        }
+        let mut tx = pool.begin().await?;
+        for statement in crate::db::health_schema::POSTGRES_MIGRATION_35 {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query("INSERT INTO schema_version(version) VALUES(35)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 35: durable health orchestration persistence present");
+    }
+
+    validate_pg_health_schema(pool).await?;
+
+    Ok(())
+}
+
+async fn validate_pg_health_schema(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    for table in crate::db::health_schema::HEALTH_TABLES {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema=current_schema() AND table_name=$1",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await?;
+        if count != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "PostgreSQL migration 35 version/schema mismatch: missing {table}"
+            )));
+        }
+    }
+    for (table, expected) in crate::db::health_schema::HEALTH_COLUMN_COUNTS {
+        let actual: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema=current_schema() AND table_name=$1",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await?;
+        if actual != expected {
+            return Err(sqlx::Error::Protocol(
+                format!(
+                    "PostgreSQL migration 35 version/schema mismatch: {table} has {actual} columns, expected {expected}"
+                ),
+            ));
+        }
+    }
+    for index in crate::db::health_schema::HEALTH_INDEXES {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await?;
+        if count != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "PostgreSQL migration 35 version/schema mismatch: missing {index}"
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -13,6 +13,7 @@
 use super::PgRepository;
 use crate::config::Config;
 use crate::db::error::DbError;
+use crate::db::health_orchestration::*;
 use crate::db::pg_schema::{apply_pg_schema, run_pg_migrations};
 use crate::db::repo::*;
 use relay_shared::protocol::TrafficEntry;
@@ -7185,7 +7186,15 @@ async fn pg_migration_34_cleans_orphans_preserves_fingerprints_and_adds_cascade(
         .execute(&db.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_version WHERE version=34")
+    // Recreate an actual pre-34 database. Once later versions exist, deleting
+    // only row 34 leaves MAX(version) at 35 and correctly skips migration 34.
+    for table in crate::db::health_schema::HEALTH_TABLES.iter().rev() {
+        sqlx::query(&format!("DROP TABLE {table}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM schema_version WHERE version>=34")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -7366,5 +7375,511 @@ async fn pg_stage4_recommendation_one_thousand_nodes_is_bounded_and_explained() 
     .unwrap();
     assert!(plan.iter().any(|line| line.contains("actual time=")));
     assert!(plan.iter().any(|line| line.contains("rows=1000")));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_health_orchestration_persistence_contract() {
+    let Some(db) = repo("health_orchestration").await else {
+        return;
+    };
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 35);
+    run_pg_migrations(&db.pool).await.unwrap();
+    for index in crate::db::health_schema::HEALTH_INDEXES {
+        let present: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1",
+        )
+        .bind(index)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(present, 1, "missing {index}");
+    }
+    let mut plan_connection = db.pool.acquire().await.unwrap();
+    sqlx::query("SET enable_seqscan=off")
+        .execute(&mut *plan_connection)
+        .await
+        .unwrap();
+    let ready_plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN SELECT id FROM socks5_check_job_items
+         WHERE state='QUEUED' AND not_before_ms <= 1000 LIMIT 100",
+    )
+    .fetch_all(&mut *plan_connection)
+    .await
+    .unwrap();
+    assert!(ready_plan
+        .iter()
+        .any(|line| line.contains("idx_socks5_check_job_items_ready")));
+    sqlx::query("RESET enable_seqscan")
+        .execute(&mut *plan_connection)
+        .await
+        .unwrap();
+    drop(plan_connection);
+
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('health','in','health-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('health-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'health-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+
+    let policy = db
+        .create_health_policy(&NewHealthPolicy {
+            name: "health-policy".into(),
+            enabled: true,
+            resource_selector_json: "{}".into(),
+            node_selector_json: "{}".into(),
+            interval_seconds: 3600,
+            jitter_seconds: 60,
+            max_items: 100,
+            next_run_at_ms: 1_000,
+            created_by: Some(1),
+            now_ms: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        db.update_health_policy(
+            policy,
+            1,
+            &HealthPolicyPatch {
+                name: Some("health-policy-2".into()),
+                ..Default::default()
+            },
+            2
+        )
+        .await
+        .unwrap()
+        .revision,
+        2
+    );
+    assert!(matches!(
+        db.update_health_policy(policy, 1, &HealthPolicyPatch::default(), 3)
+            .await,
+        Err(DbError::RevisionConflict)
+    ));
+
+    let job = NewHealthJob {
+        id: "pg-health-job".into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: Some(1),
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let items = [NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: Some(10_000),
+    }];
+    let key = NewHealthJobIdempotency {
+        actor_id: 1,
+        idempotency_key: "pg-health-key".into(),
+        request_fingerprint: job.request_fingerprint.clone(),
+        created_at_ms: 1_000,
+        expires_at_ms: 1_000 + IDEMPOTENCY_TTL_MS,
+    };
+    assert!(matches!(
+        db.create_health_job_idempotent(&job, &items, &key)
+            .await
+            .unwrap(),
+        HealthJobCreateOutcome::Created { .. }
+    ));
+    assert!(matches!(
+        db.create_health_job_idempotent(&job, &items, &key)
+            .await
+            .unwrap(),
+        HealthJobCreateOutcome::Replay { .. }
+    ));
+    let item = db.list_health_job_items(&job.id).await.unwrap().remove(0);
+    let leased = HealthItemTransition {
+        item_id: item.id,
+        expected_state: HealthJobItemState::Queued,
+        expected_fence: 0,
+        new_state: HealthJobItemState::Leased,
+        lease_owner: Some("pg-worker".into()),
+        lease_expires_at_ms: Some(3_000),
+        pair_fence_token: None,
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: None,
+        health_status: None,
+        safe_error_code: None,
+        safe_error_message: None,
+        completed_after_cancel: false,
+        now_ms: 2_000,
+    };
+    assert_eq!(
+        db.transition_health_job_item(&leased).await.unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    let active = db.find_health_job(&job.id).await.unwrap().unwrap();
+    assert_eq!((active.queued_count, active.running_count), (0, 1));
+    let lease = db
+        .acquire_health_pair_lease(PairLeaseAcquireRequest {
+            resource_id: resource,
+            relay_node_id: node,
+            item_id: item.id,
+            lease_owner: "pg-worker",
+            lease_expires_at_ms: 3_000,
+            now_ms: 2_000,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        lease,
+        PairLeaseAcquireOutcome::Acquired {
+            pair_fence_token: 1
+        }
+    );
+    assert_eq!(
+        db.release_health_pair_lease(resource, node, item.id, "pg-worker", 1, 2_500)
+            .await
+            .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert_eq!(
+        db.list_released_health_pair_lease_prune_candidates(2_501, 1000)
+            .await
+            .unwrap(),
+        vec![(resource, node)]
+    );
+
+    let mut dispatching = leased.clone();
+    dispatching.expected_state = HealthJobItemState::Leased;
+    dispatching.expected_fence = 1;
+    dispatching.new_state = HealthJobItemState::Dispatching;
+    dispatching.now_ms = 2_600;
+    assert_eq!(
+        db.transition_health_job_item(&dispatching).await.unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    let mut in_flight = dispatching.clone();
+    in_flight.expected_state = HealthJobItemState::Dispatching;
+    in_flight.expected_fence = 2;
+    in_flight.new_state = HealthJobItemState::InFlight;
+    in_flight.now_ms = 2_700;
+    assert_eq!(
+        db.transition_health_job_item(&in_flight).await.unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    let mut succeeded = in_flight;
+    succeeded.expected_state = HealthJobItemState::InFlight;
+    succeeded.expected_fence = 3;
+    succeeded.new_state = HealthJobItemState::Succeeded;
+    succeeded.lease_owner = None;
+    succeeded.lease_expires_at_ms = None;
+    succeeded.now_ms = 3_000;
+    assert_eq!(
+        db.transition_health_job_item(&succeeded).await.unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert!(db.finalize_health_job(&job.id, 3_001).await.unwrap());
+    let done = db.find_health_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(done.status, HealthJobStatus::Succeeded.as_str());
+    assert_eq!((done.running_count, done.succeeded_count), (0, 1));
+    assert_eq!(
+        db.list_terminal_health_job_prune_candidates(3_002, 1000)
+            .await
+            .unwrap(),
+        vec![job.id.clone()]
+    );
+
+    assert_eq!(
+        db.lookup_health_job_idempotency(1, &key.idempotency_key, &"b".repeat(64), 2_000)
+            .await
+            .unwrap(),
+        HealthJobIdempotencyOutcome::Conflict
+    );
+    assert_eq!(
+        db.lookup_health_job_idempotency(2, &key.idempotency_key, &job.request_fingerprint, 2_000)
+            .await
+            .unwrap(),
+        HealthJobIdempotencyOutcome::Available
+    );
+    sqlx::query(
+        "INSERT INTO socks5_health_job_idempotency
+         (actor_id,idempotency_key,request_fingerprint,job_id,created_at_ms,expires_at_ms)
+         SELECT 1,'expired-' || lpad(g::text,5,'0'),repeat('e',64),NULL,0,999
+         FROM generate_series(0,10000) AS g",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.lookup_health_job_idempotency(1, "expired-10000", &"e".repeat(64), 1_000)
+            .await
+            .unwrap(),
+        HealthJobIdempotencyOutcome::Available
+    );
+
+    let scheduled_item = [NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 4_000,
+        deadline_at_ms: None,
+    }];
+    for id in ["pg-slot-a", "pg-slot-b"] {
+        let scheduled = NewHealthJob {
+            id: id.into(),
+            source: HealthJobSource::Scheduled,
+            policy_id: Some(policy),
+            parent_job_id: None,
+            actor_id: None,
+            request_fingerprint: "c".repeat(64),
+            snapshot_hash: snapshot_hash(&[(resource, node)]),
+            resource_selector_json: "{}".into(),
+            node_selector_json: "{}".into(),
+            scheduled_for_ms: Some(50_000),
+            created_at_ms: 4_000,
+        };
+        let result = db.create_health_job(&scheduled, &scheduled_item).await;
+        if id == "pg-slot-a" {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(DbError::UniqueViolation)));
+        }
+    }
+    assert!(matches!(
+        sqlx::query("UPDATE socks5_check_job_items SET state='BOGUS' WHERE job_id='pg-slot-a'")
+            .execute(&db.pool)
+            .await
+            .map_err(DbError::from),
+        Err(DbError::ConstraintViolation)
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_health_orchestration_cancel_retry_constraints_and_retention_parity() {
+    let Some(db) = repo("health_orchestration_parity").await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('health-parity','in','health-parity-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('health-parity-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'health-parity-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+
+    let new_job = |id: &str| NewHealthJob {
+        id: id.into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "d".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let item = NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: None,
+    };
+
+    assert!(matches!(
+        db.create_health_job(&new_job("pg-empty"), &[]).await,
+        Err(DbError::ConstraintViolation)
+    ));
+    assert!(matches!(
+        db.create_health_job(&new_job("pg-duplicate"), &[item.clone(), item.clone()])
+            .await,
+        Err(DbError::UniqueViolation)
+    ));
+    assert!(db.find_health_job("pg-duplicate").await.unwrap().is_none());
+
+    let cancel = new_job("pg-cancel");
+    db.create_health_job(&cancel, std::slice::from_ref(&item))
+        .await
+        .unwrap();
+    assert!(db.cancel_health_job(&cancel.id, 2_000).await.unwrap());
+    let cancelled = db.find_health_job(&cancel.id).await.unwrap().unwrap();
+    assert_eq!(cancelled.status, HealthJobStatus::Cancelled.as_str());
+    assert_eq!((cancelled.queued_count, cancelled.cancelled_count), (0, 1));
+
+    let failed = new_job("pg-failed");
+    db.create_health_job(&failed, std::slice::from_ref(&item))
+        .await
+        .unwrap();
+    let failed_item = db
+        .list_health_job_items(&failed.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let transition = |expected_state, expected_fence, new_state, now_ms| HealthItemTransition {
+        item_id: failed_item.id,
+        expected_state,
+        expected_fence,
+        new_state,
+        lease_owner: (new_state == HealthJobItemState::Leased).then(|| "worker".into()),
+        lease_expires_at_ms: (new_state == HealthJobItemState::Leased).then_some(now_ms + 1_000),
+        pair_fence_token: None,
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: None,
+        health_status: None,
+        safe_error_code: None,
+        safe_error_message: None,
+        completed_after_cancel: false,
+        now_ms,
+    };
+    assert_eq!(
+        db.transition_health_job_item(&transition(
+            HealthJobItemState::Queued,
+            99,
+            HealthJobItemState::Leased,
+            2_100,
+        ))
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::ConditionFailed
+    );
+    assert_eq!(
+        db.transition_health_job_item(&transition(
+            HealthJobItemState::Queued,
+            0,
+            HealthJobItemState::Leased,
+            2_100,
+        ))
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert_eq!(
+        db.transition_health_job_item(&transition(
+            HealthJobItemState::Leased,
+            1,
+            HealthJobItemState::Failed,
+            2_200,
+        ))
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert!(db.finalize_health_job(&failed.id, 2_201).await.unwrap());
+    assert_eq!(
+        db.retry_failed_health_pairs(&failed.id).await.unwrap(),
+        vec![(resource, node)]
+    );
+
+    assert!(matches!(
+        sqlx::query("UPDATE socks5_check_jobs SET queued_count=1 WHERE id=$1")
+            .bind(&failed.id)
+            .execute(&db.pool)
+            .await
+            .map_err(DbError::from),
+        Err(DbError::ConstraintViolation)
+    ));
+    assert!(matches!(
+        sqlx::query("UPDATE socks5_check_jobs SET status='RUNNING' WHERE id=$1")
+            .bind(&failed.id)
+            .execute(&db.pool)
+            .await
+            .map_err(DbError::from),
+        Err(DbError::ConstraintViolation)
+    ));
+
+    let active = new_job("pg-active-retention");
+    db.create_health_job(&active, std::slice::from_ref(&item))
+        .await
+        .unwrap();
+    let candidates = db
+        .list_terminal_health_job_prune_candidates(10_000, 1000)
+        .await
+        .unwrap();
+    assert!(candidates.contains(&cancel.id));
+    assert!(candidates.contains(&failed.id));
+    assert!(!candidates.contains(&active.id));
+    assert_eq!(
+        db.prune_terminal_health_jobs(10_000, 1000).await.unwrap(),
+        2
+    );
+    assert!(db.find_health_job(&active.id).await.unwrap().is_some());
+
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_migration_35_upgrade_rollback_rerun_and_mismatch_detection() {
+    let Some(db) = repo("migration_35_health").await else {
+        return;
+    };
+    sqlx::query(
+        "DROP TABLE socks5_health_job_idempotency,socks5_check_pair_leases,
+         socks5_check_job_items,socks5_check_jobs,socks5_check_policies",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version=35")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let mut tx = db.pool.begin().await.unwrap();
+    for statement in crate::db::health_schema::POSTGRES_MIGRATION_35 {
+        sqlx::query(statement).execute(&mut *tx).await.unwrap();
+    }
+    assert!(
+        sqlx::query("INSERT INTO definitely_missing_table VALUES(1)")
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    let partial_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema=current_schema() AND table_name=ANY($1)",
+    )
+    .bind(crate::db::health_schema::HEALTH_TABLES.as_slice())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(partial_tables, 0);
+
+    run_pg_migrations(&db.pool).await.unwrap();
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 35);
+    run_pg_migrations(&db.pool).await.unwrap();
+    sqlx::query("DROP INDEX idx_socks5_check_job_items_ready")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let error = run_pg_migrations(&db.pool).await.unwrap_err();
+    assert!(error.to_string().contains("version/schema mismatch"));
     cleanup(&db).await;
 }

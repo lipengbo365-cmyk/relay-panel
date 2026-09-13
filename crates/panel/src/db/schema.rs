@@ -1,4 +1,8 @@
 pub const SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,
@@ -2278,6 +2282,109 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     // ── Migration 50: smart-relay receipt lifecycle integrity ──
     migrate_sqlite_relay_receipt_integrity(pool).await?;
 
+    // ── Migration 51: Stage 5.1 durable health orchestration persistence ──
+    migrate_sqlite_health_orchestration(pool).await?;
+
+    Ok(())
+}
+
+async fn validate_sqlite_health_schema(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    for table in crate::db::health_schema::HEALTH_TABLES {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(table)
+                .fetch_one(&mut *conn)
+                .await?;
+        if count != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "SQLite migration 51 version/schema mismatch: missing {table}"
+            )));
+        }
+    }
+    for (table, expected) in crate::db::health_schema::HEALTH_COLUMN_COUNTS {
+        let actual: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?)")
+            .bind(table)
+            .fetch_one(&mut *conn)
+            .await?;
+        if actual != expected {
+            return Err(sqlx::Error::Protocol(
+                format!(
+                    "SQLite migration 51 version/schema mismatch: {table} has {actual} columns, expected {expected}"
+                ),
+            ));
+        }
+    }
+    for index in crate::db::health_schema::HEALTH_INDEXES {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?")
+                .bind(index)
+                .fetch_one(&mut *conn)
+                .await?;
+        if count != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "SQLite migration 51 version/schema mismatch: missing {index}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn migrate_sqlite_health_orchestration(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    const VERSION: i64 = 51;
+    // Some pre-version-tracker SQLite databases are still supported by the
+    // historical migration chain. Establishing the tracker is distinct from
+    // creating Stage 5 tables: those remain strict, versioned DDL below.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let current: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version),0) FROM schema_version")
+        .fetch_one(pool)
+        .await?;
+    if current >= VERSION {
+        let mut conn = pool.acquire().await?;
+        return validate_sqlite_health_schema(&mut conn).await;
+    }
+
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+         ('socks5_check_policies','socks5_check_jobs','socks5_check_job_items',
+          'socks5_check_pair_leases','socks5_health_job_idempotency')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if existing != 0 {
+        return Err(sqlx::Error::Protocol(
+            "SQLite migration 51 found unversioned Stage 5.1 schema".into(),
+        ));
+    }
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let migration = async {
+        for statement in crate::db::health_schema::SQLITE_MIGRATION_51 {
+            sqlx::query(statement).execute(&mut *conn).await?;
+        }
+        sqlx::query("INSERT INTO schema_version(version) VALUES(?)")
+            .bind(VERSION)
+            .execute(&mut *conn)
+            .await?;
+        validate_sqlite_health_schema(&mut conn).await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    migration?;
+    tracing::info!("Migration 51: durable health orchestration persistence present");
     Ok(())
 }
 
@@ -3523,5 +3630,101 @@ mod tests {
             .await
             .expect("re-run baseline");
         run_migrations(&pool).await.expect("re-run migrations");
+    }
+
+    #[tokio::test]
+    async fn migration_51_fresh_rerun_constraints_indexes_and_fk_actions() {
+        let pool = fresh_pool().await;
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 51);
+        run_migrations(&pool)
+            .await
+            .expect("second startup validates");
+        for table in crate::db::health_schema::HEALTH_TABLES {
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(present, 1, "missing {table}");
+        }
+        for index in crate::db::health_schema::HEALTH_INDEXES {
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?",
+            )
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(present, 1, "missing {index}");
+        }
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(violations, 0);
+        let item_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='socks5_check_job_items'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(item_sql.contains("ON DELETE SET NULL"));
+        assert!(item_sql.contains("ON DELETE CASCADE"));
+    }
+
+    #[tokio::test]
+    async fn migration_51_failure_rolls_back_without_partial_tables() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        for statement in crate::db::health_schema::SQLITE_MIGRATION_51 {
+            sqlx::query(statement).execute(&mut *conn).await.unwrap();
+        }
+        assert!(
+            sqlx::query("INSERT INTO definitely_missing_table VALUES(1)")
+                .execute(&mut *conn)
+                .await
+                .is_err()
+        );
+        sqlx::query("ROLLBACK").execute(&mut *conn).await.unwrap();
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+             ('socks5_check_policies','socks5_check_jobs','socks5_check_job_items',
+              'socks5_check_pair_leases','socks5_health_job_idempotency')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(tables, 0);
+        let version: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(version, None);
+    }
+
+    #[tokio::test]
+    async fn migration_51_version_schema_mismatch_fails_loudly() {
+        let pool = fresh_pool().await;
+        sqlx::query("DROP INDEX idx_socks5_check_job_items_ready")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = run_migrations(&pool).await.unwrap_err();
+        assert!(error.to_string().contains("version/schema mismatch"));
     }
 }

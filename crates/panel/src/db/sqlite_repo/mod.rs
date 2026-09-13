@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 
 mod announcements;
 mod groups;
+mod health_orchestration;
 mod kvs;
 mod orders;
 mod profiles;
