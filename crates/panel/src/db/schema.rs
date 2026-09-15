@@ -2303,28 +2303,43 @@ async fn validate_sqlite_health_schema(
             )));
         }
     }
-    for (table, expected) in crate::db::health_schema::HEALTH_COLUMN_COUNTS {
-        let actual: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?)")
-            .bind(table)
-            .fetch_one(&mut *conn)
-            .await?;
-        if actual != expected {
-            return Err(sqlx::Error::Protocol(
-                format!(
-                    "SQLite migration 51 version/schema mismatch: {table} has {actual} columns, expected {expected}"
-                ),
-            ));
+    for (table, expected) in crate::db::health_schema::HEALTH_TABLES
+        .into_iter()
+        .zip(crate::db::health_schema::SQLITE_MIGRATION_51.iter().take(5))
+    {
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(table)
+                .fetch_optional(&mut *conn)
+                .await?
+                .flatten();
+        if actual
+            .as_deref()
+            .map(crate::db::health_schema::normalize_schema_sql)
+            != Some(crate::db::health_schema::normalize_schema_sql(expected))
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "SQLite migration 51 version/schema mismatch: {table} table manifest differs"
+            )));
         }
     }
-    for index in crate::db::health_schema::HEALTH_INDEXES {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?")
+    for (index, expected) in crate::db::health_schema::HEALTH_INDEXES
+        .into_iter()
+        .zip(crate::db::health_schema::SQLITE_MIGRATION_51.iter().skip(5))
+    {
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='index' AND name=?")
                 .bind(index)
-                .fetch_one(&mut *conn)
-                .await?;
-        if count != 1 {
+                .fetch_optional(&mut *conn)
+                .await?
+                .flatten();
+        if actual
+            .as_deref()
+            .map(crate::db::health_schema::normalize_schema_sql)
+            != Some(crate::db::health_schema::normalize_schema_sql(expected))
+        {
             return Err(sqlx::Error::Protocol(format!(
-                "SQLite migration 51 version/schema mismatch: missing {index}"
+                "SQLite migration 51 version/schema mismatch: {index} index manifest differs"
             )));
         }
     }
@@ -3726,5 +3741,93 @@ mod tests {
             .unwrap();
         let error = run_migrations(&pool).await.unwrap_err();
         assert!(error.to_string().contains("version/schema mismatch"));
+    }
+
+    #[tokio::test]
+    async fn migration_51_manifest_rejects_constraint_column_fk_and_index_drift() {
+        let mutations = [
+            (
+                "table",
+                "socks5_check_jobs",
+                "status IN ('QUEUED','RUNNING','CANCEL_REQUESTED','SUCCEEDED','FAILED','PARTIAL','CANCELLED','PARTIAL_CANCELLED')",
+                "status IN ('QUEUED','RUNNING')",
+            ),
+            (
+                "table",
+                "socks5_check_job_items",
+                "job_id TEXT NOT NULL REFERENCES socks5_check_jobs(id) ON DELETE CASCADE",
+                "job_id TEXT NOT NULL",
+            ),
+            (
+                "table",
+                "socks5_check_job_items",
+                "resource_id INTEGER REFERENCES socks5_resources(id) ON DELETE SET NULL",
+                "resource_id INTEGER REFERENCES socks5_resources(id) ON DELETE CASCADE",
+            ),
+            (
+                "table",
+                "socks5_check_jobs",
+                "total_items INTEGER NOT NULL",
+                "total_items INTEGER",
+            ),
+            (
+                "table",
+                "socks5_check_jobs",
+                "status TEXT NOT NULL DEFAULT 'QUEUED'",
+                "status TEXT NOT NULL DEFAULT 'RUNNING'",
+            ),
+            (
+                "table",
+                "socks5_check_jobs",
+                "total_items INTEGER NOT NULL",
+                "total_items TEXT NOT NULL",
+            ),
+            (
+                "table",
+                "socks5_check_job_items",
+                "UNIQUE(job_id,resource_id_snapshot,relay_node_id_snapshot)",
+                "CHECK(job_id <> '')",
+            ),
+            (
+                "index",
+                "uq_socks5_check_jobs_scheduled_slot",
+                "WHERE source='SCHEDULED'",
+                "WHERE source='MANUAL'",
+            ),
+            (
+                "index",
+                "idx_socks5_check_job_items_ready",
+                "(state,not_before_ms,id)",
+                "(not_before_ms,state,id)",
+            ),
+        ];
+        for (kind, name, from, to) in mutations {
+            let pool = fresh_pool().await;
+            sqlx::query("PRAGMA writable_schema=ON")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let changed = sqlx::query(
+                "UPDATE sqlite_master SET sql=replace(sql,?,?) WHERE type=? AND name=?",
+            )
+            .bind(from)
+            .bind(to)
+            .bind(kind)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+            sqlx::query("PRAGMA writable_schema=OFF")
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(changed, 1, "mutation did not target {kind} {name}");
+            let error = run_migrations(&pool).await.unwrap_err();
+            assert!(
+                error.to_string().contains("version/schema mismatch"),
+                "{kind} {name}: {error}"
+            );
+        }
     }
 }

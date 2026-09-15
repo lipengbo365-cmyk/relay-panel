@@ -1986,32 +1986,35 @@ async fn validate_pg_health_schema(pool: &sqlx::PgPool) -> Result<(), sqlx::Erro
             )));
         }
     }
-    for (table, expected) in crate::db::health_schema::HEALTH_COLUMN_COUNTS {
-        let actual: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM information_schema.columns
-             WHERE table_schema=current_schema() AND table_name=$1",
-        )
-        .bind(table)
-        .fetch_one(pool)
-        .await?;
+    use sha2::{Digest, Sha256};
+    let manifests = [
+        (
+            "columns",
+            "SELECT string_agg(format('%s|%s|%s|%s|%s',c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),CASE WHEN a.attnotnull THEN 'N' ELSE 'Y' END)||'|'||COALESCE(pg_get_expr(d.adbin,d.adrelid),''), chr(10) ORDER BY c.relname,a.attnum) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE n.nspname=current_schema() AND c.relname=ANY($1)",
+            crate::db::health_schema::POSTGRES_HEALTH_COLUMN_FINGERPRINT,
+        ),
+        (
+            "constraints",
+            "SELECT string_agg(c.relname||'|'||con.contype::text||'|'||pg_get_constraintdef(con.oid,true), chr(10) ORDER BY c.relname,con.contype::text,pg_get_constraintdef(con.oid,true)) FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND con.contype<>'n'",
+            crate::db::health_schema::POSTGRES_HEALTH_CONSTRAINT_FINGERPRINT,
+        ),
+        (
+            "indexes",
+            "SELECT string_agg(tablename||'|'||indexname||'|'||indexdef, chr(10) ORDER BY tablename,indexname) FROM pg_indexes WHERE schemaname=current_schema() AND tablename=ANY($1)",
+            crate::db::health_schema::POSTGRES_HEALTH_INDEX_FINGERPRINT,
+        ),
+    ];
+    for (kind, query, expected) in manifests {
+        let canonical: Option<String> = sqlx::query_scalar(query)
+            .bind(crate::db::health_schema::HEALTH_TABLES.as_slice())
+            .fetch_one(pool)
+            .await?;
+        let actual = canonical
+            .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
+            .unwrap_or_default();
         if actual != expected {
-            return Err(sqlx::Error::Protocol(
-                format!(
-                    "PostgreSQL migration 35 version/schema mismatch: {table} has {actual} columns, expected {expected}"
-                ),
-            ));
-        }
-    }
-    for index in crate::db::health_schema::HEALTH_INDEXES {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1",
-        )
-        .bind(index)
-        .fetch_one(pool)
-        .await?;
-        if count != 1 {
             return Err(sqlx::Error::Protocol(format!(
-                "PostgreSQL migration 35 version/schema mismatch: missing {index}"
+                "PostgreSQL migration 35 version/schema mismatch: {kind} manifest {actual}, expected {expected}"
             )));
         }
     }

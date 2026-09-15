@@ -10,14 +10,6 @@ pub const HEALTH_TABLES: [&str; 5] = [
     "socks5_health_job_idempotency",
 ];
 
-pub const HEALTH_COLUMN_COUNTS: [(&str, i64); 5] = [
-    ("socks5_check_policies", 20),
-    ("socks5_check_jobs", 24),
-    ("socks5_check_job_items", 25),
-    ("socks5_check_pair_leases", 7),
-    ("socks5_health_job_idempotency", 6),
-];
-
 pub const HEALTH_INDEXES: [&str; 10] = [
     "idx_socks5_check_jobs_status_created",
     "idx_socks5_check_jobs_policy_status",
@@ -30,6 +22,20 @@ pub const HEALTH_INDEXES: [&str; 10] = [
     "idx_socks5_check_pair_leases_updated",
     "idx_socks5_health_job_idempotency_expiry",
 ];
+
+pub const POSTGRES_HEALTH_COLUMN_FINGERPRINT: &str =
+    "8df0b1eed2ee0c77ed5aa563a065259d00126f05eec43bb92d75fcfa13a3b2d9";
+pub const POSTGRES_HEALTH_CONSTRAINT_FINGERPRINT: &str =
+    "88e0c261e38a6f0c8bfce52d956f3a01eca56db840b09fe8f394071d7c0bfbdd";
+pub const POSTGRES_HEALTH_INDEX_FINGERPRINT: &str =
+    "bfa8a654b1972ef608a1d8e050cfba04dca5d056bf8c49eb90d4f9fad01f054e";
+
+pub fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 
 pub const SQLITE_MIGRATION_51: [&str; 15] = [
     r#"CREATE TABLE socks5_check_policies (
@@ -52,7 +58,15 @@ pub const SQLITE_MIGRATION_51: [&str; 15] = [
         created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
         created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
         updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
-        deleted_at_ms INTEGER CHECK(deleted_at_ms IS NULL OR deleted_at_ms >= 0)
+        deleted_at_ms INTEGER CHECK(deleted_at_ms IS NULL OR deleted_at_ms >= 0),
+        CHECK((last_error_code IS NULL AND last_error_message IS NULL) OR
+              (last_error_code='PROXY_CONNECT_TIMEOUT' AND (last_error_message IS NULL OR last_error_message='Proxy connection timed out')) OR
+              (last_error_code='NETWORK_DNS_FAILED' AND (last_error_message IS NULL OR last_error_message='DNS resolution failed')) OR
+              (last_error_code='PROXY_AUTH_FAILED' AND (last_error_message IS NULL OR last_error_message='Proxy authentication failed')) OR
+              (last_error_code='UPSTREAM_UNAVAILABLE' AND (last_error_message IS NULL OR last_error_message='Upstream service unavailable')) OR
+              (last_error_code='PAIR_LEASE_BUSY' AND (last_error_message IS NULL OR last_error_message='Relay pair is busy')) OR
+              (last_error_code='TRANSITION_CONFLICT' AND (last_error_message IS NULL OR last_error_message='State transition conflicted')) OR
+              (last_error_code='REQUEST_CANCELLED' AND (last_error_message IS NULL OR last_error_message='Health check was cancelled')))
     )"#,
     r#"CREATE TABLE socks5_check_jobs (
         id TEXT PRIMARY KEY CHECK(length(id) > 0),
@@ -113,6 +127,19 @@ pub const SQLITE_MIGRATION_51: [&str; 15] = [
         updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
         finished_at_ms INTEGER CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0),
         CHECK((lease_owner IS NULL AND lease_expires_at_ms IS NULL) OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL)),
+        CHECK((state='LEASED' AND lease_owner IS NOT NULL AND lease_expires_at_ms > updated_at_ms AND pair_fence_token IS NOT NULL AND dispatch_attempt_id IS NULL AND request_id IS NULL) OR
+              (state='DISPATCHING' AND lease_owner IS NOT NULL AND lease_expires_at_ms > updated_at_ms AND pair_fence_token IS NOT NULL AND dispatch_attempt_id IS NOT NULL AND length(dispatch_attempt_id)>0 AND request_id IS NULL) OR
+              (state='IN_FLIGHT' AND lease_owner IS NOT NULL AND lease_expires_at_ms > updated_at_ms AND pair_fence_token IS NOT NULL AND dispatch_attempt_id IS NOT NULL AND length(dispatch_attempt_id)>0 AND request_id IS NOT NULL AND length(request_id)>0) OR
+              (state IN ('QUEUED','RETRY_WAIT','SUCCEEDED','FAILED','CANCELLED') AND lease_owner IS NULL AND lease_expires_at_ms IS NULL AND pair_fence_token IS NULL AND dispatch_attempt_id IS NULL AND request_id IS NULL)),
+        CHECK((safe_error_code IS NULL AND safe_error_message IS NULL) OR
+              (safe_error_code='PROXY_CONNECT_TIMEOUT' AND (safe_error_message IS NULL OR safe_error_message='Proxy connection timed out')) OR
+              (safe_error_code='NETWORK_DNS_FAILED' AND (safe_error_message IS NULL OR safe_error_message='DNS resolution failed')) OR
+              (safe_error_code='PROXY_AUTH_FAILED' AND (safe_error_message IS NULL OR safe_error_message='Proxy authentication failed')) OR
+              (safe_error_code='UPSTREAM_UNAVAILABLE' AND (safe_error_message IS NULL OR safe_error_message='Upstream service unavailable')) OR
+              (safe_error_code='PAIR_LEASE_BUSY' AND (safe_error_message IS NULL OR safe_error_message='Relay pair is busy')) OR
+              (safe_error_code='TRANSITION_CONFLICT' AND (safe_error_message IS NULL OR safe_error_message='State transition conflicted')) OR
+              (safe_error_code='REQUEST_CANCELLED' AND (safe_error_message IS NULL OR safe_error_message='Health check was cancelled'))),
+        CHECK(state IN ('RETRY_WAIT','FAILED') OR (safe_error_code IS NULL AND safe_error_message IS NULL)),
         CHECK((state IN ('SUCCEEDED','FAILED','CANCELLED') AND finished_at_ms IS NOT NULL) OR (state IN ('QUEUED','LEASED','DISPATCHING','IN_FLIGHT','RETRY_WAIT') AND finished_at_ms IS NULL)),
         UNIQUE(job_id,resource_id_snapshot,relay_node_id_snapshot)
     )"#,
@@ -125,7 +152,7 @@ pub const SQLITE_MIGRATION_51: [&str; 15] = [
         pair_fence_token INTEGER NOT NULL DEFAULT 0 CHECK(pair_fence_token >= 0),
         updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
         PRIMARY KEY(resource_id,relay_node_id),
-        CHECK((lease_owner IS NULL AND lease_expires_at_ms IS NULL) OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL))
+        CHECK((lease_owner IS NULL AND lease_expires_at_ms IS NULL) OR (lease_owner IS NOT NULL AND lease_expires_at_ms > updated_at_ms))
     )"#,
     r#"CREATE TABLE socks5_health_job_idempotency (
         actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -164,7 +191,15 @@ pub const POSTGRES_MIGRATION_35: [&str; 15] = [
         skipped_overlap_count BIGINT NOT NULL DEFAULT 0 CHECK(skipped_overlap_count >= 0),
         created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
         created_at_ms BIGINT NOT NULL CHECK(created_at_ms >= 0), updated_at_ms BIGINT NOT NULL CHECK(updated_at_ms >= 0),
-        deleted_at_ms BIGINT CHECK(deleted_at_ms IS NULL OR deleted_at_ms >= 0)
+        deleted_at_ms BIGINT CHECK(deleted_at_ms IS NULL OR deleted_at_ms >= 0),
+        CHECK((last_error_code IS NULL AND last_error_message IS NULL) OR
+              (last_error_code='PROXY_CONNECT_TIMEOUT' AND (last_error_message IS NULL OR last_error_message='Proxy connection timed out')) OR
+              (last_error_code='NETWORK_DNS_FAILED' AND (last_error_message IS NULL OR last_error_message='DNS resolution failed')) OR
+              (last_error_code='PROXY_AUTH_FAILED' AND (last_error_message IS NULL OR last_error_message='Proxy authentication failed')) OR
+              (last_error_code='UPSTREAM_UNAVAILABLE' AND (last_error_message IS NULL OR last_error_message='Upstream service unavailable')) OR
+              (last_error_code='PAIR_LEASE_BUSY' AND (last_error_message IS NULL OR last_error_message='Relay pair is busy')) OR
+              (last_error_code='TRANSITION_CONFLICT' AND (last_error_message IS NULL OR last_error_message='State transition conflicted')) OR
+              (last_error_code='REQUEST_CANCELLED' AND (last_error_message IS NULL OR last_error_message='Health check was cancelled')))
     )"#,
     r#"CREATE TABLE socks5_check_jobs (
         id TEXT PRIMARY KEY CHECK(length(id)>0), source TEXT NOT NULL CHECK(source IN ('MANUAL','SCHEDULED','RETRY_FAILED','POLICY_RUN_NOW')),
@@ -197,6 +232,19 @@ pub const POSTGRES_MIGRATION_35: [&str; 15] = [
         health_status TEXT, safe_error_code TEXT, safe_error_message TEXT CHECK(safe_error_message IS NULL OR length(safe_error_message)<=256), completed_after_cancel BOOLEAN NOT NULL DEFAULT FALSE,
         created_at_ms BIGINT NOT NULL CHECK(created_at_ms>=0), updated_at_ms BIGINT NOT NULL CHECK(updated_at_ms>=0), finished_at_ms BIGINT CHECK(finished_at_ms IS NULL OR finished_at_ms>=0),
         CHECK((lease_owner IS NULL AND lease_expires_at_ms IS NULL) OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL)),
+        CHECK((state='LEASED' AND lease_owner IS NOT NULL AND lease_expires_at_ms > updated_at_ms AND pair_fence_token IS NOT NULL AND dispatch_attempt_id IS NULL AND request_id IS NULL) OR
+              (state='DISPATCHING' AND lease_owner IS NOT NULL AND lease_expires_at_ms > updated_at_ms AND pair_fence_token IS NOT NULL AND dispatch_attempt_id IS NOT NULL AND length(dispatch_attempt_id)>0 AND request_id IS NULL) OR
+              (state='IN_FLIGHT' AND lease_owner IS NOT NULL AND lease_expires_at_ms > updated_at_ms AND pair_fence_token IS NOT NULL AND dispatch_attempt_id IS NOT NULL AND length(dispatch_attempt_id)>0 AND request_id IS NOT NULL AND length(request_id)>0) OR
+              (state IN ('QUEUED','RETRY_WAIT','SUCCEEDED','FAILED','CANCELLED') AND lease_owner IS NULL AND lease_expires_at_ms IS NULL AND pair_fence_token IS NULL AND dispatch_attempt_id IS NULL AND request_id IS NULL)),
+        CHECK((safe_error_code IS NULL AND safe_error_message IS NULL) OR
+              (safe_error_code='PROXY_CONNECT_TIMEOUT' AND (safe_error_message IS NULL OR safe_error_message='Proxy connection timed out')) OR
+              (safe_error_code='NETWORK_DNS_FAILED' AND (safe_error_message IS NULL OR safe_error_message='DNS resolution failed')) OR
+              (safe_error_code='PROXY_AUTH_FAILED' AND (safe_error_message IS NULL OR safe_error_message='Proxy authentication failed')) OR
+              (safe_error_code='UPSTREAM_UNAVAILABLE' AND (safe_error_message IS NULL OR safe_error_message='Upstream service unavailable')) OR
+              (safe_error_code='PAIR_LEASE_BUSY' AND (safe_error_message IS NULL OR safe_error_message='Relay pair is busy')) OR
+              (safe_error_code='TRANSITION_CONFLICT' AND (safe_error_message IS NULL OR safe_error_message='State transition conflicted')) OR
+              (safe_error_code='REQUEST_CANCELLED' AND (safe_error_message IS NULL OR safe_error_message='Health check was cancelled'))),
+        CHECK(state IN ('RETRY_WAIT','FAILED') OR (safe_error_code IS NULL AND safe_error_message IS NULL)),
         CHECK((state IN ('SUCCEEDED','FAILED','CANCELLED') AND finished_at_ms IS NOT NULL) OR (state IN ('QUEUED','LEASED','DISPATCHING','IN_FLIGHT','RETRY_WAIT') AND finished_at_ms IS NULL)),
         UNIQUE(job_id,resource_id_snapshot,relay_node_id_snapshot)
     )"#,
@@ -204,7 +252,7 @@ pub const POSTGRES_MIGRATION_35: [&str; 15] = [
         resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE, relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
         item_id BIGINT REFERENCES socks5_check_job_items(id) ON DELETE SET NULL, lease_owner TEXT, lease_expires_at_ms BIGINT CHECK(lease_expires_at_ms IS NULL OR lease_expires_at_ms>=0),
         pair_fence_token BIGINT NOT NULL DEFAULT 0 CHECK(pair_fence_token>=0), updated_at_ms BIGINT NOT NULL CHECK(updated_at_ms>=0), PRIMARY KEY(resource_id,relay_node_id),
-        CHECK((lease_owner IS NULL AND lease_expires_at_ms IS NULL) OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL))
+        CHECK((lease_owner IS NULL AND lease_expires_at_ms IS NULL) OR (lease_owner IS NOT NULL AND lease_expires_at_ms > updated_at_ms))
     )"#,
     r#"CREATE TABLE socks5_health_job_idempotency (
         actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, idempotency_key TEXT NOT NULL CHECK(length(idempotency_key)>0),

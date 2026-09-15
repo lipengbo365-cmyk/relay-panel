@@ -1,11 +1,12 @@
 use super::SqliteRepository;
 use crate::db::error::DbError;
 use crate::db::health_orchestration::{
-    safe_error_message, ConditionalWriteOutcome, HealthCounterCategory, HealthItemTransition,
-    HealthJobCreateOutcome, HealthJobIdempotencyOutcome, HealthJobItemRecord, HealthJobRecord,
-    HealthPairLeaseRecord, HealthPolicyPatch, HealthPolicyRecord, NewHealthJob,
-    NewHealthJobIdempotency, NewHealthJobItem, NewHealthPolicy, PairLeaseAcquireOutcome,
-    PairLeaseAcquireRequest, HEALTH_RETRY_POLICY_VERSION,
+    safe_error_message, validate_health_item_transition_fields, ConditionalWriteOutcome,
+    HealthCounterCategory, HealthItemTransition, HealthJobCreateOutcome,
+    HealthJobIdempotencyOutcome, HealthJobItemRecord, HealthJobRecord, HealthPairLeaseRecord,
+    HealthPolicyPatch, HealthPolicyRecord, NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem,
+    NewHealthPolicy, PairLeaseAcquireOutcome, PairLeaseAcquireRequest, HEALTH_RETRY_POLICY_VERSION,
+    PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS,
 };
 use crate::db::repo::HealthOrchestrationRepository;
 use async_trait::async_trait;
@@ -30,6 +31,17 @@ async fn insert_job(
 ) -> Result<(), DbError> {
     if items.is_empty() {
         return Err(DbError::ConstraintViolation);
+    }
+    if let Some(policy_id) = job.policy_id {
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM socks5_check_policies WHERE id=? AND deleted_at_ms IS NULL)",
+        )
+        .bind(policy_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !active {
+            return Err(DbError::NotFound);
+        }
     }
     let total = i64::try_from(items.len()).map_err(|_| DbError::ConstraintViolation)?;
     sqlx::query(
@@ -180,12 +192,12 @@ impl HealthOrchestrationRepository for SqliteRepository {
     }
 
     async fn find_health_policy(&self, id: i64) -> Result<Option<HealthPolicyRecord>, DbError> {
-        Ok(
-            sqlx::query_as("SELECT * FROM socks5_check_policies WHERE id=?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?,
+        Ok(sqlx::query_as(
+            "SELECT * FROM socks5_check_policies WHERE id=? AND deleted_at_ms IS NULL",
         )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     async fn update_health_policy(
@@ -200,14 +212,14 @@ impl HealthOrchestrationRepository for SqliteRepository {
              resource_selector_json=COALESCE(?,resource_selector_json),node_selector_json=COALESCE(?,node_selector_json),
              interval_seconds=COALESCE(?,interval_seconds),jitter_seconds=COALESCE(?,jitter_seconds),
              max_items=COALESCE(?,max_items),next_run_at_ms=COALESCE(?,next_run_at_ms),
-             revision=revision+1,updated_at_ms=? WHERE id=? AND revision=?"
+             revision=revision+1,updated_at_ms=? WHERE id=? AND revision=? AND deleted_at_ms IS NULL"
         ).bind(&patch.name).bind(patch.enabled).bind(&patch.resource_selector_json)
         .bind(&patch.node_selector_json).bind(patch.interval_seconds).bind(patch.jitter_seconds)
         .bind(patch.max_items).bind(patch.next_run_at_ms).bind(now_ms).bind(id).bind(expected_revision)
         .execute(&self.pool).await?;
         if result.rows_affected() == 0 {
             let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM socks5_check_policies WHERE id=?)")
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM socks5_check_policies WHERE id=? AND deleted_at_ms IS NULL)")
                     .bind(id)
                     .fetch_one(&self.pool)
                     .await?;
@@ -334,7 +346,14 @@ impl HealthOrchestrationRepository for SqliteRepository {
         &self,
         t: &HealthItemTransition,
     ) -> Result<ConditionalWriteOutcome, DbError> {
-        if !t.expected_state.can_transition_to(t.new_state) {
+        let message = safe_error_message(
+            t.safe_error_code.as_deref(),
+            t.safe_error_message.as_deref(),
+        )
+        .map_err(|()| DbError::ConstraintViolation)?;
+        if !t.expected_state.can_transition_to(t.new_state)
+            || !validate_health_item_transition_fields(t)
+        {
             return Err(DbError::InvalidTransition);
         }
         let mut conn = begin_immediate(&self.pool).await?;
@@ -354,7 +373,6 @@ impl HealthOrchestrationRepository for SqliteRepository {
         }
         let old = t.expected_state.counter_category();
         let new = t.new_state.counter_category();
-        let message = safe_error_message(t.safe_error_message.as_deref());
         let terminal = t.new_state.is_terminal();
         sqlx::query("UPDATE socks5_check_job_items SET state=?,item_fence_token=item_fence_token+1,lease_owner=?,lease_expires_at_ms=?,pair_fence_token=?,dispatch_attempt_id=?,request_id=?,not_before_ms=COALESCE(?,not_before_ms),first_started_at_ms=CASE WHEN ?='LEASED' THEN COALESCE(first_started_at_ms,?) ELSE first_started_at_ms END,last_started_at_ms=CASE WHEN ?='LEASED' THEN ? ELSE last_started_at_ms END,health_status=?,safe_error_code=?,safe_error_message=?,completed_after_cancel=?,updated_at_ms=?,finished_at_ms=? WHERE id=? AND state=? AND item_fence_token=?")
             .bind(t.new_state.as_str()).bind(&t.lease_owner).bind(t.lease_expires_at_ms).bind(t.pair_fence_token).bind(&t.dispatch_attempt_id).bind(&t.request_id).bind(t.not_before_ms)
@@ -367,6 +385,9 @@ impl HealthOrchestrationRepository for SqliteRepository {
                 .bind(&job_id)
                 .execute(&mut *conn)
                 .await?;
+        }
+        if terminal {
+            aggregate_and_finalize(&mut conn, &job_id, t.now_ms).await?;
         }
         sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(ConditionalWriteOutcome::Applied)
@@ -396,7 +417,7 @@ impl HealthOrchestrationRepository for SqliteRepository {
         .bind(job_id)
         .execute(&mut *conn)
         .await?;
-        sqlx::query("UPDATE socks5_check_job_items SET state='CANCELLED',lease_owner=NULL,lease_expires_at_ms=NULL,finished_at_ms=?,updated_at_ms=? WHERE job_id=? AND state IN ('QUEUED','RETRY_WAIT')")
+        sqlx::query("UPDATE socks5_check_job_items SET state='CANCELLED',lease_owner=NULL,lease_expires_at_ms=NULL,pair_fence_token=NULL,dispatch_attempt_id=NULL,request_id=NULL,finished_at_ms=?,updated_at_ms=? WHERE job_id=? AND state IN ('QUEUED','RETRY_WAIT')")
             .bind(now_ms).bind(now_ms).bind(job_id).execute(&mut *conn).await?;
         aggregate_and_finalize(&mut conn, job_id, now_ms).await?;
         sqlx::query("COMMIT").execute(&mut *conn).await?;
@@ -433,7 +454,35 @@ impl HealthOrchestrationRepository for SqliteRepository {
         &self,
         r: PairLeaseAcquireRequest<'_>,
     ) -> Result<PairLeaseAcquireOutcome, DbError> {
+        if r.resource_id <= 0
+            || r.relay_node_id <= 0
+            || r.item_id <= 0
+            || r.lease_owner.is_empty()
+            || r.lease_expires_at_ms <= r.now_ms
+        {
+            return Err(DbError::ConstraintViolation);
+        }
         let mut conn = begin_immediate(&self.pool).await?;
+        let item: Option<(i64, i64, String)> = sqlx::query_as(
+            "SELECT resource_id_snapshot,relay_node_id_snapshot,state FROM socks5_check_job_items WHERE id=?",
+        )
+        .bind(r.item_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((resource_snapshot, node_snapshot, state)) = item else {
+            rollback(&mut conn).await;
+            return Err(DbError::NotFound);
+        };
+        if resource_snapshot != r.resource_id
+            || node_snapshot != r.relay_node_id
+            || !matches!(
+                state.as_str(),
+                "QUEUED" | "LEASED" | "DISPATCHING" | "IN_FLIGHT" | "RETRY_WAIT"
+            )
+        {
+            rollback(&mut conn).await;
+            return Err(DbError::InvalidTransition);
+        }
         let row:Option<(Option<String>,Option<i64>,i64)>=sqlx::query_as("SELECT lease_owner,lease_expires_at_ms,pair_fence_token FROM socks5_check_pair_leases WHERE resource_id=? AND relay_node_id=?").bind(r.resource_id).bind(r.relay_node_id).fetch_optional(&mut *conn).await?;
         let token = match row {
             None => {
@@ -468,6 +517,9 @@ impl HealthOrchestrationRepository for SqliteRepository {
         lease_expires_at_ms: i64,
         now_ms: i64,
     ) -> Result<ConditionalWriteOutcome, DbError> {
+        if lease_owner.is_empty() || lease_expires_at_ms <= now_ms {
+            return Err(DbError::ConstraintViolation);
+        }
         let result=sqlx::query("UPDATE socks5_check_pair_leases SET lease_expires_at_ms=?,updated_at_ms=? WHERE resource_id=? AND relay_node_id=? AND item_id=? AND lease_owner=? AND pair_fence_token=?").bind(lease_expires_at_ms).bind(now_ms).bind(resource_id).bind(relay_node_id).bind(item_id).bind(lease_owner).bind(expected_pair_fence).execute(&self.pool).await?;
         Ok(if result.rows_affected() == 1 {
             ConditionalWriteOutcome::Applied
@@ -534,9 +586,12 @@ impl HealthOrchestrationRepository for SqliteRepository {
         limit: i64,
     ) -> Result<Vec<(i64, i64)>, DbError> {
         Ok(sqlx::query_as(
-            "SELECT resource_id,relay_node_id FROM socks5_check_pair_leases
-             WHERE lease_owner IS NULL AND item_id IS NULL AND updated_at_ms < ?
-             ORDER BY updated_at_ms,resource_id,relay_node_id LIMIT ?",
+            "SELECT l.resource_id,l.relay_node_id FROM socks5_check_pair_leases l
+             WHERE l.lease_owner IS NULL AND l.item_id IS NULL AND l.updated_at_ms < ?
+               AND NOT EXISTS (SELECT 1 FROM socks5_check_job_items i
+                   WHERE i.resource_id_snapshot=l.resource_id AND i.relay_node_id_snapshot=l.relay_node_id
+                     AND i.state IN ('QUEUED','LEASED','DISPATCHING','IN_FLIGHT','RETRY_WAIT'))
+             ORDER BY l.updated_at_ms,l.resource_id,l.relay_node_id LIMIT ?",
         )
         .bind(cutoff_ms)
         .bind(limit.clamp(0, 1000))
@@ -549,7 +604,7 @@ impl HealthOrchestrationRepository for SqliteRepository {
         cutoff_ms: i64,
         limit: i64,
     ) -> Result<u64, DbError> {
-        let result=sqlx::query("DELETE FROM socks5_check_pair_leases WHERE rowid IN (SELECT rowid FROM socks5_check_pair_leases WHERE lease_owner IS NULL AND item_id IS NULL AND updated_at_ms < ? ORDER BY updated_at_ms LIMIT ?)").bind(cutoff_ms).bind(limit.clamp(0,1000)).execute(&self.pool).await?;
+        let result=sqlx::query("UPDATE socks5_check_pair_leases SET updated_at_ms=? WHERE rowid IN (SELECT l.rowid FROM socks5_check_pair_leases l WHERE l.lease_owner IS NULL AND l.item_id IS NULL AND l.updated_at_ms < ? AND NOT EXISTS (SELECT 1 FROM socks5_check_job_items i WHERE i.resource_id_snapshot=l.resource_id AND i.relay_node_id_snapshot=l.relay_node_id AND i.state IN ('QUEUED','LEASED','DISPATCHING','IN_FLIGHT','RETRY_WAIT')) ORDER BY l.updated_at_ms LIMIT ?) AND lease_owner IS NULL AND item_id IS NULL AND NOT EXISTS (SELECT 1 FROM socks5_check_job_items i WHERE i.resource_id_snapshot=socks5_check_pair_leases.resource_id AND i.relay_node_id_snapshot=socks5_check_pair_leases.relay_node_id AND i.state IN ('QUEUED','LEASED','DISPATCHING','IN_FLIGHT','RETRY_WAIT'))").bind(PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS).bind(cutoff_ms).bind(limit.clamp(0,1000)).execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
     async fn prune_expired_health_job_idempotency(
@@ -644,6 +699,10 @@ mod tests {
                 | HealthJobItemState::Dispatching
                 | HealthJobItemState::InFlight
         );
+        let dispatching = matches!(
+            to,
+            HealthJobItemState::Dispatching | HealthJobItemState::InFlight
+        );
         HealthItemTransition {
             item_id,
             expected_state: from,
@@ -651,9 +710,9 @@ mod tests {
             new_state: to,
             lease_owner: running.then(|| "worker-1".into()),
             lease_expires_at_ms: running.then_some(now_ms + 1_000),
-            pair_fence_token: None,
-            dispatch_attempt_id: None,
-            request_id: None,
+            pair_fence_token: running.then_some(1),
+            dispatch_attempt_id: dispatching.then(|| "dispatch-1".into()),
+            request_id: (to == HealthJobItemState::InFlight).then(|| "request-1".into()),
             not_before_ms: None,
             health_status: None,
             safe_error_code: None,
@@ -698,6 +757,17 @@ mod tests {
             repo.update_health_policy(id, 1, &HealthPolicyPatch::default(), 3)
                 .await,
             Err(DbError::RevisionConflict)
+        ));
+        sqlx::query("UPDATE socks5_check_policies SET deleted_at_ms=4 WHERE id=?")
+            .bind(id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        assert!(repo.find_health_policy(id).await.unwrap().is_none());
+        assert!(matches!(
+            repo.update_health_policy(id, 2, &HealthPolicyPatch::default(), 5)
+                .await,
+            Err(DbError::NotFound)
         ));
         let invalid = repo
             .create_health_policy(&NewHealthPolicy {
@@ -792,6 +862,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_item_state_fields_and_safe_errors_are_fail_closed() {
+        let (repo, resource, node) = fixture().await;
+        let (job, items) = job("job-state-fields", resource, node, None);
+        repo.create_health_job(&job, &items).await.unwrap();
+        let item = repo.list_health_job_items(&job.id).await.unwrap().remove(0);
+
+        let mut invalid = transition(
+            item.id,
+            HealthJobItemState::Queued,
+            0,
+            HealthJobItemState::Leased,
+            2_000,
+        );
+        invalid.lease_owner = None;
+        assert!(matches!(
+            repo.transition_health_job_item(&invalid).await,
+            Err(DbError::InvalidTransition)
+        ));
+
+        let mut secret = transition(
+            item.id,
+            HealthJobItemState::Queued,
+            0,
+            HealthJobItemState::Leased,
+            2_000,
+        );
+        secret.safe_error_code = Some("RAW_UPSTREAM_ERROR".into());
+        secret.safe_error_message = Some("socks5://user:password@proxy:1080".into());
+        assert!(matches!(
+            repo.transition_health_job_item(&secret).await,
+            Err(DbError::ConstraintViolation)
+        ));
+
+        assert!(sqlx::query(
+            "UPDATE socks5_check_job_items SET state='LEASED',updated_at_ms=2000 WHERE id=?",
+        )
+        .bind(item.id)
+        .execute(&repo.pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE socks5_check_job_items SET state='SUCCEEDED',lease_owner='stale',lease_expires_at_ms=3000,finished_at_ms=2000,updated_at_ms=2000 WHERE id=?",
+        )
+        .bind(item.id)
+        .execute(&repo.pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE socks5_check_job_items SET safe_error_code='PROXY_CONNECT_TIMEOUT',safe_error_message='socks5://user:password@proxy:1080' WHERE id=?",
+        )
+        .bind(item.id)
+        .execute(&repo.pool)
+        .await
+        .is_err());
+        sqlx::query(
+            "UPDATE socks5_check_job_items SET state='FAILED',finished_at_ms=2000,updated_at_ms=2000,safe_error_code='PROXY_CONNECT_TIMEOUT',safe_error_message='Proxy connection timed out' WHERE id=?",
+        )
+        .bind(item.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn health_job_cancel_and_retry_failed_snapshot_are_persistent() {
         let (repo, resource, node) = fixture().await;
         let (mut parent, items) = job("job-parent", resource, node, None);
@@ -854,9 +988,13 @@ mod tests {
     #[tokio::test]
     async fn health_pair_lease_wait_fencing_and_prune_contract() {
         let (repo, resource, node) = fixture().await;
-        let (job, items) = job("job-lease", resource, node, None);
-        repo.create_health_job(&job, &items).await.unwrap();
-        let item = repo.list_health_job_items(&job.id).await.unwrap().remove(0);
+        let (lease_job, items) = job("job-lease", resource, node, None);
+        repo.create_health_job(&lease_job, &items).await.unwrap();
+        let item = repo
+            .list_health_job_items(&lease_job.id)
+            .await
+            .unwrap()
+            .remove(0);
         let acquired = repo
             .acquire_health_pair_lease(PairLeaseAcquireRequest {
                 resource_id: resource,
@@ -903,6 +1041,19 @@ mod tests {
             repo.list_released_health_pair_lease_prune_candidates(1_800, 1000)
                 .await
                 .unwrap(),
+            Vec::<(i64, i64)>::new()
+        );
+        assert_eq!(
+            repo.prune_released_health_pair_leases(1_800, 1000)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(repo.cancel_health_job(&lease_job.id, 1_750).await.unwrap());
+        assert_eq!(
+            repo.list_released_health_pair_lease_prune_candidates(1_800, 1000)
+                .await
+                .unwrap(),
             vec![(resource, node)]
         );
         assert_eq!(
@@ -911,6 +1062,62 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert!(repo
+            .find_health_pair_lease(resource, node)
+            .await
+            .unwrap()
+            .is_some());
+
+        let (next_job, next_items) = job("job-lease-next", resource, node, None);
+        repo.create_health_job(&next_job, &next_items)
+            .await
+            .unwrap();
+        let next_item = repo
+            .list_health_job_items(&next_job.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            repo.acquire_health_pair_lease(PairLeaseAcquireRequest {
+                resource_id: resource,
+                relay_node_id: node,
+                item_id: next_item.id,
+                lease_owner: "w2",
+                lease_expires_at_ms: 4_000,
+                now_ms: 3_000,
+            })
+            .await
+            .unwrap(),
+            PairLeaseAcquireOutcome::Acquired {
+                pair_fence_token: 2
+            }
+        );
+        assert_eq!(
+            repo.release_health_pair_lease(resource, node, item.id, "w1", 1, 3_100)
+                .await
+                .unwrap(),
+            ConditionalWriteOutcome::ConditionFailed
+        );
+
+        let wrong_resource = sqlx::query(
+            "INSERT INTO socks5_resources(name,host,port) VALUES('wrong-pair','127.0.0.2',1081)",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        assert!(matches!(
+            repo.acquire_health_pair_lease(PairLeaseAcquireRequest {
+                resource_id: wrong_resource,
+                relay_node_id: node,
+                item_id: next_item.id,
+                lease_owner: "wrong",
+                lease_expires_at_ms: 5_000,
+                now_ms: 4_000,
+            })
+            .await,
+            Err(DbError::InvalidTransition)
+        ));
     }
 
     #[tokio::test]

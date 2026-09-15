@@ -14,6 +14,17 @@ pub const HEALTH_JOB_CONTRACT_VERSION: &str = "stage5-health-job-v1";
 pub const HEALTH_RETRY_POLICY_VERSION: &str = "v1";
 pub const IDEMPOTENCY_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub const SAFE_ERROR_MESSAGE_MAX_CHARS: usize = 256;
+pub const PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS: i64 = i64::MAX;
+
+const SAFE_ERROR_MESSAGES: [(&str, &str); 7] = [
+    ("PROXY_CONNECT_TIMEOUT", "Proxy connection timed out"),
+    ("NETWORK_DNS_FAILED", "DNS resolution failed"),
+    ("PROXY_AUTH_FAILED", "Proxy authentication failed"),
+    ("UPSTREAM_UNAVAILABLE", "Upstream service unavailable"),
+    ("PAIR_LEASE_BUSY", "Relay pair is busy"),
+    ("TRANSITION_CONFLICT", "State transition conflicted"),
+    ("REQUEST_CANCELLED", "Health check was cancelled"),
+];
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -523,8 +534,72 @@ pub struct PairLeaseAcquireRequest<'a> {
     pub now_ms: i64,
 }
 
-pub fn safe_error_message(value: Option<&str>) -> Option<String> {
-    value.map(|message| message.chars().take(SAFE_ERROR_MESSAGE_MAX_CHARS).collect())
+pub fn validate_health_item_transition_fields(transition: &HealthItemTransition) -> bool {
+    let has_lease = transition
+        .lease_owner
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        && transition
+            .lease_expires_at_ms
+            .is_some_and(|value| value > transition.now_ms)
+        && transition.pair_fence_token.is_some_and(|value| value >= 0);
+    let no_lease = transition.lease_owner.is_none()
+        && transition.lease_expires_at_ms.is_none()
+        && transition.pair_fence_token.is_none();
+    let has_dispatch = transition
+        .dispatch_attempt_id
+        .as_deref()
+        .is_some_and(|value| !value.is_empty());
+    let has_request = transition
+        .request_id
+        .as_deref()
+        .is_some_and(|value| !value.is_empty());
+
+    let state_fields_valid = match transition.new_state {
+        HealthJobItemState::Leased => has_lease && !has_dispatch && !has_request,
+        HealthJobItemState::Dispatching => has_lease && has_dispatch && !has_request,
+        HealthJobItemState::InFlight => has_lease && has_dispatch && has_request,
+        HealthJobItemState::Queued
+        | HealthJobItemState::RetryWait
+        | HealthJobItemState::Succeeded
+        | HealthJobItemState::Failed
+        | HealthJobItemState::Cancelled => no_lease && !has_dispatch && !has_request,
+    };
+    let error_fields_valid = matches!(
+        transition.new_state,
+        HealthJobItemState::RetryWait | HealthJobItemState::Failed
+    ) || (transition.safe_error_code.is_none()
+        && transition.safe_error_message.is_none());
+    state_fields_valid && error_fields_valid
+}
+
+pub fn safe_error_message(
+    error_code: Option<&str>,
+    requested_message: Option<&str>,
+) -> Result<Option<String>, ()> {
+    let Some(code) = error_code else {
+        return if requested_message.is_none() {
+            Ok(None)
+        } else {
+            Err(())
+        };
+    };
+    let Some((_, canonical)) = SAFE_ERROR_MESSAGES
+        .iter()
+        .find(|(allowed_code, _)| *allowed_code == code)
+    else {
+        return Err(());
+    };
+    match requested_message {
+        None => Ok(None),
+        Some(message) if message == *canonical => Ok(Some(
+            canonical
+                .chars()
+                .take(SAFE_ERROR_MESSAGE_MAX_CHARS)
+                .collect(),
+        )),
+        Some(_) => Err(()),
+    }
 }
 
 #[cfg(test)]
@@ -580,5 +655,35 @@ mod tests {
         let second = snapshot_hash(&[(1, 3), (2, 4)]);
         assert_eq!(first, second);
         assert_ne!(first, snapshot_hash(&[(1, 3), (2, 5)]));
+    }
+
+    #[test]
+    fn safe_error_contract_only_accepts_canonical_allowlisted_messages() {
+        assert_eq!(
+            safe_error_message(
+                Some("PROXY_CONNECT_TIMEOUT"),
+                Some("Proxy connection timed out")
+            ),
+            Ok(Some("Proxy connection timed out".into()))
+        );
+        assert_eq!(safe_error_message(None, None), Ok(None));
+        for secret in [
+            "socks5://user:password@host:1080",
+            "password=hunter2",
+            "passwd=secret",
+            "Authorization: Bearer abc.def.ghi",
+            "Cookie: session=secret",
+            "token=secret",
+            "混合文本 secret=秘密 🔐",
+        ] {
+            assert!(safe_error_message(Some("PROXY_CONNECT_TIMEOUT"), Some(secret)).is_err());
+        }
+        assert!(safe_error_message(Some("UNKNOWN"), None).is_err());
+        assert!(safe_error_message(None, Some(&"🙂".repeat(300))).is_err());
+        assert!(safe_error_message(
+            Some("NETWORK_DNS_FAILED"),
+            Some(&"a".repeat(SAFE_ERROR_MESSAGE_MAX_CHARS + 1))
+        )
+        .is_err());
     }
 }
