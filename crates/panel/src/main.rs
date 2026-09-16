@@ -111,8 +111,9 @@ async fn main() {
         )),
     };
 
-    let health_worker_config = service::health_worker::HealthWorkerConfig::load()
-        .expect("invalid durable health worker configuration");
+    let health_worker_config =
+        service::health_worker::HealthWorkerConfig::load(&config.database_path)
+            .expect("invalid durable health worker configuration");
     service::health_worker::spawn(state.clone(), health_worker_config);
 
     // v1.2.0: scheduled rule restarts. Shares the AppState (and therefore the

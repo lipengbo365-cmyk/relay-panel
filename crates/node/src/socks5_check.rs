@@ -4,9 +4,10 @@ use crate::config::NodeConfig;
 use relay_shared::protocol::{
     Socks5CheckRequest, Socks5CheckResult, Socks5CheckStage, Socks5HealthStatus,
 };
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -28,6 +29,41 @@ pub struct Socks5CheckRuntime {
     semaphore: Arc<Semaphore>,
     waiting: Arc<AtomicUsize>,
     queue_limit: usize,
+    active_resources: Arc<StdMutex<HashSet<i64>>>,
+}
+
+struct ActiveResourceGuard {
+    resource_id: i64,
+    active_resources: Arc<StdMutex<HashSet<i64>>>,
+}
+
+impl ActiveResourceGuard {
+    fn try_acquire(
+        active_resources: Arc<StdMutex<HashSet<i64>>>,
+        resource_id: i64,
+    ) -> Option<Self> {
+        let inserted = active_resources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(resource_id);
+        if inserted {
+            Some(Self {
+                resource_id,
+                active_resources,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ActiveResourceGuard {
+    fn drop(&mut self) {
+        self.active_resources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.resource_id);
+    }
 }
 
 impl Socks5CheckRuntime {
@@ -36,6 +72,7 @@ impl Socks5CheckRuntime {
             semaphore: Arc::new(Semaphore::new(concurrency.max(1))),
             waiting: Arc::new(AtomicUsize::new(0)),
             queue_limit: queue_limit.max(1),
+            active_resources: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -65,9 +102,30 @@ impl Socks5CheckRuntime {
             );
             return;
         }
+        // The Panel result timeout only bounds Panel ownership; it does not
+        // cancel an operation already running on this process. This guard is
+        // therefore the final same-(resource, physical-node) invariant across
+        // Panel timeout, disconnect and restart. It deliberately contains only
+        // the non-secret resource identity and removes the key on every exit.
+        let Some(resource_guard) =
+            ActiveResourceGuard::try_acquire(self.active_resources.clone(), request.resource_id)
+        else {
+            let result = failure_result(
+                &request,
+                &local_node_id,
+                Socks5HealthStatus::Unknown,
+                None,
+                "NODE_BUSY",
+                "SOCKS5 resource check is already active",
+                Instant::now(),
+            );
+            report(&config, &result, &node_identity_secret).await;
+            return;
+        };
         if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
             tokio::spawn(async move {
                 let _permit = permit;
+                let _resource_guard = resource_guard;
                 let result = execute_check(&request, &local_node_id).await;
                 report(&config, &result, &node_identity_secret).await;
             });
@@ -78,6 +136,7 @@ impl Socks5CheckRuntime {
         // the configured waiting queue, so concurrency=4, queue=20 really
         // means 4 running + 20 queued (not 4 running + 16 queued).
         if !self.try_enqueue() {
+            drop(resource_guard);
             let result = failure_result(
                 &request,
                 &local_node_id,
@@ -96,6 +155,7 @@ impl Socks5CheckRuntime {
 
         let runtime = self.clone();
         tokio::spawn(async move {
+            let _resource_guard = resource_guard;
             let permit = runtime.semaphore.clone().acquire_owned().await;
             runtime.waiting.fetch_sub(1, Ordering::AcqRel);
             let Ok(_permit) = permit else {
@@ -1159,5 +1219,80 @@ mod tests {
             assert_eq!(busy, 976, "profile={profile}");
             assert_eq!(runtime.queue_depth(), 20, "profile={profile}");
         }
+    }
+
+    #[test]
+    fn node_pair_guard_serializes_same_resource_and_allows_different_resources() {
+        let active = Arc::new(StdMutex::new(HashSet::new()));
+        let first = ActiveResourceGuard::try_acquire(active.clone(), 7).unwrap();
+        assert!(ActiveResourceGuard::try_acquire(active.clone(), 7).is_none());
+        let different = ActiveResourceGuard::try_acquire(active.clone(), 8).unwrap();
+        assert_eq!(active.lock().unwrap().len(), 2);
+        drop(first);
+        assert!(ActiveResourceGuard::try_acquire(active.clone(), 7).is_some());
+        drop(different);
+    }
+
+    #[test]
+    fn node_pair_guard_admits_only_one_of_one_hundred_simultaneous_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        let active_resources = Arc::new(StdMutex::new(HashSet::new()));
+        let start = Arc::new(Barrier::new(101));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let active_network = Arc::new(AtomicUsize::new(0));
+        let max_active_network = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..100 {
+            let active_resources = active_resources.clone();
+            let start = start.clone();
+            let admitted = admitted.clone();
+            let active_network = active_network.clone();
+            let max_active_network = max_active_network.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let Some(_guard) = ActiveResourceGuard::try_acquire(active_resources, 7) else {
+                    return;
+                };
+                admitted.fetch_add(1, Ordering::SeqCst);
+                let current = active_network.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active_network.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(25));
+                active_network.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        start.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+        assert_eq!(max_active_network.load(Ordering::SeqCst), 1);
+        assert!(active_resources.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn node_pair_guard_outlives_panel_timeout_crash_and_restart() {
+        let active = Arc::new(StdMutex::new(HashSet::new()));
+
+        // The first guard represents an operation still owned by the Node after
+        // the dispatching Panel timed out or disappeared. A replacement Panel
+        // cannot start the same resource while that Node operation is alive.
+        let old_node_operation = ActiveResourceGuard::try_acquire(active.clone(), 41).unwrap();
+        assert!(ActiveResourceGuard::try_acquire(active.clone(), 41).is_none());
+
+        // Only completion/abort of the Node operation releases the hard guard.
+        drop(old_node_operation);
+        assert!(ActiveResourceGuard::try_acquire(active.clone(), 41).is_some());
+    }
+
+    #[test]
+    fn node_pair_guard_does_not_retain_completed_resource_keys() {
+        let active = Arc::new(StdMutex::new(HashSet::new()));
+        for resource_id in 1..=10_000 {
+            let guard = ActiveResourceGuard::try_acquire(active.clone(), resource_id).unwrap();
+            drop(guard);
+        }
+        assert!(active.lock().unwrap().is_empty());
     }
 }

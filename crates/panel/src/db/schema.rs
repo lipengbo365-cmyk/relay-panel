@@ -2285,12 +2285,17 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     // ── Migration 51: Stage 5.1 durable health orchestration persistence ──
     migrate_sqlite_health_orchestration(pool).await?;
 
+    // ── Migration 52: independent durable orchestration retry counter ──
+    migrate_sqlite_health_retry_count(pool).await?;
+
     Ok(())
 }
 
 async fn validate_sqlite_health_schema(
     conn: &mut sqlx::SqliteConnection,
+    retry_count_present: bool,
 ) -> Result<(), sqlx::Error> {
+    let migration = if retry_count_present { 52 } else { 51 };
     for table in crate::db::health_schema::HEALTH_TABLES {
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
@@ -2299,7 +2304,7 @@ async fn validate_sqlite_health_schema(
                 .await?;
         if count != 1 {
             return Err(sqlx::Error::Protocol(format!(
-                "SQLite migration 51 version/schema mismatch: missing {table}"
+                "SQLite migration {migration} version/schema mismatch: missing {table}"
             )));
         }
     }
@@ -2313,13 +2318,22 @@ async fn validate_sqlite_health_schema(
                 .fetch_optional(&mut *conn)
                 .await?
                 .flatten();
+        let expected = if retry_count_present && table == "socks5_check_job_items" {
+            expected.replacen(
+                "        CHECK((lease_owner IS NULL",
+                "        retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0),\n        CHECK((lease_owner IS NULL",
+                1,
+            )
+        } else {
+            (*expected).to_owned()
+        };
         if actual
             .as_deref()
             .map(crate::db::health_schema::normalize_schema_sql)
-            != Some(crate::db::health_schema::normalize_schema_sql(expected))
+            != Some(crate::db::health_schema::normalize_schema_sql(&expected))
         {
             return Err(sqlx::Error::Protocol(format!(
-                "SQLite migration 51 version/schema mismatch: {table} table manifest differs"
+                "SQLite migration {migration} version/schema mismatch: {table} table manifest differs"
             )));
         }
     }
@@ -2339,7 +2353,7 @@ async fn validate_sqlite_health_schema(
             != Some(crate::db::health_schema::normalize_schema_sql(expected))
         {
             return Err(sqlx::Error::Protocol(format!(
-                "SQLite migration 51 version/schema mismatch: {index} index manifest differs"
+                "SQLite migration {migration} version/schema mismatch: {index} index manifest differs"
             )));
         }
     }
@@ -2362,9 +2376,11 @@ async fn migrate_sqlite_health_orchestration(pool: &sqlx::SqlitePool) -> Result<
     let current: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version),0) FROM schema_version")
         .fetch_one(pool)
         .await?;
-    if current >= VERSION {
+    if current == VERSION {
         let mut conn = pool.acquire().await?;
-        return validate_sqlite_health_schema(&mut conn).await;
+        return validate_sqlite_health_schema(&mut conn, false).await;
+    } else if current > VERSION {
+        return Ok(());
     }
 
     let existing: i64 = sqlx::query_scalar(
@@ -2390,7 +2406,7 @@ async fn migrate_sqlite_health_orchestration(pool: &sqlx::SqlitePool) -> Result<
             .bind(VERSION)
             .execute(&mut *conn)
             .await?;
-        validate_sqlite_health_schema(&mut conn).await?;
+        validate_sqlite_health_schema(&mut conn, false).await?;
         sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok::<(), sqlx::Error>(())
     }
@@ -2400,6 +2416,77 @@ async fn migrate_sqlite_health_orchestration(pool: &sqlx::SqlitePool) -> Result<
     }
     migration?;
     tracing::info!("Migration 51: durable health orchestration persistence present");
+    Ok(())
+}
+
+async fn validate_sqlite_health_retry_count(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    let row: Option<(String, i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT name,\"notnull\",dflt_value,pk FROM pragma_table_info('socks5_check_job_items') WHERE name='retry_count'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if row != Some(("retry_count".into(), 1, Some("0".into()), 0)) {
+        return Err(sqlx::Error::Protocol(
+            "SQLite migration 52 version/schema mismatch: retry_count column differs".into(),
+        ));
+    }
+    let table_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='socks5_check_job_items'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .flatten();
+    let normalized = table_sql
+        .as_deref()
+        .map(crate::db::health_schema::normalize_schema_sql)
+        .unwrap_or_default();
+    if !normalized.contains("retry_countintegernotnulldefault0check(retry_count>=0)") {
+        return Err(sqlx::Error::Protocol(
+            "SQLite migration 52 version/schema mismatch: retry_count constraint missing".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn migrate_sqlite_health_retry_count(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    const VERSION: i64 = 52;
+    let current: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version),0) FROM schema_version")
+        .fetch_one(pool)
+        .await?;
+    if current >= VERSION {
+        let mut conn = pool.acquire().await?;
+        validate_sqlite_health_schema(&mut conn, true).await?;
+        validate_sqlite_health_retry_count(&mut conn).await?;
+        return Ok(());
+    }
+    if current != 51 {
+        return Err(sqlx::Error::Protocol(format!(
+            "SQLite migration 52 requires version 51, found {current}"
+        )));
+    }
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let migration = async {
+        sqlx::query(crate::db::health_schema::SQLITE_MIGRATION_52)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("INSERT INTO schema_version(version) VALUES(?)")
+            .bind(VERSION)
+            .execute(&mut *conn)
+            .await?;
+        validate_sqlite_health_schema(&mut conn, true).await?;
+        validate_sqlite_health_retry_count(&mut conn).await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    migration?;
+    tracing::info!("Migration 52: durable orchestration retry counter present");
     Ok(())
 }
 
@@ -3648,13 +3735,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_51_fresh_rerun_constraints_indexes_and_fk_actions() {
+    async fn migration_52_fresh_rerun_constraints_indexes_and_fk_actions() {
         let pool = fresh_pool().await;
         let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
         run_migrations(&pool)
             .await
             .expect("second startup validates");
@@ -3691,6 +3778,72 @@ mod tests {
         .unwrap();
         assert!(item_sql.contains("ON DELETE SET NULL"));
         assert!(item_sql.contains("ON DELETE CASCADE"));
+        assert!(item_sql.contains("retry_count INTEGER NOT NULL DEFAULT 0"));
+    }
+
+    #[tokio::test]
+    async fn migration_52_upgrades_version_51_and_rolls_back_failed_upgrade() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        migrate_sqlite_health_orchestration(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            51
+        );
+        migrate_sqlite_health_retry_count(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            52
+        );
+        migrate_sqlite_health_retry_count(&pool)
+            .await
+            .expect("migration 52 rerun must validate and pass");
+
+        let failed = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&failed).await.unwrap();
+        migrate_sqlite_health_orchestration(&failed).await.unwrap();
+        sqlx::query("ALTER TABLE socks5_check_job_items ADD COLUMN retry_count INTEGER")
+            .execute(&failed)
+            .await
+            .unwrap();
+        assert!(migrate_sqlite_health_retry_count(&failed).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&failed)
+                .await
+                .unwrap(),
+            51,
+            "a failed migration 52 must not advance the schema version"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_52_version_schema_mismatch_fails_loudly() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "ALTER TABLE socks5_check_job_items RENAME COLUMN retry_count TO retry_count_bad",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = run_migrations(&pool).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("migration 52 version/schema mismatch"));
     }
 
     #[tokio::test]

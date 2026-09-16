@@ -4,11 +4,11 @@ use crate::db::health_orchestration::{
     safe_error_message, validate_health_item_transition_fields, ConditionalWriteOutcome,
     HealthCounterCategory, HealthItemClaimRequest, HealthItemDispatchRequest, HealthItemTransition,
     HealthJobCreateOutcome, HealthJobIdempotencyOutcome, HealthJobItemListQuery,
-    HealthJobItemRecord, HealthJobItemState, HealthJobListQuery, HealthJobRecord,
-    HealthLeaseRenewRequest, HealthPairLeaseRecord, HealthPolicyPatch, HealthPolicyRecord,
-    NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem, NewHealthPolicy,
-    PairLeaseAcquireOutcome, PairLeaseAcquireRequest, HEALTH_RETRY_POLICY_VERSION,
-    PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS,
+    HealthJobItemRecord, HealthJobItemState, HealthJobListQuery, HealthJobReconcileOutcome,
+    HealthJobRecord, HealthJobStatus, HealthLeaseRenewRequest, HealthPairCoordinationRequest,
+    HealthPairLeaseRecord, HealthPolicyPatch, HealthPolicyRecord, NewHealthJob,
+    NewHealthJobIdempotency, NewHealthJobItem, NewHealthPolicy, PairLeaseAcquireOutcome,
+    PairLeaseAcquireRequest, HEALTH_RETRY_POLICY_VERSION, PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS,
 };
 use crate::db::repo::HealthOrchestrationRepository;
 use async_trait::async_trait;
@@ -108,7 +108,15 @@ async fn aggregate_and_finalize(
     conn: &mut SqliteConnection,
     job_id: &str,
     now_ms: i64,
-) -> Result<bool, DbError> {
+) -> Result<(bool, bool), DbError> {
+    let current: Option<(bool, String)> =
+        sqlx::query_as("SELECT cancel_requested,status FROM socks5_check_jobs WHERE id=?")
+            .bind(job_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((cancel_requested, previous_status)) = current else {
+        return Ok((false, false));
+    };
     let counts: Option<(i64, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT
            SUM(CASE WHEN state IN ('QUEUED','RETRY_WAIT') THEN 1 ELSE 0 END),
@@ -122,7 +130,7 @@ async fn aggregate_and_finalize(
     .fetch_optional(&mut *conn)
     .await?;
     let Some((queued, running, succeeded, failed, cancelled)) = counts else {
-        return Ok(false);
+        return Ok((false, false));
     };
     let total = queued + running + succeeded + failed + cancelled;
     let terminal = queued == 0 && running == 0;
@@ -139,20 +147,18 @@ async fn aggregate_and_finalize(
             "PARTIAL"
         }
     } else {
-        let cancel_requested: bool =
-            sqlx::query_scalar("SELECT cancel_requested FROM socks5_check_jobs WHERE id=?")
-                .bind(job_id)
-                .fetch_one(&mut *conn)
-                .await?;
         if cancel_requested {
             "CANCEL_REQUESTED"
         } else {
             "RUNNING"
         }
     };
+    let finalized = terminal
+        && !HealthJobStatus::parse(&previous_status).is_some_and(HealthJobStatus::is_terminal);
     let result = sqlx::query(
         "UPDATE socks5_check_jobs SET status=?,total_items=?,queued_count=?,running_count=?,
-         succeeded_count=?,failed_count=?,cancelled_count=?,finished_at_ms=? WHERE id=?",
+         succeeded_count=?,failed_count=?,cancelled_count=?,
+         finished_at_ms=CASE WHEN ? THEN COALESCE(finished_at_ms,?) ELSE NULL END WHERE id=?",
     )
     .bind(status)
     .bind(total)
@@ -161,11 +167,12 @@ async fn aggregate_and_finalize(
     .bind(succeeded)
     .bind(failed)
     .bind(cancelled)
-    .bind(terminal.then_some(now_ms))
+    .bind(terminal)
+    .bind(now_ms)
     .bind(job_id)
     .execute(&mut *conn)
     .await?;
-    Ok(result.rows_affected() == 1)
+    Ok((result.rows_affected() == 1, finalized))
 }
 
 #[async_trait]
@@ -604,7 +611,7 @@ impl HealthOrchestrationRepository for SqliteRepository {
         }
         let updated = sqlx::query(
             "UPDATE socks5_check_job_items
-             SET state='DISPATCHING',attempt_count=attempt_count+1,
+             SET state='DISPATCHING',
                  item_fence_token=item_fence_token+1,dispatch_attempt_id=?,last_started_at_ms=?,
                  updated_at_ms=? WHERE id=? AND state='LEASED' AND lease_owner=?
                  AND item_fence_token=? AND pair_fence_token=? AND lease_expires_at_ms>?",
@@ -726,7 +733,7 @@ impl HealthOrchestrationRepository for SqliteRepository {
         &self,
         now_ms: i64,
         limit: i64,
-    ) -> Result<Vec<String>, DbError> {
+    ) -> Result<Vec<HealthJobReconcileOutcome>, DbError> {
         let mut conn = begin_immediate(&self.pool).await?;
         let jobs: Vec<String> = sqlx::query_scalar(
             "SELECT j.id FROM socks5_check_jobs j
@@ -747,11 +754,15 @@ impl HealthOrchestrationRepository for SqliteRepository {
         .bind(limit.clamp(0, 500))
         .fetch_all(&mut *conn)
         .await?;
-        for job_id in &jobs {
-            aggregate_and_finalize(&mut conn, job_id, now_ms).await?;
+        let mut reconciled = Vec::with_capacity(jobs.len());
+        for job_id in jobs {
+            let (updated, finalized) = aggregate_and_finalize(&mut conn, &job_id, now_ms).await?;
+            if updated {
+                reconciled.push(HealthJobReconcileOutcome { job_id, finalized });
+            }
         }
         sqlx::query("COMMIT").execute(&mut *conn).await?;
-        Ok(jobs)
+        Ok(reconciled)
     }
 
     async fn transition_health_job_item(
@@ -803,8 +814,8 @@ impl HealthOrchestrationRepository for SqliteRepository {
         let terminal = t.new_state.is_terminal();
         let completed_after_cancel =
             t.completed_after_cancel || (cancelled && t.new_state == HealthJobItemState::Succeeded);
-        sqlx::query("UPDATE socks5_check_job_items SET state=?,item_fence_token=item_fence_token+1,lease_owner=?,lease_expires_at_ms=?,pair_fence_token=?,dispatch_attempt_id=?,request_id=?,not_before_ms=COALESCE(?,not_before_ms),first_started_at_ms=CASE WHEN ?='LEASED' THEN COALESCE(first_started_at_ms,?) ELSE first_started_at_ms END,last_started_at_ms=CASE WHEN ?='LEASED' THEN ? ELSE last_started_at_ms END,health_status=?,safe_error_code=?,safe_error_message=?,completed_after_cancel=?,updated_at_ms=?,finished_at_ms=? WHERE id=? AND state=? AND item_fence_token=?")
-            .bind(t.new_state.as_str()).bind(&t.lease_owner).bind(t.lease_expires_at_ms).bind(t.pair_fence_token).bind(&t.dispatch_attempt_id).bind(&t.request_id).bind(t.not_before_ms)
+        sqlx::query("UPDATE socks5_check_job_items SET state=?,item_fence_token=item_fence_token+1,attempt_count=attempt_count+CASE WHEN ?='IN_FLIGHT' THEN 1 ELSE 0 END,retry_count=retry_count+CASE WHEN ?='RETRY_WAIT' THEN 1 ELSE 0 END,lease_owner=?,lease_expires_at_ms=?,pair_fence_token=?,dispatch_attempt_id=?,request_id=?,not_before_ms=COALESCE(?,not_before_ms),first_started_at_ms=CASE WHEN ?='LEASED' THEN COALESCE(first_started_at_ms,?) ELSE first_started_at_ms END,last_started_at_ms=CASE WHEN ?='LEASED' THEN ? ELSE last_started_at_ms END,health_status=?,safe_error_code=?,safe_error_message=?,completed_after_cancel=?,updated_at_ms=?,finished_at_ms=? WHERE id=? AND state=? AND item_fence_token=?")
+            .bind(t.new_state.as_str()).bind(t.new_state.as_str()).bind(t.new_state.as_str()).bind(&t.lease_owner).bind(t.lease_expires_at_ms).bind(t.pair_fence_token).bind(&t.dispatch_attempt_id).bind(&t.request_id).bind(t.not_before_ms)
             .bind(t.new_state.as_str()).bind(t.now_ms).bind(t.new_state.as_str()).bind(t.now_ms).bind(&t.health_status).bind(&t.safe_error_code).bind(message).bind(completed_after_cancel).bind(t.now_ms).bind(terminal.then_some(t.now_ms)).bind(t.item_id).bind(t.expected_state.as_str()).bind(t.expected_fence)
             .execute(&mut *conn).await?;
         if old != new {
@@ -846,8 +857,8 @@ impl HealthOrchestrationRepository for SqliteRepository {
         .bind(job_id)
         .execute(&mut *conn)
         .await?;
-        sqlx::query("UPDATE socks5_check_job_items SET state='CANCELLED',lease_owner=NULL,lease_expires_at_ms=NULL,pair_fence_token=NULL,dispatch_attempt_id=NULL,request_id=NULL,finished_at_ms=?,updated_at_ms=? WHERE job_id=? AND state IN ('QUEUED','RETRY_WAIT')")
-            .bind(now_ms).bind(now_ms).bind(job_id).execute(&mut *conn).await?;
+        sqlx::query("UPDATE socks5_check_job_items SET state='CANCELLED',item_fence_token=item_fence_token+1,lease_owner=NULL,lease_expires_at_ms=NULL,pair_fence_token=NULL,dispatch_attempt_id=NULL,request_id=NULL,not_before_ms=?,health_status=NULL,safe_error_code=NULL,safe_error_message=NULL,completed_after_cancel=0,finished_at_ms=?,updated_at_ms=? WHERE job_id=? AND state IN ('QUEUED','RETRY_WAIT')")
+            .bind(now_ms).bind(now_ms).bind(now_ms).bind(job_id).execute(&mut *conn).await?;
         aggregate_and_finalize(&mut conn, job_id, now_ms).await?;
         sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(true)
@@ -859,7 +870,7 @@ impl HealthOrchestrationRepository for SqliteRepository {
         match result {
             Ok(value) => {
                 sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(value)
+                Ok(value.0)
             }
             Err(error) => {
                 rollback(&mut conn).await;
@@ -933,6 +944,88 @@ impl HealthOrchestrationRepository for SqliteRepository {
         sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(PairLeaseAcquireOutcome::Acquired {
             pair_fence_token: token,
+        })
+    }
+
+    async fn acquire_health_pair_coordination(
+        &self,
+        r: HealthPairCoordinationRequest<'_>,
+    ) -> Result<PairLeaseAcquireOutcome, DbError> {
+        if r.resource_id <= 0
+            || r.relay_node_id <= 0
+            || r.lease_owner.is_empty()
+            || r.lease_expires_at_ms <= r.now_ms
+        {
+            return Err(DbError::ConstraintViolation);
+        }
+        let mut conn = begin_immediate(&self.pool).await?;
+        let row: Option<(Option<String>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT lease_owner,lease_expires_at_ms,pair_fence_token FROM socks5_check_pair_leases WHERE resource_id=? AND relay_node_id=?",
+        )
+        .bind(r.resource_id)
+        .bind(r.relay_node_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let token = match row {
+            None => {
+                sqlx::query("INSERT INTO socks5_check_pair_leases(resource_id,relay_node_id,item_id,lease_owner,lease_expires_at_ms,pair_fence_token,updated_at_ms) VALUES(?,?,NULL,?,?,1,?)")
+                    .bind(r.resource_id).bind(r.relay_node_id).bind(r.lease_owner)
+                    .bind(r.lease_expires_at_ms).bind(r.now_ms).execute(&mut *conn).await?;
+                1
+            }
+            Some((owner, expires, token))
+                if owner.is_none() || expires.is_some_and(|value| value <= r.now_ms) =>
+            {
+                let next = token.checked_add(1).ok_or(DbError::ConstraintViolation)?;
+                sqlx::query("UPDATE socks5_check_pair_leases SET item_id=NULL,lease_owner=?,lease_expires_at_ms=?,pair_fence_token=?,updated_at_ms=? WHERE resource_id=? AND relay_node_id=?")
+                    .bind(r.lease_owner).bind(r.lease_expires_at_ms).bind(next).bind(r.now_ms)
+                    .bind(r.resource_id).bind(r.relay_node_id).execute(&mut *conn).await?;
+                next
+            }
+            Some(_) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                return Ok(PairLeaseAcquireOutcome::Busy);
+            }
+        };
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(PairLeaseAcquireOutcome::Acquired {
+            pair_fence_token: token,
+        })
+    }
+
+    async fn renew_health_pair_coordination(
+        &self,
+        r: HealthPairCoordinationRequest<'_>,
+        expected_pair_fence: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError> {
+        if r.lease_owner.is_empty() || r.lease_expires_at_ms <= r.now_ms {
+            return Err(DbError::ConstraintViolation);
+        }
+        let result = sqlx::query("UPDATE socks5_check_pair_leases SET lease_expires_at_ms=?,updated_at_ms=? WHERE resource_id=? AND relay_node_id=? AND item_id IS NULL AND lease_owner=? AND pair_fence_token=? AND lease_expires_at_ms>?")
+            .bind(r.lease_expires_at_ms).bind(r.now_ms).bind(r.resource_id).bind(r.relay_node_id)
+            .bind(r.lease_owner).bind(expected_pair_fence).bind(r.now_ms).execute(&self.pool).await?;
+        Ok(if result.rows_affected() == 1 {
+            ConditionalWriteOutcome::Applied
+        } else {
+            ConditionalWriteOutcome::ConditionFailed
+        })
+    }
+
+    async fn release_health_pair_coordination(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        lease_owner: &str,
+        expected_pair_fence: i64,
+        now_ms: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError> {
+        let result = sqlx::query("UPDATE socks5_check_pair_leases SET lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE resource_id=? AND relay_node_id=? AND item_id IS NULL AND lease_owner=? AND pair_fence_token=?")
+            .bind(now_ms).bind(resource_id).bind(relay_node_id).bind(lease_owner).bind(expected_pair_fence)
+            .execute(&self.pool).await?;
+        Ok(if result.rows_affected() == 1 {
+            ConditionalWriteOutcome::Applied
+        } else {
+            ConditionalWriteOutcome::ConditionFailed
         })
     }
 
@@ -1155,6 +1248,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_retry_wait_atomically_clears_state_bound_fields() {
+        let (repo, resource, node) = fixture().await;
+        let (job, items) = job("cancel-retry-wait-safe-error", resource, node, None);
+        repo.create_health_job(&job, &items).await.unwrap();
+        let leased = repo
+            .claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: "worker-1".into(),
+                now_ms: 2_000,
+                lease_expires_at_ms: 62_000,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 16,
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        let mut retry = transition(
+            leased.id,
+            HealthJobItemState::Leased,
+            leased.item_fence_token,
+            HealthJobItemState::RetryWait,
+            2_100,
+        );
+        retry.not_before_ms = Some(3_100);
+        retry.safe_error_code = Some("UPSTREAM_UNAVAILABLE".into());
+        retry.safe_error_message = Some("Upstream service unavailable".into());
+        assert_eq!(
+            repo.transition_health_job_item(&retry).await.unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+        repo.release_health_pair_lease(
+            resource,
+            node,
+            leased.id,
+            "worker-1",
+            leased.pair_fence_token.unwrap(),
+            2_101,
+        )
+        .await
+        .unwrap();
+
+        assert!(repo.cancel_health_job(&job.id, 2_200).await.unwrap());
+        let cancelled = repo.find_health_job_item(leased.id).await.unwrap().unwrap();
+        assert_eq!(cancelled.state, "CANCELLED");
+        assert_eq!(cancelled.safe_error_code, None);
+        assert_eq!(cancelled.safe_error_message, None);
+        assert_eq!(cancelled.not_before_ms, 2_200);
+        assert_eq!(cancelled.lease_owner, None);
+        assert_eq!(cancelled.lease_expires_at_ms, None);
+        assert_eq!(cancelled.dispatch_attempt_id, None);
+        assert_eq!(cancelled.request_id, None);
+        assert_eq!(cancelled.pair_fence_token, None);
+        assert_eq!(cancelled.finished_at_ms, Some(2_200));
+        let cancelled_job = repo.find_health_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(cancelled_job.status, "CANCELLED");
+        assert_eq!(cancelled_job.cancelled_count, 1);
+        assert!(repo.cancel_health_job(&job.id, 2_300).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn health_policy_revision_and_constraints() {
         let (repo, _, _) = fixture().await;
         let id = repo
@@ -1276,7 +1430,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(dispatching.state, "DISPATCHING");
-        assert_eq!(dispatching.attempt_count, 1);
+        assert_eq!(
+            dispatching.attempt_count, 0,
+            "DISPATCHING is not yet a network attempt"
+        );
         assert_eq!(dispatching.item_fence_token, 2);
         assert_eq!(
             repo.renew_health_item_and_pair_lease(&HealthLeaseRenewRequest {
@@ -1335,7 +1492,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             repo.reconcile_health_job_counters(3_200, 10).await.unwrap(),
-            vec![job.id.clone()]
+            vec![HealthJobReconcileOutcome {
+                job_id: job.id.clone(),
+                finalized: false,
+            }]
         );
         let repaired = repo.find_health_job(&job.id).await.unwrap().unwrap();
         assert_eq!((repaired.queued_count, repaired.running_count), (0, 1));
@@ -1896,7 +2056,29 @@ mod tests {
         let done = repo.find_health_job(&job.id).await.unwrap().unwrap();
         assert_eq!(done.status, HealthJobStatus::Succeeded.as_str());
         assert_eq!((done.running_count, done.succeeded_count), (0, 1));
-        assert_eq!(done.finished_at_ms, Some(3_001));
+        assert_eq!(done.finished_at_ms, Some(3_000));
+
+        sqlx::query("UPDATE socks5_check_jobs SET succeeded_count=0,failed_count=1 WHERE id=?")
+            .bind(&job.id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.reconcile_health_job_counters(4_000, 10).await.unwrap(),
+            vec![HealthJobReconcileOutcome {
+                job_id: job.id.clone(),
+                finalized: false,
+            }]
+        );
+        assert_eq!(
+            repo.find_health_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .finished_at_ms,
+            Some(3_000),
+            "reconciliation must not reopen finalization or rewrite its timestamp"
+        );
     }
 
     #[tokio::test]

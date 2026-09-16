@@ -5,11 +5,7 @@
 use crate::api::middleware::AdminOnly;
 use crate::api::node::{extract_node_token, node_identity_hash};
 use crate::api::AppState;
-use crate::db::health_orchestration::{
-    canonical_selector_json, request_fingerprint, snapshot_hash, HealthJobFingerprintInput,
-    HealthJobItemState, HealthJobSource, HealthJobStatus, HealthMatrixMode, NewHealthJob,
-    NewHealthJobItem, NodeSelector, ResourceSelector,
-};
+use crate::db::health_orchestration::HealthJobItemState;
 use crate::db::repo::{Socks5HealthRecord, Socks5ResourceQuery};
 use crate::service::credentials::CredentialCipher;
 use axum::extract::{Path, Query, State};
@@ -65,6 +61,26 @@ impl Socks5CheckRegistry {
 
     #[cfg(test)]
     async fn start(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        node_id: &str,
+        session_id: &str,
+        resource_generation: i64,
+        generation: i64,
+    ) -> (String, String, oneshot::Receiver<Socks5CheckResult>) {
+        self.start_compatibility(
+            resource_id,
+            relay_node_id,
+            node_id,
+            session_id,
+            resource_generation,
+            generation,
+        )
+        .await
+    }
+
+    async fn start_compatibility(
         &self,
         resource_id: i64,
         relay_node_id: i64,
@@ -406,7 +422,7 @@ async fn run_batch(
     state: AppState,
     ids: Vec<i64>,
     relay_node_id: i64,
-    actor_id: i64,
+    _actor_id: i64,
 ) -> Vec<CheckResponse> {
     let base = |resource_id: i64, outcome: &str| CheckResponse {
         resource_id,
@@ -474,210 +490,198 @@ async fn run_batch(
             .map(|id| responses.remove(&id).expect("response exists"))
             .collect();
     }
-    let resource_selector = ResourceSelector {
-        ids: valid_ids.clone(),
-        enabled: None,
-        ..Default::default()
-    }
-    .canonicalized();
-    let node_selector = NodeSelector {
-        ids: vec![relay_node_id],
-        enabled: None,
-        ..Default::default()
-    }
-    .canonicalized();
-    let pairs = valid_ids
-        .iter()
-        .map(|resource_id| (*resource_id, relay_node_id))
-        .collect::<Vec<_>>();
-    let created_at_ms = chrono::Utc::now().timestamp_millis();
-    let fingerprint = request_fingerprint(&HealthJobFingerprintInput {
-        operation: "COMPATIBILITY_CHECK".into(),
-        source: HealthJobSource::Manual,
-        resource_selector: resource_selector.clone(),
-        node_selector: node_selector.clone(),
-        matrix_mode: HealthMatrixMode::Cartesian,
-        max_items: MAX_BATCH_SIZE as i64,
-        parent_job_id: None,
-        policy_id: None,
-        policy_revision: None,
-    });
-    let job_id = uuid::Uuid::new_v4().to_string();
-    let job = NewHealthJob {
-        id: job_id.clone(),
-        source: HealthJobSource::Manual,
-        policy_id: None,
-        parent_job_id: None,
-        actor_id: Some(actor_id),
-        request_fingerprint: fingerprint,
-        snapshot_hash: snapshot_hash(&pairs),
-        resource_selector_json: canonical_selector_json(&resource_selector),
-        node_selector_json: canonical_selector_json(&node_selector),
-        scheduled_for_ms: None,
-        created_at_ms,
-    };
-    let deadline_at_ms = created_at_ms + 15 * 60 * 1_000;
-    let items = pairs
-        .iter()
-        .map(|(resource_id, node_id)| NewHealthJobItem {
-            resource_id: *resource_id,
-            relay_node_id: *node_id,
-            not_before_ms: created_at_ms,
-            deadline_at_ms: Some(deadline_at_ms),
-        })
-        .collect::<Vec<_>>();
-    if let Err(error) = state.db.create_health_job(&job, &items).await {
-        tracing::error!("create compatibility durable health job: {error}");
-        for id in &valid_ids {
-            responses.insert(*id, base(*id, "DISPATCH_FAILED"));
+    let completed = map_bounded(valid_ids, 50, |resource_id| {
+        let state = state.clone();
+        let relay = relay.clone();
+        let resource = resources.get(&resource_id).cloned();
+        async move {
+            match resource {
+                Some(resource) => compatibility_check(state, resource, relay).await,
+                None => CheckResponse {
+                    resource_id,
+                    relay_node_id,
+                    outcome: "INVALID_RESOURCE".into(),
+                    result: None,
+                },
+            }
         }
-    } else {
-        crate::service::audit::record(
-            &state,
-            Some(actor_id),
-            "JOB_CREATED",
-            "socks5_health_job",
-            &job_id,
-            &format!("source=MANUAL; total_items={}", items.len()),
-        )
-        .await;
-        let terminal_items = wait_for_job(
-            &state,
-            &job_id,
-            created_at_ms + RESULT_TIMEOUT.as_millis() as i64,
-        )
-        .await;
-        let terminal_by_resource = terminal_items
-            .into_iter()
-            .map(|item| (item.resource_id_snapshot, item))
-            .collect::<HashMap<_, _>>();
-        let completed = map_bounded(valid_ids.clone(), 50, |resource_id| {
-            let state = state.clone();
-            let item = terminal_by_resource.get(&resource_id).cloned();
-            async move { compatibility_response(state, resource_id, relay_node_id, item).await }
-        })
-        .await;
-        for response in completed {
-            responses.insert(response.resource_id, response);
-        }
+    })
+    .await;
+    for response in completed {
+        responses.insert(response.resource_id, response);
     }
     ids.into_iter()
         .map(|id| responses.remove(&id).expect("response exists"))
         .collect()
 }
 
-async fn wait_for_job(
-    state: &AppState,
-    job_id: &str,
-    deadline_at_ms: i64,
-) -> Vec<crate::db::health_orchestration::HealthJobItemRecord> {
-    loop {
-        let job = state.db.find_health_job(job_id).await.ok().flatten();
-        if job.as_ref().is_some_and(|job| {
-            HealthJobStatus::parse(&job.status).is_some_and(HealthJobStatus::is_terminal)
-        }) {
-            return state
-                .db
-                .list_health_job_items(job_id)
-                .await
-                .unwrap_or_default();
-        }
-        if chrono::Utc::now().timestamp_millis() >= deadline_at_ms {
-            return state
-                .db
-                .list_health_job_items(job_id)
-                .await
-                .unwrap_or_default();
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn compatibility_response(
+async fn compatibility_check(
     state: AppState,
-    resource_id: i64,
-    relay_node_id: i64,
-    item: Option<crate::db::health_orchestration::HealthJobItemRecord>,
+    resource: crate::db::repo::Socks5ResourceRecord,
+    relay: crate::db::repo::RelayNodeRecord,
 ) -> CheckResponse {
+    use crate::db::health_orchestration::{
+        ConditionalWriteOutcome, HealthPairCoordinationRequest, PairLeaseAcquireOutcome,
+    };
+    use relay_shared::protocol::{SecretString, Socks5CheckRequest};
+    let resource_id = resource.id;
+    let relay_node_id = relay.id;
     let base = |outcome: &str| CheckResponse {
         resource_id,
         relay_node_id,
         outcome: outcome.into(),
         result: None,
     };
-    let Some(item) = item else {
-        return base("NODE_TIMEOUT");
-    };
-    if item.state != "SUCCEEDED" {
-        if !HealthJobItemState::parse(&item.state).is_some_and(HealthJobItemState::is_terminal) {
-            return base("NODE_TIMEOUT");
-        }
-        return base(match item.safe_error_code.as_deref() {
-            Some("PROXY_AUTH_FAILED") => "CREDENTIAL_UNAVAILABLE",
-            Some("PROXY_CONNECT_TIMEOUT") => "NODE_TIMEOUT",
-            _ if item.state == "CANCELLED" => "NODE_TIMEOUT",
-            _ => "DISPATCH_FAILED",
-        });
-    }
-    let health = state
+    let owner = format!("compat:{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+    let pair_fence = match state
         .db
-        .list_socks5_health(resource_id)
+        .acquire_health_pair_coordination(HealthPairCoordinationRequest {
+            resource_id,
+            relay_node_id,
+            lease_owner: &owner,
+            lease_expires_at_ms: now + 60_000,
+            now_ms: now,
+        })
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .find(|health| health.relay_node_id == relay_node_id);
-    let Some(health) = health else {
-        return base("PERSIST_FAILED");
+    {
+        Ok(PairLeaseAcquireOutcome::Acquired { pair_fence_token }) => pair_fence_token,
+        Ok(PairLeaseAcquireOutcome::Busy) => return base("NODE_BUSY"),
+        Err(error) => {
+            tracing::error!("acquire compatibility health pair: {error}");
+            return base("DISPATCH_FAILED");
+        }
     };
-    CheckResponse {
-        resource_id,
-        relay_node_id,
-        outcome: "COMPLETED".into(),
-        result: Some(public_result_from_health(health)),
+    let response = async {
+        let Some(session_id) = state
+            .node_connections
+            .node_session(relay.device_group_id, &relay.node_key)
+            .await
+        else {
+            return base("NODE_OFFLINE");
+        };
+        let password = match decrypt_password(&state, &resource) {
+            Ok(value) => value.map(SecretString::new),
+            Err(()) => return base("CREDENTIAL_UNAVAILABLE"),
+        };
+        let Some((resource, generation)) = state
+            .db
+            .begin_socks5_health_check_if_resource_generation(
+                resource_id,
+                relay_node_id,
+                resource.health_generation,
+            )
+            .await
+            .ok()
+            .flatten()
+        else {
+            return base("DISPATCH_FAILED");
+        };
+        let resource_generation = resource.health_generation;
+        let (request_id, challenge, mut receiver) = state
+            .socks5_checks
+            .start_compatibility(
+                resource_id,
+                relay_node_id,
+                &relay.node_key,
+                &session_id,
+                resource_generation,
+                generation,
+            )
+            .await;
+        let command = Socks5CheckRequest {
+            msg_type: "socks5_check".into(),
+            request_id: request_id.clone(),
+            challenge,
+            session_id: session_id.clone(),
+            resource_generation,
+            generation,
+            resource_id,
+            relay_node_id,
+            node_id: relay.node_key.clone(),
+            host: resource.host,
+            port: resource.port as u16,
+            username: resource.username,
+            password,
+            check_urls: state.config.socks5_check_urls.clone(),
+            relay_public_ip: (!relay.public_ip.is_empty()).then_some(relay.public_ip.clone()),
+        };
+        let Ok(payload) = serde_json::to_string(&command) else {
+            state.socks5_checks.remove(&request_id).await;
+            return base("DISPATCH_FAILED");
+        };
+        if state
+            .node_connections
+            .send_node_session(
+                relay.device_group_id,
+                &relay.node_key,
+                &session_id,
+                &payload,
+            )
+            .await
+            == 0
+        {
+            state.socks5_checks.remove(&request_id).await;
+            return base("NODE_OFFLINE");
+        }
+        let deadline = tokio::time::Instant::now() + RESULT_TIMEOUT;
+        let exact = loop {
+            tokio::select! {
+                value = &mut receiver => break value.ok(),
+                _ = tokio::time::sleep_until(deadline) => break None,
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    let renew_now = chrono::Utc::now().timestamp_millis();
+                    if !matches!(state.db.renew_health_pair_coordination(
+                        HealthPairCoordinationRequest {
+                            resource_id,
+                            relay_node_id,
+                            lease_owner: &owner,
+                            lease_expires_at_ms: renew_now + 60_000,
+                            now_ms: renew_now,
+                        },
+                        pair_fence,
+                    ).await, Ok(ConditionalWriteOutcome::Applied)) {
+                        state.socks5_checks.remove(&request_id).await;
+                        break None;
+                    }
+                }
+            }
+        };
+        let Some(result) = exact else {
+            state.socks5_checks.remove(&request_id).await;
+            return base("NODE_TIMEOUT");
+        };
+        if result.error_code.as_deref() == Some("NODE_BUSY") {
+            return base("NODE_BUSY");
+        }
+        if result.error_code.as_deref() == Some("PERSIST_FAILED") {
+            return base("PERSIST_FAILED");
+        }
+        if matches!(
+            result.error_code.as_deref(),
+            Some("RESULT_SUPERSEDED" | "NODE_DISABLED")
+        ) {
+            return base("DISPATCH_FAILED");
+        }
+        CheckResponse {
+            resource_id,
+            relay_node_id,
+            outcome: "COMPLETED".into(),
+            result: Some(result.into()),
+        }
     }
-}
-
-fn public_result_from_health(health: Socks5HealthRecord) -> Socks5CheckResultPublic {
-    let millis = |value: Option<i32>| value.map(|value| value.max(0) as u64);
-    Socks5CheckResultPublic {
-        status: parse_health_status(&health.status),
-        tcp_latency_ms: millis(health.tcp_latency_ms),
-        handshake_latency_ms: millis(health.handshake_latency_ms),
-        connect_latency_ms: millis(health.connect_latency_ms),
-        total_latency_ms: millis(health.total_latency_ms),
-        exit_ip: health.exit_ip,
-        detected_country: health.country,
-        error_stage: health.error_stage.as_deref().and_then(parse_check_stage),
-        error_code: health.error_code,
-        safe_error_message: health.safe_error_message,
-        checked_at: health.checked_at,
-    }
-}
-
-fn parse_health_status(value: &str) -> relay_shared::protocol::Socks5HealthStatus {
-    use relay_shared::protocol::Socks5HealthStatus as Status;
-    match value {
-        "ONLINE" => Status::Online,
-        "OFFLINE" => Status::Offline,
-        "AUTH_FAILED" => Status::AuthFailed,
-        "TIMEOUT" => Status::Timeout,
-        "CONNECT_FAILED" => Status::ConnectFailed,
-        "DISABLED" => Status::Disabled,
-        _ => Status::Unknown,
-    }
-}
-
-fn parse_check_stage(value: &str) -> Option<relay_shared::protocol::Socks5CheckStage> {
-    use relay_shared::protocol::Socks5CheckStage as Stage;
-    match value {
-        "TCP_CONNECT" => Some(Stage::TcpConnect),
-        "SOCKS5_NEGOTIATION" => Some(Stage::Socks5Negotiation),
-        "AUTHENTICATION" => Some(Stage::Authentication),
-        "SOCKS5_CONNECT" => Some(Stage::Socks5Connect),
-        "INTERNET_REQUEST" => Some(Stage::InternetRequest),
-        "EXIT_IP_PARSE" => Some(Stage::ExitIpParse),
-        _ => None,
-    }
+    .await;
+    let _ = state
+        .db
+        .release_health_pair_coordination(
+            resource_id,
+            relay_node_id,
+            &owner,
+            pair_fence,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+    response
 }
 
 async fn map_bounded<I, F, Fut, Output>(
@@ -1023,7 +1027,7 @@ mod tests {
     use crate::db::schema::{run_migrations, SCHEMA_SQL};
     use crate::db::sqlite_repo::SqliteRepository;
     use crate::{api::system::ReleaseCache, api::ws::NodeConnections, config::Config};
-    use relay_shared::protocol::Socks5HealthStatus;
+    use relay_shared::protocol::{Socks5CheckRequest, Socks5HealthStatus};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashSet;
 
@@ -1324,7 +1328,7 @@ mod tests {
             socks5_checks: Socks5CheckRegistry::new(),
             geoip_in_flight: Arc::new(Mutex::new(HashSet::new())),
         };
-        let (_connection_id, _node_receiver) = state
+        let (_connection_id, mut node_receiver) = state
             .node_connections
             .register(group, Some("compat-pair-node".into()))
             .await;
@@ -1337,17 +1341,35 @@ mod tests {
             .await
             .unwrap();
 
-        // `run_batch` is the execution path used by both the legacy single and
-        // batch handlers. Keep each call alive only until its durable Job commit.
+        // `run_batch` is the execution path used by both legacy single and
+        // batch handlers. Both acquire the same persistent Pair coordinator as
+        // Manual Jobs, without creating hidden Jobs themselves.
         let batch = tokio::spawn(run_batch(
             state.clone(),
             vec![resource_a, resource_b],
             node,
             1,
         ));
-        wait_for_job_count(&pool, 1).await;
+        let first: Socks5CheckRequest = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(2), node_receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let second: Socks5CheckRequest = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(2), node_receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         let single = tokio::spawn(run_batch(state.clone(), vec![resource_a], node, 1));
-        wait_for_job_count(&pool, 2).await;
+        let single_result = tokio::time::timeout(Duration::from_secs(2), single)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(single_result[0].outcome, "NODE_BUSY");
 
         let created_at_ms = chrono::Utc::now().timestamp_millis();
         let manual = NewHealthJob {
@@ -1389,46 +1411,96 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            claimed
-                .iter()
-                .filter(|item| item.resource_id_snapshot == resource_a)
-                .count(),
-            1,
-            "legacy single, legacy batch and Manual Job must share one active Pair"
+        assert!(
+            claimed.is_empty(),
+            "legacy batch must block the Manual Job Pair"
         );
-        assert_eq!(
-            claimed
-                .iter()
-                .filter(|item| item.resource_id_snapshot == resource_b)
-                .count(),
-            1
-        );
-        let active_shared_pair: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM socks5_check_job_items WHERE resource_id_snapshot=? AND relay_node_id_snapshot=? AND state IN ('LEASED','DISPATCHING','IN_FLIGHT')",
+        let hidden_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM socks5_check_jobs WHERE id<>'manual-shared-pair'",
         )
-        .bind(resource_a)
-        .bind(node)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(active_shared_pair, 1);
-        batch.abort();
-        single.abort();
-    }
-
-    async fn wait_for_job_count(pool: &sqlx::SqlitePool, expected: i64) {
-        for _ in 0..100 {
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_check_jobs")
-                .fetch_one(pool)
+        assert_eq!(
+            hidden_jobs, 0,
+            "compatibility APIs must not create hidden Jobs"
+        );
+        let (request_a, request_b) = if first.resource_id == resource_a {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let latest = Socks5HealthRecord {
+            resource_id: resource_a,
+            relay_node_id: node,
+            status: "ONLINE".into(),
+            tcp_latency_ms: Some(99),
+            handshake_latency_ms: Some(99),
+            connect_latency_ms: Some(99),
+            total_latency_ms: Some(297),
+            exit_ip: Some("203.0.113.99".into()),
+            country: Some("ZZ".into()),
+            error_stage: None,
+            error_code: None,
+            safe_error_message: None,
+            consecutive_failures: 0,
+            checked_at: "2026-09-16 00:00:00".into(),
+            last_success_at: None,
+        };
+        assert!(state
+            .db
+            .record_socks5_health(&latest, request_a.resource_generation, request_a.generation,)
+            .await
+            .unwrap());
+        let exact = |request: &Socks5CheckRequest, exit_ip: &str| Socks5CheckResult {
+            msg_type: "socks5_check_result".into(),
+            request_id: request.request_id.clone(),
+            challenge: request.challenge.clone(),
+            session_id: request.session_id.clone(),
+            resource_generation: request.resource_generation,
+            generation: request.generation,
+            resource_id: request.resource_id,
+            relay_node_id: request.relay_node_id,
+            node_id: request.node_id.clone(),
+            status: Socks5HealthStatus::Online,
+            tcp_latency_ms: Some(1),
+            handshake_latency_ms: Some(2),
+            connect_latency_ms: Some(3),
+            total_latency_ms: Some(6),
+            exit_ip: Some(exit_ip.into()),
+            detected_country: Some("US".into()),
+            error_stage: None,
+            error_code: None,
+            safe_error_message: None,
+            checked_at: "2026-09-16 00:00:01".into(),
+        };
+        for result in [
+            exact(&request_a, "198.51.100.1"),
+            exact(&request_b, "198.51.100.2"),
+        ] {
+            let completion = state
+                .socks5_checks
+                .complete_matching(&result)
                 .await
                 .unwrap();
-            if count >= expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            completion.sender.send(result).unwrap();
         }
-        panic!("compatibility durable Job was not committed");
+        let batch_result = tokio::time::timeout(Duration::from_secs(2), batch)
+            .await
+            .unwrap()
+            .unwrap();
+        let a = batch_result
+            .iter()
+            .find(|response| response.resource_id == resource_a)
+            .unwrap();
+        assert_eq!(a.outcome, "COMPLETED");
+        assert_eq!(
+            a.result
+                .as_ref()
+                .and_then(|result| result.exit_ip.as_deref()),
+            Some("198.51.100.1"),
+            "compatibility response must use its exact result, not the latest health cell"
+        );
     }
 
     #[tokio::test]
@@ -1450,6 +1522,18 @@ mod tests {
         .await;
         assert_eq!(output.len(), 1_000);
         assert!(peak.load(Ordering::SeqCst) <= 50);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compatibility_batch_has_per_item_lifetimes_not_a_global_35_second_deadline() {
+        let started = tokio::time::Instant::now();
+        let output = map_bounded((0..21).collect(), 1, |item| async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            item
+        })
+        .await;
+        assert_eq!(output.len(), 21);
+        assert!(started.elapsed() >= Duration::from_secs(42));
     }
 
     #[test]

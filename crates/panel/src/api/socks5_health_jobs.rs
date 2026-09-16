@@ -70,6 +70,10 @@ pub struct JobResponse {
     pub node_selector: serde_json::Value,
     pub snapshot_hash: String,
     pub matrix_mode: String,
+    /// `CARTESIAN` for selector-derived Jobs and `EXACT_PAIRS` for a
+    /// Retry-Failed child. The persisted selectors remain provenance only.
+    pub snapshot_semantics: &'static str,
+    pub selectors_reconstruct_snapshot: bool,
     pub retry_policy_version: String,
     pub cancel_requested: bool,
     pub total_items: i64,
@@ -94,6 +98,7 @@ pub struct JobItemResponse {
     pub relay_node_id_snapshot: i64,
     pub state: String,
     pub attempt_count: i64,
+    pub retry_count: i64,
     pub not_before: i64,
     pub first_started_at: Option<i64>,
     pub last_started_at: Option<i64>,
@@ -306,6 +311,7 @@ pub async fn create(
         "CREATE",
     )
     .await
+    .response
 }
 
 pub async fn list(
@@ -575,18 +581,24 @@ pub async fn retry_failed(
         "RETRY_FAILED",
     )
     .await;
-    if result.status().is_success() {
+    if result.response.status().is_success() {
+        let replayed = result.replayed.unwrap_or(false);
         crate::service::audit::record(
             &state,
             Some(admin.user_id),
             "JOB_RETRY_FAILED",
             "socks5_health_job",
             &parent_job_id,
-            "child_job_created=true",
+            &format!("child_job_created={}; replayed={replayed}", !replayed),
         )
         .await;
     }
-    result
+    result.response
+}
+
+struct CreateFromPairsOutcome {
+    response: Response,
+    replayed: Option<bool>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -601,11 +613,14 @@ async fn create_from_pairs(
     mut pairs: Vec<(i64, i64)>,
     max_items: i64,
     operation: &str,
-) -> Response {
+) -> CreateFromPairsOutcome {
     pairs.sort_unstable();
     pairs.dedup();
     if pairs.is_empty() {
-        return error(StatusCode::UNPROCESSABLE_ENTITY, "EMPTY_SELECTION");
+        return CreateFromPairsOutcome {
+            response: error(StatusCode::UNPROCESSABLE_ENTITY, "EMPTY_SELECTION"),
+            replayed: None,
+        };
     }
     if pairs.len() > ABSOLUTE_MAX_ITEMS as usize || pairs.len() as i64 > max_items {
         crate::service::audit::record(
@@ -617,7 +632,10 @@ async fn create_from_pairs(
             &format!("item_count={}; effective_limit={max_items}", pairs.len()),
         )
         .await;
-        return error(StatusCode::UNPROCESSABLE_ENTITY, "MATRIX_TOO_LARGE");
+        return CreateFromPairsOutcome {
+            response: error(StatusCode::UNPROCESSABLE_ENTITY, "MATRIX_TOO_LARGE"),
+            replayed: None,
+        };
     }
     let fingerprint = request_fingerprint(&HealthJobFingerprintInput {
         operation: operation.into(),
@@ -677,20 +695,26 @@ async fn create_from_pairs(
                 &format!("source={}; total_items={}", source.as_str(), items.len()),
             )
             .await;
-            success(
-                StatusCode::ACCEPTED,
-                JobCreateResponse {
-                    job_id,
-                    status: "QUEUED".into(),
-                    total_items: items.len() as i64,
-                    created_at: created_at_ms,
-                    replayed: false,
-                },
-            )
+            CreateFromPairsOutcome {
+                response: success(
+                    StatusCode::ACCEPTED,
+                    JobCreateResponse {
+                        job_id,
+                        status: "QUEUED".into(),
+                        total_items: items.len() as i64,
+                        created_at: created_at_ms,
+                        replayed: false,
+                    },
+                ),
+                replayed: Some(false),
+            }
         }
         Ok(HealthJobCreateOutcome::Replay { job_id }) => {
             let Some(existing) = state.db.find_health_job(&job_id).await.ok().flatten() else {
-                return error(StatusCode::CONFLICT, "IDEMPOTENCY_LEDGER_ORPHANED");
+                return CreateFromPairsOutcome {
+                    response: error(StatusCode::CONFLICT, "IDEMPOTENCY_LEDGER_ORPHANED"),
+                    replayed: None,
+                };
             };
             crate::service::audit::record(
                 state,
@@ -701,23 +725,30 @@ async fn create_from_pairs(
                 "same_fingerprint=true",
             )
             .await;
-            success(
-                StatusCode::OK,
-                JobCreateResponse {
-                    job_id,
-                    status: existing.status,
-                    total_items: existing.total_items,
-                    created_at: existing.created_at_ms,
-                    replayed: true,
-                },
-            )
+            CreateFromPairsOutcome {
+                response: success(
+                    StatusCode::OK,
+                    JobCreateResponse {
+                        job_id,
+                        status: existing.status,
+                        total_items: existing.total_items,
+                        created_at: existing.created_at_ms,
+                        replayed: true,
+                    },
+                ),
+                replayed: Some(true),
+            }
         }
-        Ok(HealthJobCreateOutcome::Conflict) => {
-            error(StatusCode::CONFLICT, "IDEMPOTENCY_KEY_REUSED")
-        }
+        Ok(HealthJobCreateOutcome::Conflict) => CreateFromPairsOutcome {
+            response: error(StatusCode::CONFLICT, "IDEMPOTENCY_KEY_REUSED"),
+            replayed: None,
+        },
         Err(db_error) => {
             tracing::error!("create durable health job: {db_error}");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR")
+            CreateFromPairsOutcome {
+                response: error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
+                replayed: None,
+            }
         }
     }
 }
@@ -1009,6 +1040,7 @@ fn parse_json(raw: &str) -> serde_json::Value {
 }
 
 fn job_response(row: HealthJobRecord) -> JobResponse {
+    let exact_pairs = row.source == HealthJobSource::RetryFailed.as_str();
     JobResponse {
         id: row.id,
         source: row.source,
@@ -1018,6 +1050,12 @@ fn job_response(row: HealthJobRecord) -> JobResponse {
         node_selector: parse_json(&row.node_selector_json),
         snapshot_hash: row.snapshot_hash,
         matrix_mode: row.matrix_mode,
+        snapshot_semantics: if exact_pairs {
+            "EXACT_PAIRS"
+        } else {
+            "CARTESIAN"
+        },
+        selectors_reconstruct_snapshot: !exact_pairs,
         retry_policy_version: row.retry_policy_version,
         cancel_requested: row.cancel_requested,
         total_items: row.total_items,
@@ -1043,6 +1081,7 @@ fn item_response(row: HealthJobItemRecord) -> JobItemResponse {
         relay_node_id_snapshot: row.relay_node_id_snapshot,
         state: row.state,
         attempt_count: row.attempt_count,
+        retry_count: row.retry_count,
         not_before: row.not_before_ms,
         first_started_at: row.first_started_at_ms,
         last_started_at: row.last_started_at_ms,
@@ -1413,5 +1452,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tampered_cursor.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn retry_failed_reports_exact_pairs_and_audits_idempotency_replay_truthfully() {
+        let (state, pool) = http_test_state().await;
+        let parent = NewHealthJob {
+            id: "retry-parent".into(),
+            source: HealthJobSource::Manual,
+            policy_id: None,
+            parent_job_id: None,
+            actor_id: Some(1),
+            request_fingerprint: "a".repeat(64),
+            snapshot_hash: snapshot_hash(&[(11, 31)]),
+            resource_selector_json: r#"{"ids":[11]}"#.into(),
+            node_selector_json: r#"{"ids":[31]}"#.into(),
+            scheduled_for_ms: None,
+            created_at_ms: 1_000,
+        };
+        state
+            .db
+            .create_health_job(
+                &parent,
+                &[NewHealthJobItem {
+                    resource_id: 11,
+                    relay_node_id: 31,
+                    not_before_ms: 1_000,
+                    deadline_at_ms: Some(10_000),
+                }],
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE socks5_check_job_items
+             SET state='FAILED',safe_error_code='UPSTREAM_UNAVAILABLE',
+                 safe_error_message='Upstream service unavailable',finished_at_ms=2000,updated_at_ms=2000
+             WHERE job_id='retry-parent'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE socks5_check_jobs
+             SET status='FAILED',queued_count=0,failed_count=1,finished_at_ms=2000
+             WHERE id='retry-parent'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = crate::api::routes().with_state(state);
+        let admin = token(1, true);
+        let key = uuid::Uuid::new_v4().to_string();
+        let created = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/admin/socks5-health/jobs/retry-parent/retry-failed",
+                Some(&admin),
+                Some(&key),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::ACCEPTED);
+        let created_body = axum::body::to_bytes(created.into_body(), 65_536)
+            .await
+            .unwrap();
+        let created_body: serde_json::Value = serde_json::from_slice(&created_body).unwrap();
+        let child_id = created_body["data"]["job_id"].as_str().unwrap();
+        assert_eq!(created_body["data"]["replayed"], false);
+
+        let replay = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/admin/socks5-health/jobs/retry-parent/retry-failed",
+                Some(&admin),
+                Some(&key),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+
+        let detail = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &format!("/admin/socks5-health/jobs/{child_id}"),
+                Some(&admin),
+                None,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail = axum::body::to_bytes(detail.into_body(), 65_536)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&detail).unwrap();
+        assert_eq!(detail["data"]["snapshot_semantics"], "EXACT_PAIRS");
+        assert_eq!(detail["data"]["selectors_reconstruct_snapshot"], false);
+        assert_eq!(detail["data"]["matrix_mode"], "CARTESIAN");
+
+        let audit: Vec<String> = sqlx::query_scalar(
+            "SELECT detail FROM audit_log WHERE action='JOB_RETRY_FAILED' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            audit,
+            vec![
+                "child_job_created=true; replayed=false".to_string(),
+                "child_job_created=false; replayed=true".to_string(),
+            ]
+        );
     }
 }

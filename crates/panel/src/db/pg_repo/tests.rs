@@ -7391,7 +7391,7 @@ async fn pg_health_orchestration_persistence_contract() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, 36);
     run_pg_migrations(&db.pool).await.unwrap();
     for index in crate::db::health_schema::HEALTH_INDEXES {
         let present: i64 = sqlx::query_scalar(
@@ -8551,7 +8551,10 @@ async fn pg_manual_health_runtime_claim_dispatch_renew_and_reconcile() {
         .unwrap()
         .unwrap();
     assert_eq!(dispatching.state, "DISPATCHING");
-    assert_eq!(dispatching.attempt_count, 1);
+    assert_eq!(
+        dispatching.attempt_count, 0,
+        "DISPATCHING is not yet a network attempt"
+    );
     assert_eq!(dispatching.item_fence_token, 2);
     assert_eq!(
         db.renew_health_item_and_pair_lease(&HealthLeaseRenewRequest {
@@ -8610,7 +8613,10 @@ async fn pg_manual_health_runtime_claim_dispatch_renew_and_reconcile() {
         .unwrap();
     assert_eq!(
         db.reconcile_health_job_counters(3_200, 10).await.unwrap(),
-        vec![job.id.clone()]
+        vec![HealthJobReconcileOutcome {
+            job_id: job.id.clone(),
+            finalized: false,
+        }]
     );
     let repaired = db.find_health_job(&job.id).await.unwrap().unwrap();
     assert_eq!((repaired.queued_count, repaired.running_count), (0, 1));
@@ -9252,7 +9258,7 @@ async fn pg_retry_snapshot_survives_deleted_live_resource_and_node() {
 }
 
 #[tokio::test]
-async fn pg_migration_35_upgrade_rollback_rerun_and_mismatch_detection() {
+async fn pg_migration_35_36_upgrade_rollback_rerun_and_mismatch_detection() {
     let Some(db) = repo("migration_35_health").await else {
         return;
     };
@@ -9263,7 +9269,7 @@ async fn pg_migration_35_upgrade_rollback_rerun_and_mismatch_detection() {
     .execute(&db.pool)
     .await
     .unwrap();
-    sqlx::query("DELETE FROM schema_version WHERE version=35")
+    sqlx::query("DELETE FROM schema_version WHERE version>=35")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -9294,8 +9300,75 @@ async fn pg_migration_35_upgrade_rollback_rerun_and_mismatch_detection() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, 36);
     run_pg_migrations(&db.pool).await.unwrap();
+
+    sqlx::query("DELETE FROM schema_version WHERE version=36")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE socks5_check_job_items DROP COLUMN retry_count")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut retry_tx = db.pool.begin().await.unwrap();
+    sqlx::query(crate::db::health_schema::POSTGRES_MIGRATION_36)
+        .execute(&mut *retry_tx)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("INSERT INTO definitely_missing_table VALUES(1)")
+            .execute(&mut *retry_tx)
+            .await
+            .is_err()
+    );
+    retry_tx.rollback().await.unwrap();
+    let retry_column_after_rollback: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema=current_schema() AND table_name='socks5_check_job_items'
+           AND column_name='retry_count'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(retry_column_after_rollback, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        35
+    );
+    run_pg_migrations(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    let retry_check: String = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint
+         WHERE conrelid='socks5_check_job_items'::regclass
+           AND contype='c' AND pg_get_constraintdef(oid,true) LIKE '%retry_count%'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "ALTER TABLE socks5_check_job_items DROP CONSTRAINT {retry_check}"
+    ))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query(&format!(
+        "ALTER TABLE socks5_check_job_items ADD CONSTRAINT {retry_check} CHECK(retry_count >= 0)"
+    ))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
     sqlx::query("DROP INDEX idx_socks5_check_job_items_ready")
         .execute(&db.pool)
         .await

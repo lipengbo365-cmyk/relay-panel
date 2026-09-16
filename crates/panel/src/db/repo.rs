@@ -34,10 +34,10 @@ use super::error::DbError;
 use super::health_orchestration::{
     ConditionalWriteOutcome, HealthItemClaimRequest, HealthItemDispatchRequest,
     HealthItemTransition, HealthJobCreateOutcome, HealthJobIdempotencyOutcome,
-    HealthJobItemListQuery, HealthJobItemRecord, HealthJobListQuery, HealthJobRecord,
-    HealthLeaseRenewRequest, HealthPairLeaseRecord, HealthPolicyPatch, HealthPolicyRecord,
-    NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem, NewHealthPolicy,
-    PairLeaseAcquireOutcome, PairLeaseAcquireRequest,
+    HealthJobItemListQuery, HealthJobItemRecord, HealthJobListQuery, HealthJobReconcileOutcome,
+    HealthJobRecord, HealthLeaseRenewRequest, HealthPairCoordinationRequest, HealthPairLeaseRecord,
+    HealthPolicyPatch, HealthPolicyRecord, NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem,
+    NewHealthPolicy, PairLeaseAcquireOutcome, PairLeaseAcquireRequest,
 };
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1014,7 +1014,7 @@ pub trait HealthOrchestrationRepository: Send + Sync {
         &self,
         now_ms: i64,
         limit: i64,
-    ) -> Result<Vec<String>, DbError>;
+    ) -> Result<Vec<HealthJobReconcileOutcome>, DbError>;
     async fn transition_health_job_item(
         &self,
         transition: &HealthItemTransition,
@@ -1030,6 +1030,23 @@ pub trait HealthOrchestrationRepository: Send + Sync {
         &self,
         request: PairLeaseAcquireRequest<'_>,
     ) -> Result<PairLeaseAcquireOutcome, DbError>;
+    async fn acquire_health_pair_coordination(
+        &self,
+        request: HealthPairCoordinationRequest<'_>,
+    ) -> Result<PairLeaseAcquireOutcome, DbError>;
+    async fn renew_health_pair_coordination(
+        &self,
+        request: HealthPairCoordinationRequest<'_>,
+        expected_pair_fence: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn release_health_pair_coordination(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        lease_owner: &str,
+        expected_pair_fence: i64,
+        now_ms: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
     #[allow(clippy::too_many_arguments)]
     async fn renew_health_pair_lease(
         &self,

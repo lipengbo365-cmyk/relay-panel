@@ -4,11 +4,11 @@ use crate::db::health_orchestration::{
     safe_error_message, validate_health_item_transition_fields, ConditionalWriteOutcome,
     HealthCounterCategory, HealthItemClaimRequest, HealthItemDispatchRequest, HealthItemTransition,
     HealthJobCreateOutcome, HealthJobIdempotencyOutcome, HealthJobItemListQuery,
-    HealthJobItemRecord, HealthJobItemState, HealthJobListQuery, HealthJobRecord,
-    HealthLeaseRenewRequest, HealthPairLeaseRecord, HealthPolicyPatch, HealthPolicyRecord,
-    NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem, NewHealthPolicy,
-    PairLeaseAcquireOutcome, PairLeaseAcquireRequest, HEALTH_RETRY_POLICY_VERSION,
-    PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS,
+    HealthJobItemRecord, HealthJobItemState, HealthJobListQuery, HealthJobReconcileOutcome,
+    HealthJobRecord, HealthJobStatus, HealthLeaseRenewRequest, HealthPairCoordinationRequest,
+    HealthPairLeaseRecord, HealthPolicyPatch, HealthPolicyRecord, NewHealthJob,
+    NewHealthJobIdempotency, NewHealthJobItem, NewHealthPolicy, PairLeaseAcquireOutcome,
+    PairLeaseAcquireRequest, HEALTH_RETRY_POLICY_VERSION, PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS,
 };
 use crate::db::repo::HealthOrchestrationRepository;
 use async_trait::async_trait;
@@ -86,14 +86,15 @@ async fn aggregate_and_finalize(
     tx: &mut Transaction<'_, Postgres>,
     job_id: &str,
     now_ms: i64,
-) -> Result<bool, DbError> {
-    let cancel: Option<bool> =
-        sqlx::query_scalar("SELECT cancel_requested FROM socks5_check_jobs WHERE id=$1 FOR UPDATE")
-            .bind(job_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let Some(cancel) = cancel else {
-        return Ok(false);
+) -> Result<(bool, bool), DbError> {
+    let current: Option<(bool, String)> = sqlx::query_as(
+        "SELECT cancel_requested,status FROM socks5_check_jobs WHERE id=$1 FOR UPDATE",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((cancel, previous_status)) = current else {
+        return Ok((false, false));
     };
     let _: Vec<i64> = sqlx::query_scalar(
         "SELECT id FROM socks5_check_job_items WHERE job_id=$1 ORDER BY id FOR UPDATE",
@@ -112,7 +113,7 @@ async fn aggregate_and_finalize(
     .fetch_optional(&mut **tx)
     .await?;
     let Some((queued, running, succeeded, failed, cancelled)) = counts else {
-        return Ok(false);
+        return Ok((false, false));
     };
     let total = queued + running + succeeded + failed + cancelled;
     let terminal = queued == 0 && running == 0;
@@ -135,9 +136,11 @@ async fn aggregate_and_finalize(
             "RUNNING"
         }
     };
-    let result=sqlx::query("UPDATE socks5_check_jobs SET status=$1,total_items=$2,queued_count=$3,running_count=$4,succeeded_count=$5,failed_count=$6,cancelled_count=$7,finished_at_ms=$8 WHERE id=$9")
-        .bind(status).bind(total).bind(queued).bind(running).bind(succeeded).bind(failed).bind(cancelled).bind(terminal.then_some(now_ms)).bind(job_id).execute(&mut **tx).await?;
-    Ok(result.rows_affected() == 1)
+    let finalized = terminal
+        && !HealthJobStatus::parse(&previous_status).is_some_and(HealthJobStatus::is_terminal);
+    let result=sqlx::query("UPDATE socks5_check_jobs SET status=$1,total_items=$2,queued_count=$3,running_count=$4,succeeded_count=$5,failed_count=$6,cancelled_count=$7,finished_at_ms=CASE WHEN $8 THEN COALESCE(finished_at_ms,$9) ELSE NULL END WHERE id=$10")
+        .bind(status).bind(total).bind(queued).bind(running).bind(succeeded).bind(failed).bind(cancelled).bind(terminal).bind(now_ms).bind(job_id).execute(&mut **tx).await?;
+    Ok((result.rows_affected() == 1, finalized))
 }
 
 #[async_trait]
@@ -554,7 +557,7 @@ impl HealthOrchestrationRepository for PgRepository {
         }
         let row = sqlx::query_as(
             "UPDATE socks5_check_job_items SET state='DISPATCHING',
-             attempt_count=attempt_count+1,item_fence_token=item_fence_token+1,
+             item_fence_token=item_fence_token+1,
              dispatch_attempt_id=$1,last_started_at_ms=$2,updated_at_ms=$2
              WHERE id=$3 AND state='LEASED' AND lease_owner=$4 AND item_fence_token=$5
                AND pair_fence_token=$6 AND lease_expires_at_ms>$2 RETURNING *",
@@ -686,7 +689,7 @@ impl HealthOrchestrationRepository for PgRepository {
         &self,
         now_ms: i64,
         limit: i64,
-    ) -> Result<Vec<String>, DbError> {
+    ) -> Result<Vec<HealthJobReconcileOutcome>, DbError> {
         let jobs: Vec<String> = sqlx::query_scalar(
             "SELECT j.id FROM socks5_check_jobs j
              JOIN LATERAL (
@@ -709,8 +712,9 @@ impl HealthOrchestrationRepository for PgRepository {
         let mut reconciled = Vec::new();
         for job_id in jobs {
             let mut tx = self.pool.begin().await?;
-            if aggregate_and_finalize(&mut tx, &job_id, now_ms).await? {
-                reconciled.push(job_id);
+            let (updated, finalized) = aggregate_and_finalize(&mut tx, &job_id, now_ms).await?;
+            if updated {
+                reconciled.push(HealthJobReconcileOutcome { job_id, finalized });
             }
             tx.commit().await?;
         }
@@ -784,7 +788,7 @@ impl HealthOrchestrationRepository for PgRepository {
         let terminal = t.new_state.is_terminal();
         let completed_after_cancel =
             t.completed_after_cancel || (cancelled && t.new_state == HealthJobItemState::Succeeded);
-        sqlx::query("UPDATE socks5_check_job_items SET state=$1,item_fence_token=item_fence_token+1,lease_owner=$2,lease_expires_at_ms=$3,pair_fence_token=$4,dispatch_attempt_id=$5,request_id=$6,not_before_ms=COALESCE($7,not_before_ms),first_started_at_ms=CASE WHEN $1='LEASED' THEN COALESCE(first_started_at_ms,$8) ELSE first_started_at_ms END,last_started_at_ms=CASE WHEN $1='LEASED' THEN $8 ELSE last_started_at_ms END,health_status=$9,safe_error_code=$10,safe_error_message=$11,completed_after_cancel=$12,updated_at_ms=$8,finished_at_ms=$13 WHERE id=$14 AND state=$15 AND item_fence_token=$16")
+        sqlx::query("UPDATE socks5_check_job_items SET state=$1,item_fence_token=item_fence_token+1,attempt_count=attempt_count+CASE WHEN $1='IN_FLIGHT' THEN 1 ELSE 0 END,retry_count=retry_count+CASE WHEN $1='RETRY_WAIT' THEN 1 ELSE 0 END,lease_owner=$2,lease_expires_at_ms=$3,pair_fence_token=$4,dispatch_attempt_id=$5,request_id=$6,not_before_ms=COALESCE($7,not_before_ms),first_started_at_ms=CASE WHEN $1='LEASED' THEN COALESCE(first_started_at_ms,$8) ELSE first_started_at_ms END,last_started_at_ms=CASE WHEN $1='LEASED' THEN $8 ELSE last_started_at_ms END,health_status=$9,safe_error_code=$10,safe_error_message=$11,completed_after_cancel=$12,updated_at_ms=$8,finished_at_ms=$13 WHERE id=$14 AND state=$15 AND item_fence_token=$16")
             .bind(t.new_state.as_str()).bind(&t.lease_owner).bind(t.lease_expires_at_ms).bind(t.pair_fence_token).bind(&t.dispatch_attempt_id).bind(&t.request_id).bind(t.not_before_ms).bind(t.now_ms).bind(&t.health_status).bind(&t.safe_error_code).bind(message).bind(completed_after_cancel).bind(terminal.then_some(t.now_ms)).bind(t.item_id).bind(t.expected_state.as_str()).bind(t.expected_fence).execute(&mut *tx).await?;
         if old != new {
             let sql=format!("UPDATE socks5_check_jobs SET {old}={old}-1,{new}={new}+1,status=CASE WHEN status='QUEUED' THEN 'RUNNING' ELSE status END,started_at_ms=COALESCE(started_at_ms,$1) WHERE id=$2",old=counter_column(old),new=counter_column(new));
@@ -819,7 +823,7 @@ impl HealthOrchestrationRepository for PgRepository {
             return Ok(true);
         }
         sqlx::query("UPDATE socks5_check_jobs SET cancel_requested=TRUE,status='CANCEL_REQUESTED' WHERE id=$1").bind(job_id).execute(&mut *tx).await?;
-        sqlx::query("UPDATE socks5_check_job_items SET state='CANCELLED',lease_owner=NULL,lease_expires_at_ms=NULL,pair_fence_token=NULL,dispatch_attempt_id=NULL,request_id=NULL,finished_at_ms=$1,updated_at_ms=$1 WHERE job_id=$2 AND state IN ('QUEUED','RETRY_WAIT')").bind(now_ms).bind(job_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE socks5_check_job_items SET state='CANCELLED',item_fence_token=item_fence_token+1,lease_owner=NULL,lease_expires_at_ms=NULL,pair_fence_token=NULL,dispatch_attempt_id=NULL,request_id=NULL,not_before_ms=$1,health_status=NULL,safe_error_code=NULL,safe_error_message=NULL,completed_after_cancel=FALSE,finished_at_ms=$1,updated_at_ms=$1 WHERE job_id=$2 AND state IN ('QUEUED','RETRY_WAIT')").bind(now_ms).bind(job_id).execute(&mut *tx).await?;
         aggregate_and_finalize(&mut tx, job_id, now_ms).await?;
         tx.commit().await?;
         Ok(true)
@@ -828,7 +832,7 @@ impl HealthOrchestrationRepository for PgRepository {
         let mut tx = self.pool.begin().await?;
         let value = aggregate_and_finalize(&mut tx, job_id, now_ms).await?;
         tx.commit().await?;
-        Ok(value)
+        Ok(value.0)
     }
     async fn retry_failed_health_pairs(
         &self,
@@ -899,6 +903,90 @@ impl HealthOrchestrationRepository for PgRepository {
         tx.commit().await?;
         Ok(PairLeaseAcquireOutcome::Acquired {
             pair_fence_token: token,
+        })
+    }
+    async fn acquire_health_pair_coordination(
+        &self,
+        r: HealthPairCoordinationRequest<'_>,
+    ) -> Result<PairLeaseAcquireOutcome, DbError> {
+        if r.resource_id <= 0
+            || r.relay_node_id <= 0
+            || r.lease_owner.is_empty()
+            || r.lease_expires_at_ms <= r.now_ms
+        {
+            return Err(DbError::ConstraintViolation);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1,hashtext($2))")
+            .bind(HEALTH_PAIR_LEASE_LOCK_CLASS)
+            .bind(format!("{}:{}", r.resource_id, r.relay_node_id))
+            .execute(&mut *tx)
+            .await?;
+        let row: Option<(Option<String>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT lease_owner,lease_expires_at_ms,pair_fence_token FROM socks5_check_pair_leases WHERE resource_id=$1 AND relay_node_id=$2 FOR UPDATE",
+        )
+        .bind(r.resource_id)
+        .bind(r.relay_node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let token = match row {
+            None => {
+                sqlx::query("INSERT INTO socks5_check_pair_leases(resource_id,relay_node_id,item_id,lease_owner,lease_expires_at_ms,pair_fence_token,updated_at_ms) VALUES($1,$2,NULL,$3,$4,1,$5)")
+                    .bind(r.resource_id).bind(r.relay_node_id).bind(r.lease_owner)
+                    .bind(r.lease_expires_at_ms).bind(r.now_ms).execute(&mut *tx).await?;
+                1
+            }
+            Some((owner, expires, token))
+                if owner.is_none() || expires.is_some_and(|value| value <= r.now_ms) =>
+            {
+                let next = token.checked_add(1).ok_or(DbError::ConstraintViolation)?;
+                sqlx::query("UPDATE socks5_check_pair_leases SET item_id=NULL,lease_owner=$1,lease_expires_at_ms=$2,pair_fence_token=$3,updated_at_ms=$4 WHERE resource_id=$5 AND relay_node_id=$6")
+                    .bind(r.lease_owner).bind(r.lease_expires_at_ms).bind(next).bind(r.now_ms)
+                    .bind(r.resource_id).bind(r.relay_node_id).execute(&mut *tx).await?;
+                next
+            }
+            Some(_) => {
+                tx.commit().await?;
+                return Ok(PairLeaseAcquireOutcome::Busy);
+            }
+        };
+        tx.commit().await?;
+        Ok(PairLeaseAcquireOutcome::Acquired {
+            pair_fence_token: token,
+        })
+    }
+    async fn renew_health_pair_coordination(
+        &self,
+        r: HealthPairCoordinationRequest<'_>,
+        expected_pair_fence: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError> {
+        if r.lease_owner.is_empty() || r.lease_expires_at_ms <= r.now_ms {
+            return Err(DbError::ConstraintViolation);
+        }
+        let result = sqlx::query("UPDATE socks5_check_pair_leases SET lease_expires_at_ms=$1,updated_at_ms=$2 WHERE resource_id=$3 AND relay_node_id=$4 AND item_id IS NULL AND lease_owner=$5 AND pair_fence_token=$6 AND lease_expires_at_ms>$2")
+            .bind(r.lease_expires_at_ms).bind(r.now_ms).bind(r.resource_id).bind(r.relay_node_id)
+            .bind(r.lease_owner).bind(expected_pair_fence).execute(&self.pool).await?;
+        Ok(if result.rows_affected() == 1 {
+            ConditionalWriteOutcome::Applied
+        } else {
+            ConditionalWriteOutcome::ConditionFailed
+        })
+    }
+    async fn release_health_pair_coordination(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        lease_owner: &str,
+        expected_pair_fence: i64,
+        now_ms: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError> {
+        let result = sqlx::query("UPDATE socks5_check_pair_leases SET lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=$1 WHERE resource_id=$2 AND relay_node_id=$3 AND item_id IS NULL AND lease_owner=$4 AND pair_fence_token=$5")
+            .bind(now_ms).bind(resource_id).bind(relay_node_id).bind(lease_owner).bind(expected_pair_fence)
+            .execute(&self.pool).await?;
+        Ok(if result.rows_affected() == 1 {
+            ConditionalWriteOutcome::Applied
+        } else {
+            ConditionalWriteOutcome::ConditionFailed
         })
     }
     async fn renew_health_pair_lease(

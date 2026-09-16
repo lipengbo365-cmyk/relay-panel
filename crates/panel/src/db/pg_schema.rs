@@ -531,7 +531,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 35;
+pub const PG_SCHEMA_VERSION: i32 = 36;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1966,6 +1966,18 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 35: durable health orchestration persistence present");
     }
 
+    if current < 36 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(crate::db::health_schema::POSTGRES_MIGRATION_36)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO schema_version(version) VALUES(36)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 36: durable orchestration retry counter present");
+    }
+
     validate_pg_health_schema(pool).await?;
 
     Ok(())
@@ -1982,7 +1994,7 @@ async fn validate_pg_health_schema(pool: &sqlx::PgPool) -> Result<(), sqlx::Erro
         .await?;
         if count != 1 {
             return Err(sqlx::Error::Protocol(format!(
-                "PostgreSQL migration 35 version/schema mismatch: missing {table}"
+                "PostgreSQL migration 36 version/schema mismatch: missing {table}"
             )));
         }
     }
@@ -1990,12 +2002,12 @@ async fn validate_pg_health_schema(pool: &sqlx::PgPool) -> Result<(), sqlx::Erro
     let manifests = [
         (
             "columns",
-            "SELECT string_agg(format('%s|%s|%s|%s|%s',c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),CASE WHEN a.attnotnull THEN 'N' ELSE 'Y' END)||'|'||COALESCE(pg_get_expr(d.adbin,d.adrelid),''), chr(10) ORDER BY c.relname,a.attnum) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE n.nspname=current_schema() AND c.relname=ANY($1)",
+            "SELECT string_agg(format('%s|%s|%s|%s|%s',c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),CASE WHEN a.attnotnull THEN 'N' ELSE 'Y' END)||'|'||COALESCE(pg_get_expr(d.adbin,d.adrelid),''), chr(10) ORDER BY c.relname,a.attnum) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND NOT (c.relname='socks5_check_job_items' AND a.attname='retry_count')",
             crate::db::health_schema::POSTGRES_HEALTH_COLUMN_FINGERPRINT,
         ),
         (
             "constraints",
-            "SELECT string_agg(c.relname||'|'||con.contype::text||'|'||pg_get_constraintdef(con.oid,true), chr(10) ORDER BY c.relname,con.contype::text,pg_get_constraintdef(con.oid,true)) FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND con.contype<>'n'",
+            "SELECT string_agg(c.relname||'|'||con.contype::text||'|'||pg_get_constraintdef(con.oid,true), chr(10) ORDER BY c.relname,con.contype::text,pg_get_constraintdef(con.oid,true)) FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND con.contype<>'n' AND pg_get_constraintdef(con.oid,true) NOT LIKE '%retry_count%'",
             crate::db::health_schema::POSTGRES_HEALTH_CONSTRAINT_FINGERPRINT,
         ),
         (
@@ -2017,6 +2029,29 @@ async fn validate_pg_health_schema(pool: &sqlx::PgPool) -> Result<(), sqlx::Erro
                 "PostgreSQL migration 35 version/schema mismatch: {kind} manifest {actual}, expected {expected}"
             )));
         }
+    }
+    let retry_column: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT data_type,is_nullable,column_default IN ('0','0::bigint') FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='socks5_check_job_items' AND column_name='retry_count'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if retry_column != Some(("bigint".into(), "NO".into(), true)) {
+        return Err(sqlx::Error::Protocol(
+            format!(
+                "PostgreSQL migration 36 version/schema mismatch: retry_count column differs: {retry_column:?}"
+            ),
+        ));
+    }
+    let retry_check: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname='socks5_check_job_items' AND con.contype='c' AND pg_get_constraintdef(con.oid,true)='CHECK (retry_count >= 0)')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !retry_check {
+        return Err(sqlx::Error::Protocol(
+            "PostgreSQL migration 36 version/schema mismatch: retry_count constraint missing"
+                .into(),
+        ));
     }
     Ok(())
 }

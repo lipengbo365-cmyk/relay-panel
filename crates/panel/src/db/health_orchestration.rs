@@ -435,6 +435,12 @@ pub struct HealthJobRecord {
     pub finished_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthJobReconcileOutcome {
+    pub job_id: String,
+    pub finalized: bool,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct HealthJobItemRecord {
     pub id: i64,
@@ -445,6 +451,7 @@ pub struct HealthJobItemRecord {
     pub relay_node_id_snapshot: i64,
     pub state: String,
     pub attempt_count: i64,
+    pub retry_count: i64,
     pub item_fence_token: i64,
     pub pair_fence_token: Option<i64>,
     pub dispatch_attempt_id: Option<String>,
@@ -578,6 +585,17 @@ pub struct PairLeaseAcquireRequest<'a> {
     pub resource_id: i64,
     pub relay_node_id: i64,
     pub item_id: i64,
+    pub lease_owner: &'a str,
+    pub lease_expires_at_ms: i64,
+    pub now_ms: i64,
+}
+
+/// Pair ownership for the legacy synchronous health APIs. It shares the same
+/// durable pair table as Jobs, but has no Job Item foreign key.
+#[derive(Debug, Clone, Copy)]
+pub struct HealthPairCoordinationRequest<'a> {
+    pub resource_id: i64,
+    pub relay_node_id: i64,
     pub lease_owner: &'a str,
     pub lease_expires_at_ms: i64,
     pub now_ms: i64,

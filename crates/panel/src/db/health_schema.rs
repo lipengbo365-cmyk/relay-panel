@@ -175,6 +175,11 @@ pub const SQLITE_MIGRATION_51: [&str; 15] = [
     "CREATE INDEX idx_socks5_health_job_idempotency_expiry ON socks5_health_job_idempotency(expires_at_ms)",
 ];
 
+/// Stage 5.2 audit remediation. Historical migration 51 remains immutable;
+/// retry scheduling gets its own durable counter in migration 52.
+pub const SQLITE_MIGRATION_52: &str =
+    "ALTER TABLE socks5_check_job_items ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0)";
+
 pub const POSTGRES_MIGRATION_35: [&str; 15] = [
     r#"CREATE TABLE socks5_check_policies (
         id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE CHECK(length(btrim(name)) > 0),
@@ -271,3 +276,7 @@ pub const POSTGRES_MIGRATION_35: [&str; 15] = [
     "CREATE INDEX idx_socks5_check_pair_leases_updated ON socks5_check_pair_leases(updated_at_ms)",
     "CREATE INDEX idx_socks5_health_job_idempotency_expiry ON socks5_health_job_idempotency(expires_at_ms)",
 ];
+
+/// Stage 5.2 audit remediation. Historical migration 35 remains immutable.
+pub const POSTGRES_MIGRATION_36: &str =
+    "ALTER TABLE socks5_check_job_items ADD COLUMN retry_count BIGINT NOT NULL DEFAULT 0 CHECK(retry_count >= 0)";

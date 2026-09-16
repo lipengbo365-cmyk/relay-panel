@@ -16,7 +16,7 @@ use std::time::Duration;
 const ITEM_LEASE_MS: i64 = 60_000;
 const LEASE_RENEW_MS: i64 = 15_000;
 const RESULT_TIMEOUT_MS: i64 = 35_000;
-const MAX_ATTEMPTS: i64 = 3;
+const MAX_RETRIES: i64 = 3;
 const MAX_RETRY_AGE_MS: i64 = 15 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
@@ -29,15 +29,17 @@ pub struct HealthWorkerConfig {
 }
 
 impl HealthWorkerConfig {
-    pub fn load() -> Result<Self, String> {
+    pub fn load(database_path: &str) -> Result<Self, String> {
+        let sqlite = !crate::db::init::is_postgres_url(database_path);
         let config = Self {
-            global_limit: parse_env("HEALTH_WORKER_GLOBAL_LIMIT", 50)?,
+            global_limit: parse_env("HEALTH_WORKER_GLOBAL_LIMIT", if sqlite { 16 } else { 50 })?,
             per_node_limit: parse_env("HEALTH_WORKER_PER_NODE_LIMIT", 10)?,
-            per_job_limit: parse_env("HEALTH_WORKER_PER_JOB_LIMIT", 20)?,
+            per_job_limit: parse_env("HEALTH_WORKER_PER_JOB_LIMIT", if sqlite { 16 } else { 20 })?,
             node_queue_soft_limit: parse_env("HEALTH_WORKER_NODE_QUEUE_SOFT_LIMIT", 160)?,
-            claim_batch: parse_env("HEALTH_WORKER_CLAIM_BATCH", 32)?,
+            claim_batch: parse_env("HEALTH_WORKER_CLAIM_BATCH", if sqlite { 8 } else { 32 })?,
         };
         config.validate()?;
+        config.validate_for_database(sqlite)?;
         Ok(config)
     }
 
@@ -63,6 +65,16 @@ impl HealthWorkerConfig {
         }
         Ok(())
     }
+
+    fn validate_for_database(&self, sqlite: bool) -> Result<(), String> {
+        if sqlite && self.global_limit > 16 {
+            return Err("HEALTH_WORKER_GLOBAL_LIMIT must be <= 16 for SQLite".into());
+        }
+        if sqlite && self.claim_batch > 8 {
+            return Err("HEALTH_WORKER_CLAIM_BATCH must be <= 8 for SQLite".into());
+        }
+        Ok(())
+    }
 }
 
 fn parse_env(name: &str, default: i64) -> Result<i64, String> {
@@ -77,27 +89,8 @@ fn parse_env(name: &str, default: i64) -> Result<i64, String> {
 
 pub fn spawn(state: AppState, config: HealthWorkerConfig) {
     let owner = format!("panel:{}", uuid::Uuid::new_v4());
-    let sqlite = !crate::db::init::is_postgres_url(&state.config.database_path);
-    let effective_global = if sqlite {
-        config.global_limit.min(16)
-    } else {
-        config.global_limit
-    };
-    let effective_batch = if sqlite {
-        config.claim_batch.min(8)
-    } else {
-        config.claim_batch.min(32)
-    };
-    if sqlite && (effective_global != config.global_limit || effective_batch != config.claim_batch)
-    {
-        tracing::warn!(
-            configured_global = config.global_limit,
-            effective_global,
-            configured_claim_batch = config.claim_batch,
-            effective_claim_batch = effective_batch,
-            "SQLite durable health worker safety caps are active"
-        );
-    }
+    let effective_global = config.global_limit;
+    let effective_batch = config.claim_batch;
     let runtime = Runtime {
         state,
         owner,
@@ -530,11 +523,12 @@ impl Runtime {
         let now = now_ms();
         let expired = item.deadline_at_ms.is_some_and(|deadline| deadline <= now)
             || now.saturating_sub(item.created_at_ms) >= MAX_RETRY_AGE_MS;
-        if expired || item.attempt_count >= MAX_ATTEMPTS {
+        if expired || item.retry_count >= MAX_RETRIES {
             self.fail_owned(item, pair_fence, code).await;
             return;
         }
-        let delay = retry_delay_ms(item.attempt_count.max(1));
+        let next_retry_count = item.retry_count.saturating_add(1);
+        let delay = retry_delay_ms(next_retry_count);
         let Some(expected_state) = HealthJobItemState::parse(&item.state) else {
             return;
         };
@@ -714,23 +708,27 @@ impl Runtime {
     }
 
     async fn reconcile(&self) {
+        let transition_ms = now_ms();
         match self
             .state
             .db
-            .reconcile_health_job_counters(now_ms(), 500)
+            .reconcile_health_job_counters(transition_ms, 500)
             .await
         {
-            Ok(job_ids) => {
-                for job_id in job_ids {
+            Ok(outcomes) => {
+                for outcome in outcomes {
                     crate::service::audit::record(
                         &self.state,
                         None,
                         "JOB_COUNTER_RECONCILED",
                         "socks5_health_job",
-                        &job_id,
+                        &outcome.job_id,
                         "counters_rebuilt_from_items=true",
                     )
                     .await;
+                    if outcome.finalized {
+                        self.audit_if_final(&outcome.job_id, transition_ms).await;
+                    }
                 }
             }
             Err(error) => tracing::warn!("durable health counter reconciliation failed: {error}"),
@@ -840,6 +838,14 @@ mod tests {
         config.global_limit = 50;
         config.claim_batch = 33;
         assert!(config.validate().is_err());
+
+        config.claim_batch = 32;
+        assert!(config.validate_for_database(false).is_ok());
+        assert!(config.validate_for_database(true).is_err());
+        config.global_limit = 16;
+        assert!(config.validate_for_database(true).is_err());
+        config.claim_batch = 8;
+        assert!(config.validate_for_database(true).is_ok());
     }
 
     #[tokio::test]
@@ -904,7 +910,7 @@ mod tests {
             socks5_checks: crate::api::socks5_health::Socks5CheckRegistry::new(),
             geoip_in_flight: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
-        let (_connection_id, mut node_receiver) = state
+        let (connection_id, mut node_receiver) = state
             .node_connections
             .register(group, Some("worker-e2e-node".into()))
             .await;
@@ -1041,6 +1047,33 @@ mod tests {
                 .len(),
             1
         );
+        let finalized_audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_id='worker-e2e-job'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(finalized_audits, 1);
+        sqlx::query(
+            "UPDATE socks5_check_jobs SET succeeded_count=0,failed_count=1
+             WHERE id='worker-e2e-job'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        runtime.reconcile().await;
+        let finalized_audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_id='worker-e2e-job'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            finalized_audits, 1,
+            "counter reconciliation must not duplicate JOB_FINALIZED"
+        );
 
         // Recovery is DB-driven: an expired pre-dispatch lease returns to
         // RETRY_WAIT without consuming a network attempt and releases the Pair.
@@ -1093,6 +1126,7 @@ mod tests {
             .remove(0);
         assert_eq!(recovered.state, "RETRY_WAIT");
         assert_eq!(recovered.attempt_count, 0);
+        assert_eq!(recovered.retry_count, 1);
         assert_eq!(
             recovered.safe_error_code.as_deref(),
             Some("UPSTREAM_UNAVAILABLE")
@@ -1105,5 +1139,104 @@ mod tests {
             .unwrap();
         assert_eq!(pair.lease_owner, None);
         assert_eq!(pair.item_id, None);
+        state
+            .db
+            .cancel_health_job(&recovery_job.id, now_ms())
+            .await
+            .unwrap();
+
+        // A persistently offline Node consumes orchestration retries without
+        // inventing network attempts, then terminates at the retry limit.
+        state
+            .node_connections
+            .unregister(group, connection_id)
+            .await;
+        let offline_now = now_ms();
+        let offline_job = NewHealthJob {
+            id: "worker-offline-job".into(),
+            source: HealthJobSource::Manual,
+            policy_id: None,
+            parent_job_id: None,
+            actor_id: None,
+            request_fingerprint: "c".repeat(64),
+            snapshot_hash: snapshot_hash(&[(resource, node)]),
+            resource_selector_json: "{}".into(),
+            node_selector_json: "{}".into(),
+            scheduled_for_ms: None,
+            created_at_ms: offline_now,
+        };
+        state
+            .db
+            .create_health_job(
+                &offline_job,
+                &[NewHealthJobItem {
+                    resource_id: resource,
+                    relay_node_id: node,
+                    not_before_ms: offline_now,
+                    deadline_at_ms: Some(offline_now + MAX_RETRY_AGE_MS),
+                }],
+            )
+            .await
+            .unwrap();
+        for expected_retry_count in 1..=MAX_RETRIES {
+            let leased = state
+                .db
+                .claim_health_job_items(&HealthItemClaimRequest {
+                    lease_owner: runtime.owner.clone(),
+                    now_ms: offline_now + 120_000,
+                    lease_expires_at_ms: offline_now + 180_000,
+                    limit: 1,
+                    global_limit: 16,
+                    per_node_limit: 10,
+                    per_job_limit: 16,
+                })
+                .await
+                .unwrap()
+                .remove(0);
+            runtime.execute(leased).await;
+            let retried = state
+                .db
+                .list_health_job_items(&offline_job.id)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(retried.state, "RETRY_WAIT");
+            assert_eq!(retried.attempt_count, 0);
+            assert_eq!(retried.retry_count, expected_retry_count);
+        }
+        let leased = state
+            .db
+            .claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: runtime.owner.clone(),
+                now_ms: offline_now + 120_000,
+                lease_expires_at_ms: offline_now + 180_000,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 16,
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        runtime.execute(leased).await;
+        let failed = state
+            .db
+            .list_health_job_items(&offline_job.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(failed.state, "FAILED");
+        assert_eq!(failed.attempt_count, 0);
+        assert_eq!(failed.retry_count, MAX_RETRIES);
+        assert_eq!(
+            state
+                .db
+                .find_health_job(&offline_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "FAILED"
+        );
     }
 }
