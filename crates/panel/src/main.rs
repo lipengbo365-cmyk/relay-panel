@@ -111,6 +111,10 @@ async fn main() {
         )),
     };
 
+    let health_worker_config = service::health_worker::HealthWorkerConfig::load()
+        .expect("invalid durable health worker configuration");
+    service::health_worker::spawn(state.clone(), health_worker_config);
+
     // v1.2.0: scheduled rule restarts. Shares the AppState (and therefore the
     // same node WS registry) with the HTTP handlers, so a scheduled restart goes
     // out over exactly the same control channel as a manual one.

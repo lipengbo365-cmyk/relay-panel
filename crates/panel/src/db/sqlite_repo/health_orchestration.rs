@@ -2,10 +2,12 @@ use super::SqliteRepository;
 use crate::db::error::DbError;
 use crate::db::health_orchestration::{
     safe_error_message, validate_health_item_transition_fields, ConditionalWriteOutcome,
-    HealthCounterCategory, HealthItemTransition, HealthJobCreateOutcome,
-    HealthJobIdempotencyOutcome, HealthJobItemRecord, HealthJobRecord, HealthPairLeaseRecord,
-    HealthPolicyPatch, HealthPolicyRecord, NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem,
-    NewHealthPolicy, PairLeaseAcquireOutcome, PairLeaseAcquireRequest, HEALTH_RETRY_POLICY_VERSION,
+    HealthCounterCategory, HealthItemClaimRequest, HealthItemDispatchRequest, HealthItemTransition,
+    HealthJobCreateOutcome, HealthJobIdempotencyOutcome, HealthJobItemListQuery,
+    HealthJobItemRecord, HealthJobItemState, HealthJobListQuery, HealthJobRecord,
+    HealthLeaseRenewRequest, HealthPairLeaseRecord, HealthPolicyPatch, HealthPolicyRecord,
+    NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem, NewHealthPolicy,
+    PairLeaseAcquireOutcome, PairLeaseAcquireRequest, HEALTH_RETRY_POLICY_VERSION,
     PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS,
 };
 use crate::db::repo::HealthOrchestrationRepository;
@@ -74,7 +76,8 @@ async fn insert_job(
              (job_id,resource_id,relay_node_id,resource_id_snapshot,relay_node_id_snapshot,
               state,attempt_count,item_fence_token,not_before_ms,deadline_at_ms,
               completed_after_cancel,created_at_ms,updated_at_ms)
-             VALUES(?,?,?,?,?,'QUEUED',0,0,?,?,0,?,?)",
+             VALUES(?,(SELECT id FROM socks5_resources WHERE id=?),
+                    (SELECT id FROM relay_nodes WHERE id=?),?,?,'QUEUED',0,0,?,?,0,?,?)",
         )
         .bind(&job.id)
         .bind(item.resource_id)
@@ -330,6 +333,29 @@ impl HealthOrchestrationRepository for SqliteRepository {
             .fetch_optional(&self.pool)
             .await?)
     }
+    async fn list_health_jobs(
+        &self,
+        query: &HealthJobListQuery,
+    ) -> Result<Vec<HealthJobRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM socks5_check_jobs
+             WHERE (? IS NULL OR status=?)
+               AND (? IS NULL OR source=?)
+               AND (? IS NULL OR created_at_ms < ? OR (created_at_ms=? AND id < ?))
+             ORDER BY created_at_ms DESC,id DESC LIMIT ?",
+        )
+        .bind(&query.status)
+        .bind(&query.status)
+        .bind(&query.source)
+        .bind(&query.source)
+        .bind(query.before_created_at_ms)
+        .bind(query.before_created_at_ms)
+        .bind(query.before_created_at_ms)
+        .bind(&query.before_id)
+        .bind(query.limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
     async fn list_health_job_items(
         &self,
         job_id: &str,
@@ -340,6 +366,392 @@ impl HealthOrchestrationRepository for SqliteRepository {
                 .fetch_all(&self.pool)
                 .await?,
         )
+    }
+    async fn list_health_job_items_page(
+        &self,
+        query: &HealthJobItemListQuery,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM socks5_check_job_items
+             WHERE job_id=? AND (? IS NULL OR state=?)
+               AND (? IS NULL OR safe_error_code=?)
+               AND (? IS NULL OR id>?)
+             ORDER BY id ASC LIMIT ?",
+        )
+        .bind(&query.job_id)
+        .bind(&query.state)
+        .bind(&query.state)
+        .bind(&query.safe_error_code)
+        .bind(&query.safe_error_code)
+        .bind(query.after_id)
+        .bind(query.after_id)
+        .bind(query.limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn find_health_job_item(
+        &self,
+        item_id: i64,
+    ) -> Result<Option<HealthJobItemRecord>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM socks5_check_job_items WHERE id=?")
+                .bind(item_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn claim_health_job_items(
+        &self,
+        request: &HealthItemClaimRequest,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError> {
+        if request.lease_owner.is_empty()
+            || request.lease_expires_at_ms <= request.now_ms
+            || request.limit <= 0
+            || request.global_limit <= 0
+            || request.per_node_limit <= 0
+            || request.per_job_limit <= 0
+        {
+            return Err(DbError::ConstraintViolation);
+        }
+        let mut conn = begin_immediate(&self.pool).await?;
+        let mut claimed = Vec::new();
+        let claim_limit = request.limit.min(8);
+        while claimed.len() < claim_limit as usize {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM socks5_check_job_items
+                 WHERE state IN ('LEASED','DISPATCHING','IN_FLIGHT')",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if active >= request.global_limit {
+                break;
+            }
+            let candidate: Option<(i64, String, i64, i64, String, i64)> = sqlx::query_as(
+                "SELECT i.id,i.job_id,i.resource_id_snapshot,i.relay_node_id_snapshot,
+                        i.state,i.item_fence_token
+                 FROM socks5_check_job_items i
+                 JOIN socks5_check_jobs j ON j.id=i.job_id
+                 WHERE j.source IN ('MANUAL','RETRY_FAILED')
+                   AND j.cancel_requested=0
+                   AND j.status IN ('QUEUED','RUNNING')
+                   AND j.running_count < ?
+                   AND i.state IN ('QUEUED','RETRY_WAIT')
+                   AND i.not_before_ms <= ?
+                   AND (i.deadline_at_ms IS NULL OR i.deadline_at_ms > ?)
+                   AND (SELECT COUNT(*) FROM socks5_check_job_items n
+                        WHERE n.relay_node_id_snapshot=i.relay_node_id_snapshot
+                          AND n.state IN ('LEASED','DISPATCHING','IN_FLIGHT')) < ?
+                   AND NOT EXISTS(
+                       SELECT 1 FROM socks5_check_pair_leases p
+                       WHERE p.resource_id=i.resource_id_snapshot
+                         AND p.relay_node_id=i.relay_node_id_snapshot
+                         AND p.lease_owner IS NOT NULL
+                         AND p.lease_expires_at_ms > ?)
+                 ORDER BY i.not_before_ms,j.created_at_ms,i.id LIMIT 1",
+            )
+            .bind(request.per_job_limit)
+            .bind(request.now_ms)
+            .bind(request.now_ms)
+            .bind(request.per_node_limit)
+            .bind(request.now_ms)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some((item_id, job_id, resource_id, relay_node_id, state, item_fence)) = candidate
+            else {
+                break;
+            };
+            let pair: Option<(Option<String>, Option<i64>, i64)> = sqlx::query_as(
+                "SELECT lease_owner,lease_expires_at_ms,pair_fence_token
+                 FROM socks5_check_pair_leases WHERE resource_id=? AND relay_node_id=?",
+            )
+            .bind(resource_id)
+            .bind(relay_node_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let pair_fence = match pair {
+                None => {
+                    sqlx::query(
+                        "INSERT INTO socks5_check_pair_leases
+                         (resource_id,relay_node_id,item_id,lease_owner,lease_expires_at_ms,
+                          pair_fence_token,updated_at_ms) VALUES(?,?,?,?,?,1,?)",
+                    )
+                    .bind(resource_id)
+                    .bind(relay_node_id)
+                    .bind(item_id)
+                    .bind(&request.lease_owner)
+                    .bind(request.lease_expires_at_ms)
+                    .bind(request.now_ms)
+                    .execute(&mut *conn)
+                    .await?;
+                    1
+                }
+                Some((owner, expires, token))
+                    if owner.is_none() || expires.is_some_and(|value| value <= request.now_ms) =>
+                {
+                    let next = token.checked_add(1).ok_or(DbError::ConstraintViolation)?;
+                    sqlx::query(
+                        "UPDATE socks5_check_pair_leases
+                         SET item_id=?,lease_owner=?,lease_expires_at_ms=?,pair_fence_token=?,
+                             updated_at_ms=? WHERE resource_id=? AND relay_node_id=?",
+                    )
+                    .bind(item_id)
+                    .bind(&request.lease_owner)
+                    .bind(request.lease_expires_at_ms)
+                    .bind(next)
+                    .bind(request.now_ms)
+                    .bind(resource_id)
+                    .bind(relay_node_id)
+                    .execute(&mut *conn)
+                    .await?;
+                    next
+                }
+                Some(_) => continue,
+            };
+            let updated = sqlx::query(
+                "UPDATE socks5_check_job_items
+                 SET state='LEASED',item_fence_token=item_fence_token+1,lease_owner=?,
+                     lease_expires_at_ms=?,pair_fence_token=?,first_started_at_ms=COALESCE(first_started_at_ms,?),
+                     last_started_at_ms=?,safe_error_code=NULL,safe_error_message=NULL,updated_at_ms=?
+                 WHERE id=? AND state=? AND item_fence_token=?",
+            )
+            .bind(&request.lease_owner)
+            .bind(request.lease_expires_at_ms)
+            .bind(pair_fence)
+            .bind(request.now_ms)
+            .bind(request.now_ms)
+            .bind(request.now_ms)
+            .bind(item_id)
+            .bind(&state)
+            .bind(item_fence)
+            .execute(&mut *conn)
+            .await?;
+            if updated.rows_affected() != 1 {
+                rollback(&mut conn).await;
+                return Err(DbError::RevisionConflict);
+            }
+            sqlx::query(
+                "UPDATE socks5_check_jobs
+                 SET queued_count=queued_count-1,running_count=running_count+1,
+                     status='RUNNING',started_at_ms=COALESCE(started_at_ms,?) WHERE id=?",
+            )
+            .bind(request.now_ms)
+            .bind(&job_id)
+            .execute(&mut *conn)
+            .await?;
+            claimed.push(
+                sqlx::query_as("SELECT * FROM socks5_check_job_items WHERE id=?")
+                    .bind(item_id)
+                    .fetch_one(&mut *conn)
+                    .await?,
+            );
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(claimed)
+    }
+
+    async fn begin_health_item_dispatch(
+        &self,
+        request: &HealthItemDispatchRequest,
+    ) -> Result<Option<HealthJobItemRecord>, DbError> {
+        if request.lease_owner.is_empty()
+            || request.dispatch_attempt_id.is_empty()
+            || request.expected_item_fence < 0
+            || request.expected_pair_fence < 0
+        {
+            return Err(DbError::ConstraintViolation);
+        }
+        let mut conn = begin_immediate(&self.pool).await?;
+        let item: Option<(String, i64, i64)> = sqlx::query_as(
+            "SELECT job_id,resource_id_snapshot,relay_node_id_snapshot
+             FROM socks5_check_job_items WHERE id=? AND state='LEASED'
+               AND lease_owner=? AND item_fence_token=? AND pair_fence_token=?
+               AND lease_expires_at_ms>?",
+        )
+        .bind(request.item_id)
+        .bind(&request.lease_owner)
+        .bind(request.expected_item_fence)
+        .bind(request.expected_pair_fence)
+        .bind(request.now_ms)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((job_id, resource_id, relay_node_id)) = item else {
+            rollback(&mut conn).await;
+            return Ok(None);
+        };
+        let cancelled: bool =
+            sqlx::query_scalar("SELECT cancel_requested FROM socks5_check_jobs WHERE id=?")
+                .bind(&job_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        let pair_owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM socks5_check_pair_leases
+             WHERE resource_id=? AND relay_node_id=? AND item_id=? AND lease_owner=?
+               AND pair_fence_token=? AND lease_expires_at_ms>?)",
+        )
+        .bind(resource_id)
+        .bind(relay_node_id)
+        .bind(request.item_id)
+        .bind(&request.lease_owner)
+        .bind(request.expected_pair_fence)
+        .bind(request.now_ms)
+        .fetch_one(&mut *conn)
+        .await?;
+        if cancelled || !pair_owned {
+            rollback(&mut conn).await;
+            return Ok(None);
+        }
+        let updated = sqlx::query(
+            "UPDATE socks5_check_job_items
+             SET state='DISPATCHING',attempt_count=attempt_count+1,
+                 item_fence_token=item_fence_token+1,dispatch_attempt_id=?,last_started_at_ms=?,
+                 updated_at_ms=? WHERE id=? AND state='LEASED' AND lease_owner=?
+                 AND item_fence_token=? AND pair_fence_token=? AND lease_expires_at_ms>?",
+        )
+        .bind(&request.dispatch_attempt_id)
+        .bind(request.now_ms)
+        .bind(request.now_ms)
+        .bind(request.item_id)
+        .bind(&request.lease_owner)
+        .bind(request.expected_item_fence)
+        .bind(request.expected_pair_fence)
+        .bind(request.now_ms)
+        .execute(&mut *conn)
+        .await?;
+        if updated.rows_affected() != 1 {
+            rollback(&mut conn).await;
+            return Ok(None);
+        }
+        let row = sqlx::query_as("SELECT * FROM socks5_check_job_items WHERE id=?")
+            .bind(request.item_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(Some(row))
+    }
+
+    async fn renew_health_item_and_pair_lease(
+        &self,
+        request: &HealthLeaseRenewRequest,
+    ) -> Result<ConditionalWriteOutcome, DbError> {
+        if request.lease_owner.is_empty() || request.lease_expires_at_ms <= request.now_ms {
+            return Err(DbError::ConstraintViolation);
+        }
+        let mut conn = begin_immediate(&self.pool).await?;
+        let item: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT resource_id_snapshot,relay_node_id_snapshot FROM socks5_check_job_items
+             WHERE id=? AND state IN ('LEASED','DISPATCHING','IN_FLIGHT') AND lease_owner=?
+               AND item_fence_token=? AND pair_fence_token=? AND lease_expires_at_ms>?",
+        )
+        .bind(request.item_id)
+        .bind(&request.lease_owner)
+        .bind(request.expected_item_fence)
+        .bind(request.expected_pair_fence)
+        .bind(request.now_ms)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((resource_id, relay_node_id)) = item else {
+            rollback(&mut conn).await;
+            return Ok(ConditionalWriteOutcome::ConditionFailed);
+        };
+        let pair = sqlx::query(
+            "UPDATE socks5_check_pair_leases SET lease_expires_at_ms=?,updated_at_ms=?
+             WHERE resource_id=? AND relay_node_id=? AND item_id=? AND lease_owner=?
+               AND pair_fence_token=? AND lease_expires_at_ms>?",
+        )
+        .bind(request.lease_expires_at_ms)
+        .bind(request.now_ms)
+        .bind(resource_id)
+        .bind(relay_node_id)
+        .bind(request.item_id)
+        .bind(&request.lease_owner)
+        .bind(request.expected_pair_fence)
+        .bind(request.now_ms)
+        .execute(&mut *conn)
+        .await?;
+        if pair.rows_affected() != 1 {
+            rollback(&mut conn).await;
+            return Ok(ConditionalWriteOutcome::ConditionFailed);
+        }
+        sqlx::query(
+            "UPDATE socks5_check_job_items SET lease_expires_at_ms=?,updated_at_ms=?
+             WHERE id=? AND lease_owner=? AND item_fence_token=? AND pair_fence_token=?",
+        )
+        .bind(request.lease_expires_at_ms)
+        .bind(request.now_ms)
+        .bind(request.item_id)
+        .bind(&request.lease_owner)
+        .bind(request.expected_item_fence)
+        .bind(request.expected_pair_fence)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(ConditionalWriteOutcome::Applied)
+    }
+
+    async fn list_expired_health_job_items(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM socks5_check_job_items
+             WHERE state IN ('LEASED','DISPATCHING','IN_FLIGHT') AND lease_expires_at_ms<=?
+             ORDER BY lease_expires_at_ms,id LIMIT ?",
+        )
+        .bind(now_ms)
+        .bind(limit.clamp(0, 500))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn list_overdue_health_job_items(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM socks5_check_job_items
+             WHERE state IN ('QUEUED','RETRY_WAIT') AND deadline_at_ms IS NOT NULL
+               AND deadline_at_ms<=? ORDER BY deadline_at_ms,id LIMIT ?",
+        )
+        .bind(now_ms)
+        .bind(limit.clamp(0, 500))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn reconcile_health_job_counters(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DbError> {
+        let mut conn = begin_immediate(&self.pool).await?;
+        let jobs: Vec<String> = sqlx::query_scalar(
+            "SELECT j.id FROM socks5_check_jobs j
+             WHERE EXISTS(
+               SELECT 1 FROM (
+                 SELECT COUNT(*) total,
+                   SUM(CASE WHEN state IN ('QUEUED','RETRY_WAIT') THEN 1 ELSE 0 END) queued,
+                   SUM(CASE WHEN state IN ('LEASED','DISPATCHING','IN_FLIGHT') THEN 1 ELSE 0 END) running,
+                   SUM(CASE WHEN state='SUCCEEDED' THEN 1 ELSE 0 END) succeeded,
+                   SUM(CASE WHEN state='FAILED' THEN 1 ELSE 0 END) failed,
+                   SUM(CASE WHEN state='CANCELLED' THEN 1 ELSE 0 END) cancelled
+                 FROM socks5_check_job_items WHERE job_id=j.id
+               ) x WHERE x.total<>j.total_items OR x.queued<>j.queued_count
+                   OR x.running<>j.running_count OR x.succeeded<>j.succeeded_count
+                   OR x.failed<>j.failed_count OR x.cancelled<>j.cancelled_count)
+             ORDER BY j.created_at_ms,j.id LIMIT ?",
+        )
+        .bind(limit.clamp(0, 500))
+        .fetch_all(&mut *conn)
+        .await?;
+        for job_id in &jobs {
+            aggregate_and_finalize(&mut conn, job_id, now_ms).await?;
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(jobs)
     }
 
     async fn transition_health_job_item(
@@ -371,12 +783,29 @@ impl HealthOrchestrationRepository for SqliteRepository {
             rollback(&mut conn).await;
             return Ok(ConditionalWriteOutcome::ConditionFailed);
         }
+        let job_status: String =
+            sqlx::query_scalar("SELECT status FROM socks5_check_jobs WHERE id=?")
+                .bind(&job_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        let cancelled = job_status == "CANCEL_REQUESTED";
+        if cancelled
+            && !matches!(
+                t.new_state,
+                HealthJobItemState::Succeeded | HealthJobItemState::Cancelled
+            )
+        {
+            rollback(&mut conn).await;
+            return Ok(ConditionalWriteOutcome::ConditionFailed);
+        }
         let old = t.expected_state.counter_category();
         let new = t.new_state.counter_category();
         let terminal = t.new_state.is_terminal();
+        let completed_after_cancel =
+            t.completed_after_cancel || (cancelled && t.new_state == HealthJobItemState::Succeeded);
         sqlx::query("UPDATE socks5_check_job_items SET state=?,item_fence_token=item_fence_token+1,lease_owner=?,lease_expires_at_ms=?,pair_fence_token=?,dispatch_attempt_id=?,request_id=?,not_before_ms=COALESCE(?,not_before_ms),first_started_at_ms=CASE WHEN ?='LEASED' THEN COALESCE(first_started_at_ms,?) ELSE first_started_at_ms END,last_started_at_ms=CASE WHEN ?='LEASED' THEN ? ELSE last_started_at_ms END,health_status=?,safe_error_code=?,safe_error_message=?,completed_after_cancel=?,updated_at_ms=?,finished_at_ms=? WHERE id=? AND state=? AND item_fence_token=?")
             .bind(t.new_state.as_str()).bind(&t.lease_owner).bind(t.lease_expires_at_ms).bind(t.pair_fence_token).bind(&t.dispatch_attempt_id).bind(&t.request_id).bind(t.not_before_ms)
-            .bind(t.new_state.as_str()).bind(t.now_ms).bind(t.new_state.as_str()).bind(t.now_ms).bind(&t.health_status).bind(&t.safe_error_code).bind(message).bind(t.completed_after_cancel).bind(t.now_ms).bind(terminal.then_some(t.now_ms)).bind(t.item_id).bind(t.expected_state.as_str()).bind(t.expected_fence)
+            .bind(t.new_state.as_str()).bind(t.now_ms).bind(t.new_state.as_str()).bind(t.now_ms).bind(&t.health_status).bind(&t.safe_error_code).bind(message).bind(completed_after_cancel).bind(t.now_ms).bind(terminal.then_some(t.now_ms)).bind(t.item_id).bind(t.expected_state.as_str()).bind(t.expected_fence)
             .execute(&mut *conn).await?;
         if old != new {
             let sql=format!("UPDATE socks5_check_jobs SET {old}={old}-1,{new}={new}+1,status=CASE WHEN status='QUEUED' THEN 'RUNNING' ELSE status END,started_at_ms=CASE WHEN started_at_ms IS NULL THEN ? ELSE started_at_ms END WHERE id=?",old=counter_column(old),new=counter_column(new));
@@ -621,8 +1050,11 @@ impl HealthOrchestrationRepository for SqliteRepository {
 mod tests {
     use super::*;
     use crate::db::health_orchestration::{
-        snapshot_hash, HealthJobItemState, HealthJobSource, HealthJobStatus, IDEMPOTENCY_TTL_MS,
+        snapshot_hash, HealthItemClaimRequest, HealthItemDispatchRequest, HealthJobItemListQuery,
+        HealthJobItemState, HealthJobListQuery, HealthJobSource, HealthJobStatus,
+        HealthLeaseRenewRequest, IDEMPOTENCY_TTL_MS,
     };
+    use crate::db::repo::{Socks5HealthRecord, Socks5Repository};
     use crate::db::schema::{run_migrations, SCHEMA_SQL};
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -784,6 +1216,612 @@ mod tests {
             })
             .await;
         assert!(matches!(invalid, Err(DbError::ConstraintViolation)));
+    }
+
+    #[tokio::test]
+    async fn manual_runtime_claim_dispatch_renew_pagination_and_reconcile() {
+        let (repo, resource, node) = fixture().await;
+        let (job, items) = job("runtime-job", resource, node, None);
+        repo.create_health_job(&job, &items).await.unwrap();
+
+        let claim = HealthItemClaimRequest {
+            lease_owner: "worker-a".into(),
+            now_ms: 2_000,
+            lease_expires_at_ms: 62_000,
+            limit: 8,
+            global_limit: 16,
+            per_node_limit: 10,
+            per_job_limit: 20,
+        };
+        let claimed = repo.claim_health_job_items(&claim).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        let leased = &claimed[0];
+        assert_eq!(leased.state, "LEASED");
+        assert_eq!(leased.attempt_count, 0, "claim is not a network attempt");
+        assert_eq!(leased.item_fence_token, 1);
+        assert_eq!(leased.pair_fence_token, Some(1));
+
+        let competing = HealthItemClaimRequest {
+            lease_owner: "worker-b".into(),
+            ..claim.clone()
+        };
+        assert!(repo
+            .claim_health_job_items(&competing)
+            .await
+            .unwrap()
+            .is_empty());
+
+        assert!(repo
+            .begin_health_item_dispatch(&HealthItemDispatchRequest {
+                item_id: leased.id,
+                lease_owner: "worker-b".into(),
+                expected_item_fence: 1,
+                expected_pair_fence: 1,
+                dispatch_attempt_id: "wrong-owner".into(),
+                now_ms: 2_100,
+            })
+            .await
+            .unwrap()
+            .is_none());
+        let dispatching = repo
+            .begin_health_item_dispatch(&HealthItemDispatchRequest {
+                item_id: leased.id,
+                lease_owner: "worker-a".into(),
+                expected_item_fence: 1,
+                expected_pair_fence: 1,
+                dispatch_attempt_id: "attempt-a".into(),
+                now_ms: 2_100,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dispatching.state, "DISPATCHING");
+        assert_eq!(dispatching.attempt_count, 1);
+        assert_eq!(dispatching.item_fence_token, 2);
+        assert_eq!(
+            repo.renew_health_item_and_pair_lease(&HealthLeaseRenewRequest {
+                item_id: dispatching.id,
+                lease_owner: "worker-a".into(),
+                expected_item_fence: 2,
+                expected_pair_fence: 1,
+                lease_expires_at_ms: 70_000,
+                now_ms: 3_000,
+            })
+            .await
+            .unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+        assert_eq!(
+            repo.renew_health_item_and_pair_lease(&HealthLeaseRenewRequest {
+                item_id: dispatching.id,
+                lease_owner: "worker-b".into(),
+                expected_item_fence: 2,
+                expected_pair_fence: 1,
+                lease_expires_at_ms: 80_000,
+                now_ms: 3_100,
+            })
+            .await
+            .unwrap(),
+            ConditionalWriteOutcome::ConditionFailed
+        );
+
+        let page = repo
+            .list_health_job_items_page(&HealthJobItemListQuery {
+                job_id: job.id.clone(),
+                state: Some("DISPATCHING".into()),
+                safe_error_code: None,
+                after_id: None,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert!(repo
+            .list_health_job_items_page(&HealthJobItemListQuery {
+                job_id: job.id.clone(),
+                state: None,
+                safe_error_code: None,
+                after_id: Some(page[0].id),
+                limit: 1,
+            })
+            .await
+            .unwrap()
+            .is_empty());
+
+        sqlx::query("UPDATE socks5_check_jobs SET queued_count=1,running_count=0 WHERE id=?")
+            .bind(&job.id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.reconcile_health_job_counters(3_200, 10).await.unwrap(),
+            vec![job.id.clone()]
+        );
+        let repaired = repo.find_health_job(&job.id).await.unwrap().unwrap();
+        assert_eq!((repaired.queued_count, repaired.running_count), (0, 1));
+        assert_eq!(
+            repo.list_expired_health_job_items(70_000, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let jobs = repo
+            .list_health_jobs(&HealthJobListQuery {
+                status: Some("RUNNING".into()),
+                source: Some("MANUAL".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_wins_retry_race_and_in_flight_success_is_marked_after_cancel() {
+        let (repo, resource, node) = fixture().await;
+        let (cancel_job, items) = job("cancel-retry-race", resource, node, None);
+        repo.create_health_job(&cancel_job, &items).await.unwrap();
+        let leased = repo
+            .claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: "worker-a".into(),
+                now_ms: 2_000,
+                lease_expires_at_ms: 62_000,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 20,
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(repo.cancel_health_job(&cancel_job.id, 2_100).await.unwrap());
+        assert_eq!(
+            repo.transition_health_job_item(&transition(
+                leased.id,
+                HealthJobItemState::Leased,
+                leased.item_fence_token,
+                HealthJobItemState::RetryWait,
+                2_200,
+            ))
+            .await
+            .unwrap(),
+            ConditionalWriteOutcome::ConditionFailed
+        );
+        assert_eq!(
+            repo.transition_health_job_item(&transition(
+                leased.id,
+                HealthJobItemState::Leased,
+                leased.item_fence_token,
+                HealthJobItemState::Failed,
+                2_200,
+            ))
+            .await
+            .unwrap(),
+            ConditionalWriteOutcome::ConditionFailed
+        );
+        assert_eq!(
+            repo.transition_health_job_item(&transition(
+                leased.id,
+                HealthJobItemState::Leased,
+                leased.item_fence_token,
+                HealthJobItemState::Cancelled,
+                2_300,
+            ))
+            .await
+            .unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+        assert_eq!(
+            repo.find_health_job(&cancel_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "CANCELLED"
+        );
+
+        let (repo, resource, node) = fixture().await;
+        let (job, items) = job("cancel-result-race", resource, node, None);
+        repo.create_health_job(&job, &items).await.unwrap();
+        let leased = repo
+            .claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: "worker-a".into(),
+                now_ms: 2_000,
+                lease_expires_at_ms: 62_000,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 20,
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        let dispatching = repo
+            .begin_health_item_dispatch(&HealthItemDispatchRequest {
+                item_id: leased.id,
+                lease_owner: "worker-a".into(),
+                expected_item_fence: leased.item_fence_token,
+                expected_pair_fence: leased.pair_fence_token.unwrap(),
+                dispatch_attempt_id: "cancel-result-attempt".into(),
+                now_ms: 2_100,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let mut in_flight = transition(
+            dispatching.id,
+            HealthJobItemState::Dispatching,
+            dispatching.item_fence_token,
+            HealthJobItemState::InFlight,
+            2_200,
+        );
+        in_flight.lease_owner = Some("worker-a".into());
+        in_flight.lease_expires_at_ms = dispatching.lease_expires_at_ms;
+        in_flight.pair_fence_token = dispatching.pair_fence_token;
+        in_flight.dispatch_attempt_id = Some("cancel-result-attempt".into());
+        in_flight.request_id = Some("cancel-result-request".into());
+        assert_eq!(
+            repo.transition_health_job_item(&in_flight).await.unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+        assert!(repo.cancel_health_job(&job.id, 2_300).await.unwrap());
+        let current = repo.find_health_job_item(leased.id).await.unwrap().unwrap();
+        let mut succeeded = transition(
+            current.id,
+            HealthJobItemState::InFlight,
+            current.item_fence_token,
+            HealthJobItemState::Succeeded,
+            2_400,
+        );
+        succeeded.health_status = Some("ONLINE".into());
+        succeeded.completed_after_cancel = false;
+        assert_eq!(
+            repo.transition_health_job_item(&succeeded).await.unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+        let stored = repo
+            .find_health_job_item(current.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.completed_after_cancel);
+        assert_eq!(
+            repo.find_health_job(&job.id).await.unwrap().unwrap().status,
+            "SUCCEEDED"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_hundred_concurrent_claimers_produce_one_owner() {
+        let (repo, resource, node) = fixture().await;
+        let (job, items) = job("claim-race", resource, node, None);
+        repo.create_health_job(&job, &items).await.unwrap();
+        let repo = std::sync::Arc::new(repo);
+        let results = futures_util::future::join_all((0..100).map(|index| {
+            let repo = repo.clone();
+            async move {
+                repo.claim_health_job_items(&HealthItemClaimRequest {
+                    lease_owner: format!("worker-{index}"),
+                    now_ms: 2_000,
+                    lease_expires_at_ms: 62_000,
+                    limit: 1,
+                    global_limit: 16,
+                    per_node_limit: 10,
+                    per_job_limit: 20,
+                })
+                .await
+                .unwrap()
+                .len()
+            }
+        }))
+        .await;
+        assert_eq!(results.into_iter().sum::<usize>(), 1);
+        let stored = repo.list_health_job_items(&job.id).await.unwrap();
+        assert_eq!(stored[0].state, "LEASED");
+        assert_eq!(stored[0].item_fence_token, 1);
+        let pair = repo
+            .find_health_pair_lease(resource, node)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair.item_id, Some(stored[0].id));
+        assert_eq!(pair.pair_fence_token, 1);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_reclaims_expired_work_and_fences_the_stale_owner() {
+        let (repo, resource, node) = fixture().await;
+        let (job, items) = job("crash-recovery", resource, node, None);
+        repo.create_health_job(&job, &items).await.unwrap();
+
+        // A crash immediately after the Job commit leaves durable queued work.
+        let queued = repo.list_health_job_items(&job.id).await.unwrap().remove(0);
+        assert_eq!(queued.state, "QUEUED");
+        let leased = repo
+            .claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: "old-worker".into(),
+                now_ms: 2_000,
+                lease_expires_at_ms: 3_000,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 20,
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        let dispatching = repo
+            .begin_health_item_dispatch(&HealthItemDispatchRequest {
+                item_id: leased.id,
+                lease_owner: "old-worker".into(),
+                expected_item_fence: leased.item_fence_token,
+                expected_pair_fence: leased.pair_fence_token.unwrap(),
+                dispatch_attempt_id: "old-attempt".into(),
+                now_ms: 2_100,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let resource_before = repo.find_socks5_resource(resource).await.unwrap().unwrap();
+        let (_, old_generation) = repo
+            .begin_socks5_health_check_if_resource_generation(
+                resource,
+                node,
+                resource_before.health_generation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_generation, 1);
+
+        let mut in_flight = transition(
+            dispatching.id,
+            HealthJobItemState::Dispatching,
+            dispatching.item_fence_token,
+            HealthJobItemState::InFlight,
+            2_200,
+        );
+        in_flight.lease_owner = Some("old-worker".into());
+        in_flight.lease_expires_at_ms = Some(3_000);
+        in_flight.pair_fence_token = Some(1);
+        in_flight.dispatch_attempt_id = Some("old-attempt".into());
+        in_flight.request_id = Some("old-request".into());
+        assert_eq!(
+            repo.transition_health_job_item(&in_flight).await.unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+        let old_in_flight = repo.find_health_job_item(leased.id).await.unwrap().unwrap();
+
+        // Simulate a process crash after Health Truth was persisted but before
+        // the durable Item could transition to SUCCEEDED.
+        let health = Socks5HealthRecord {
+            resource_id: resource,
+            relay_node_id: node,
+            status: "ONLINE".into(),
+            tcp_latency_ms: Some(1),
+            handshake_latency_ms: Some(2),
+            connect_latency_ms: Some(3),
+            total_latency_ms: Some(6),
+            exit_ip: Some("203.0.113.10".into()),
+            country: Some("US".into()),
+            error_stage: None,
+            error_code: None,
+            safe_error_message: None,
+            consecutive_failures: 0,
+            checked_at: "2026-01-01 00:00:00".into(),
+            last_success_at: Some("2026-01-01 00:00:00".into()),
+        };
+        assert!(repo
+            .record_socks5_health(&health, resource_before.health_generation, old_generation,)
+            .await
+            .unwrap());
+
+        let mut retry = transition(
+            old_in_flight.id,
+            HealthJobItemState::InFlight,
+            old_in_flight.item_fence_token,
+            HealthJobItemState::RetryWait,
+            3_000,
+        );
+        retry.not_before_ms = Some(3_001);
+        retry.safe_error_code = Some("UPSTREAM_UNAVAILABLE".into());
+        retry.safe_error_message = Some("Upstream service unavailable".into());
+        assert_eq!(
+            repo.transition_health_job_item(&retry).await.unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+
+        // A new worker steals only the expired Pair lease and advances both
+        // fencing epochs. The old worker can no longer renew, release or finish.
+        let new_lease = repo
+            .claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: "new-worker".into(),
+                now_ms: 3_001,
+                lease_expires_at_ms: 63_001,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 20,
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            new_lease.item_fence_token,
+            old_in_flight.item_fence_token + 2
+        );
+        assert_eq!(new_lease.pair_fence_token, Some(2));
+        assert_eq!(
+            repo.renew_health_item_and_pair_lease(&HealthLeaseRenewRequest {
+                item_id: old_in_flight.id,
+                lease_owner: "old-worker".into(),
+                expected_item_fence: old_in_flight.item_fence_token,
+                expected_pair_fence: 1,
+                lease_expires_at_ms: 70_000,
+                now_ms: 3_002,
+            })
+            .await
+            .unwrap(),
+            ConditionalWriteOutcome::ConditionFailed
+        );
+        assert_eq!(
+            repo.release_health_pair_lease(resource, node, leased.id, "old-worker", 1, 3_002)
+                .await
+                .unwrap(),
+            ConditionalWriteOutcome::ConditionFailed
+        );
+        let mut stale_success = transition(
+            old_in_flight.id,
+            HealthJobItemState::InFlight,
+            old_in_flight.item_fence_token,
+            HealthJobItemState::Succeeded,
+            3_002,
+        );
+        stale_success.health_status = Some("ONLINE".into());
+        assert_eq!(
+            repo.transition_health_job_item(&stale_success)
+                .await
+                .unwrap(),
+            ConditionalWriteOutcome::ConditionFailed
+        );
+
+        let current_resource = repo.find_socks5_resource(resource).await.unwrap().unwrap();
+        let (_, new_generation) = repo
+            .begin_socks5_health_check_if_resource_generation(
+                resource,
+                node,
+                current_resource.health_generation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_generation, 2);
+        assert!(!repo
+            .record_socks5_health(&health, resource_before.health_generation, old_generation,)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn conditional_generation_does_not_advance_after_resource_revision_changes() {
+        let (repo, resource, node) = fixture().await;
+        let initial = repo.find_socks5_resource(resource).await.unwrap().unwrap();
+        sqlx::query("UPDATE socks5_resources SET health_generation=health_generation+1 WHERE id=?")
+            .bind(resource)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        assert!(repo
+            .begin_socks5_health_check_if_resource_generation(
+                resource,
+                node,
+                initial.health_generation,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let generations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_check_generations")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(generations, 0);
+        let current = repo.find_socks5_resource(resource).await.unwrap().unwrap();
+        let (_, generation) = repo
+            .begin_socks5_health_check_if_resource_generation(
+                resource,
+                node,
+                current.health_generation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(generation, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_snapshot_survives_deleted_live_resource_and_node() {
+        let (repo, resource, node) = fixture().await;
+        let (parent, parent_items) = job("retry-deleted-parent", resource, node, None);
+        repo.create_health_job(&parent, &parent_items)
+            .await
+            .unwrap();
+        let parent_item = repo
+            .list_health_job_items(&parent.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            repo.transition_health_job_item(&transition(
+                parent_item.id,
+                HealthJobItemState::Queued,
+                0,
+                HealthJobItemState::Leased,
+                2_000,
+            ))
+            .await
+            .unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+        assert_eq!(
+            repo.transition_health_job_item(&transition(
+                parent_item.id,
+                HealthJobItemState::Leased,
+                1,
+                HealthJobItemState::Failed,
+                2_100,
+            ))
+            .await
+            .unwrap(),
+            ConditionalWriteOutcome::Applied
+        );
+        assert!(repo.finalize_health_job(&parent.id, 2_101).await.unwrap());
+        sqlx::query("DELETE FROM socks5_resources WHERE id=?")
+            .bind(resource)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM relay_nodes WHERE id=?")
+            .bind(node)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+
+        let child = NewHealthJob {
+            id: "retry-deleted-child".into(),
+            source: HealthJobSource::RetryFailed,
+            policy_id: None,
+            parent_job_id: Some(parent.id.clone()),
+            actor_id: None,
+            request_fingerprint: "b".repeat(64),
+            snapshot_hash: snapshot_hash(&[(resource, node)]),
+            resource_selector_json: "{}".into(),
+            node_selector_json: "{}".into(),
+            scheduled_for_ms: None,
+            created_at_ms: 3_000,
+        };
+        repo.create_health_job(
+            &child,
+            &[NewHealthJobItem {
+                resource_id: resource,
+                relay_node_id: node,
+                not_before_ms: 3_000,
+                deadline_at_ms: Some(10_000),
+            }],
+        )
+        .await
+        .unwrap();
+        let child_item = repo
+            .list_health_job_items(&child.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(child_item.resource_id, None);
+        assert_eq!(child_item.relay_node_id, None);
+        assert_eq!(child_item.resource_id_snapshot, resource);
+        assert_eq!(child_item.relay_node_id_snapshot, node);
     }
 
     #[tokio::test]

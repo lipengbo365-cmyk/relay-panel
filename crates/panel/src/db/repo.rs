@@ -32,10 +32,12 @@ use serde::Serialize;
 
 use super::error::DbError;
 use super::health_orchestration::{
-    ConditionalWriteOutcome, HealthItemTransition, HealthJobCreateOutcome,
-    HealthJobIdempotencyOutcome, HealthJobItemRecord, HealthJobRecord, HealthPairLeaseRecord,
-    HealthPolicyPatch, HealthPolicyRecord, NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem,
-    NewHealthPolicy, PairLeaseAcquireOutcome, PairLeaseAcquireRequest,
+    ConditionalWriteOutcome, HealthItemClaimRequest, HealthItemDispatchRequest,
+    HealthItemTransition, HealthJobCreateOutcome, HealthJobIdempotencyOutcome,
+    HealthJobItemListQuery, HealthJobItemRecord, HealthJobListQuery, HealthJobRecord,
+    HealthLeaseRenewRequest, HealthPairLeaseRecord, HealthPolicyPatch, HealthPolicyRecord,
+    NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem, NewHealthPolicy,
+    PairLeaseAcquireOutcome, PairLeaseAcquireRequest,
 };
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -908,6 +910,14 @@ pub trait Socks5Repository: Send + Sync {
         resource_id: i64,
         relay_node_id: i64,
     ) -> Result<Option<(Socks5ResourceRecord, i64)>, DbError>;
+    /// Stage 5 dispatch variant: advances generation only if the resource is
+    /// still enabled and has the revision whose credential was just decrypted.
+    async fn begin_socks5_health_check_if_resource_generation(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        expected_resource_generation: i64,
+    ) -> Result<Option<(Socks5ResourceRecord, i64)>, DbError>;
     /// Returns false when the resource was deleted or a newer check/update has
     /// superseded this generation.
     async fn record_socks5_health(
@@ -962,10 +972,49 @@ pub trait HealthOrchestrationRepository: Send + Sync {
         now_ms: i64,
     ) -> Result<HealthJobIdempotencyOutcome, DbError>;
     async fn find_health_job(&self, id: &str) -> Result<Option<HealthJobRecord>, DbError>;
+    async fn list_health_jobs(
+        &self,
+        query: &HealthJobListQuery,
+    ) -> Result<Vec<HealthJobRecord>, DbError>;
     async fn list_health_job_items(
         &self,
         job_id: &str,
     ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn list_health_job_items_page(
+        &self,
+        query: &HealthJobItemListQuery,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn find_health_job_item(
+        &self,
+        item_id: i64,
+    ) -> Result<Option<HealthJobItemRecord>, DbError>;
+    async fn claim_health_job_items(
+        &self,
+        request: &HealthItemClaimRequest,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn begin_health_item_dispatch(
+        &self,
+        request: &HealthItemDispatchRequest,
+    ) -> Result<Option<HealthJobItemRecord>, DbError>;
+    async fn renew_health_item_and_pair_lease(
+        &self,
+        request: &HealthLeaseRenewRequest,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn list_expired_health_job_items(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn list_overdue_health_job_items(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn reconcile_health_job_counters(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DbError>;
     async fn transition_health_job_item(
         &self,
         transition: &HealthItemTransition,

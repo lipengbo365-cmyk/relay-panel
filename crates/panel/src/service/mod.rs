@@ -3,6 +3,7 @@ pub mod audit;
 pub mod auto_restart;
 pub mod credentials;
 pub mod groups;
+pub mod health_worker;
 pub mod history_prune;
 pub mod node_config;
 pub mod node_watch;

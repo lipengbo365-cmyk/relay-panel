@@ -21,6 +21,7 @@ pub mod security_headers;
 pub mod site;
 pub mod smart_relay;
 pub mod socks5_health;
+pub mod socks5_health_jobs;
 pub mod socks5_import;
 pub mod socks5_resources;
 pub mod stats;
@@ -250,6 +251,30 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/socks5-resources/{id}/check-history",
             axum::routing::get(socks5_health::list_history),
+        )
+        .route(
+            "/admin/socks5-health/jobs/dry-run",
+            axum::routing::post(socks5_health_jobs::dry_run),
+        )
+        .route(
+            "/admin/socks5-health/jobs",
+            axum::routing::get(socks5_health_jobs::list).post(socks5_health_jobs::create),
+        )
+        .route(
+            "/admin/socks5-health/jobs/{job_id}",
+            axum::routing::get(socks5_health_jobs::detail),
+        )
+        .route(
+            "/admin/socks5-health/jobs/{job_id}/items",
+            axum::routing::get(socks5_health_jobs::items),
+        )
+        .route(
+            "/admin/socks5-health/jobs/{job_id}/cancel",
+            axum::routing::post(socks5_health_jobs::cancel),
+        )
+        .route(
+            "/admin/socks5-health/jobs/{job_id}/retry-failed",
+            axum::routing::post(socks5_health_jobs::retry_failed),
         )
         .route(
             "/admin/socks5-resources/{id}/relay-recommendations",

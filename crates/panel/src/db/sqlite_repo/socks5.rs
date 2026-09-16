@@ -1209,6 +1209,50 @@ impl Socks5Repository for SqliteRepository {
         Ok(Some((resource, generation)))
     }
 
+    async fn begin_socks5_health_check_if_resource_generation(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        expected_resource_generation: i64,
+    ) -> Result<Option<(Socks5ResourceRecord, i64)>, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let operation: Result<Option<(Socks5ResourceRecord, i64)>, DbError> = async {
+            let resource: Option<Socks5ResourceRecord> = sqlx::query_as(
+                "SELECT * FROM socks5_resources
+                 WHERE id=? AND enabled=1 AND health_generation=?",
+            )
+            .bind(resource_id)
+            .bind(expected_resource_generation)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(resource) = resource else {
+                return Ok(None);
+            };
+            let generation: i64 = sqlx::query_scalar(
+                "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation)
+                 VALUES(?,?,1) ON CONFLICT(resource_id,relay_node_id) DO UPDATE SET
+                 generation=socks5_check_generations.generation+1 RETURNING generation",
+            )
+            .bind(resource_id)
+            .bind(relay_node_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            Ok(Some((resource, generation)))
+        }
+        .await;
+        match operation {
+            Ok(value) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn record_socks5_health(
         &self,
         health: &Socks5HealthRecord,

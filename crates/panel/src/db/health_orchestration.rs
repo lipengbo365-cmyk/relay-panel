@@ -464,6 +464,55 @@ pub struct HealthJobItemRecord {
     pub finished_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct HealthJobListQuery {
+    pub status: Option<String>,
+    pub source: Option<String>,
+    pub before_created_at_ms: Option<i64>,
+    pub before_id: Option<String>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HealthJobItemListQuery {
+    pub job_id: String,
+    pub state: Option<String>,
+    pub safe_error_code: Option<String>,
+    pub after_id: Option<i64>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthItemClaimRequest {
+    pub lease_owner: String,
+    pub now_ms: i64,
+    pub lease_expires_at_ms: i64,
+    pub limit: i64,
+    pub global_limit: i64,
+    pub per_node_limit: i64,
+    pub per_job_limit: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthItemDispatchRequest {
+    pub item_id: i64,
+    pub lease_owner: String,
+    pub expected_item_fence: i64,
+    pub expected_pair_fence: i64,
+    pub dispatch_attempt_id: String,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthLeaseRenewRequest {
+    pub item_id: i64,
+    pub lease_owner: String,
+    pub expected_item_fence: i64,
+    pub expected_pair_fence: i64,
+    pub lease_expires_at_ms: i64,
+    pub now_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct HealthItemTransition {
     pub item_id: i64,

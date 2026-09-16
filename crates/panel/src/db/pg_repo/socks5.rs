@@ -1037,6 +1037,37 @@ impl Socks5Repository for PgRepository {
         tx.commit().await?;
         Ok(Some((resource, generation)))
     }
+    async fn begin_socks5_health_check_if_resource_generation(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        expected_resource_generation: i64,
+    ) -> Result<Option<(Socks5ResourceRecord, i64)>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let resource: Option<Socks5ResourceRecord> = sqlx::query_as(
+            "SELECT * FROM socks5_resources
+             WHERE id=$1 AND enabled=TRUE AND health_generation=$2 FOR SHARE",
+        )
+        .bind(resource_id)
+        .bind(expected_resource_generation)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(resource) = resource else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let generation: i64 = sqlx::query_scalar(
+            "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation)
+             VALUES($1,$2,1) ON CONFLICT(resource_id,relay_node_id) DO UPDATE SET
+             generation=socks5_check_generations.generation+1 RETURNING generation",
+        )
+        .bind(resource_id)
+        .bind(relay_node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some((resource, generation)))
+    }
 
     async fn record_socks5_health(
         &self,
