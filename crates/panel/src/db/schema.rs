@@ -2288,6 +2288,9 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     // ── Migration 52: independent durable orchestration retry counter ──
     migrate_sqlite_health_retry_count(pool).await?;
 
+    // ── Migration 53: exactly-once durable health Job finalization audit ──
+    migrate_sqlite_health_finalized_audit(pool).await?;
+
     Ok(())
 }
 
@@ -2487,6 +2490,68 @@ async fn migrate_sqlite_health_retry_count(pool: &sqlx::SqlitePool) -> Result<()
     }
     migration?;
     tracing::info!("Migration 52: durable orchestration retry counter present");
+    Ok(())
+}
+
+async fn validate_sqlite_health_finalized_audit(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    let sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_audit_health_job_finalized'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .flatten();
+    let normalized = sql
+        .as_deref()
+        .map(crate::db::health_schema::normalize_schema_sql)
+        .unwrap_or_default();
+    if normalized
+        != "createuniqueindexuq_audit_health_job_finalizedonaudit_log(target_id)whereaction='job_finalized'andtarget_type='socks5_health_job'"
+    {
+        return Err(sqlx::Error::Protocol(
+            "SQLite migration 53 version/schema mismatch: health finalization audit index differs"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn migrate_sqlite_health_finalized_audit(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    const VERSION: i64 = 53;
+    let current: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version),0) FROM schema_version")
+        .fetch_one(pool)
+        .await?;
+    if current >= VERSION {
+        let mut conn = pool.acquire().await?;
+        validate_sqlite_health_finalized_audit(&mut conn).await?;
+        return Ok(());
+    }
+    if current != 52 {
+        return Err(sqlx::Error::Protocol(format!(
+            "SQLite migration 53 requires version 52, found {current}"
+        )));
+    }
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let migration = async {
+        for statement in crate::db::health_schema::SQLITE_MIGRATION_53 {
+            sqlx::query(statement).execute(&mut *conn).await?;
+        }
+        sqlx::query("INSERT INTO schema_version(version) VALUES(?)")
+            .bind(VERSION)
+            .execute(&mut *conn)
+            .await?;
+        validate_sqlite_health_finalized_audit(&mut conn).await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    migration?;
+    tracing::info!("Migration 53: health Job finalization audit is unique");
     Ok(())
 }
 
@@ -3735,13 +3800,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_52_fresh_rerun_constraints_indexes_and_fk_actions() {
+    async fn migration_53_fresh_rerun_constraints_indexes_and_fk_actions() {
         let pool = fresh_pool().await;
         let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(version, 52);
+        assert_eq!(version, 53);
         run_migrations(&pool)
             .await
             .expect("second startup validates");
@@ -3779,6 +3844,10 @@ mod tests {
         assert!(item_sql.contains("ON DELETE SET NULL"));
         assert!(item_sql.contains("ON DELETE CASCADE"));
         assert!(item_sql.contains("retry_count INTEGER NOT NULL DEFAULT 0"));
+        let mut conn = pool.acquire().await.unwrap();
+        validate_sqlite_health_finalized_audit(&mut conn)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3844,6 +3913,114 @@ mod tests {
         assert!(error
             .to_string()
             .contains("migration 52 version/schema mismatch"));
+    }
+
+    #[tokio::test]
+    async fn migration_53_deduplicates_finalized_audits_and_rolls_back_atomically() {
+        async fn version_52_pool() -> sqlx::SqlitePool {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+            migrate_sqlite_health_orchestration(&pool).await.unwrap();
+            migrate_sqlite_health_retry_count(&pool).await.unwrap();
+            pool
+        }
+
+        let pool = version_52_pool().await;
+        for _ in 0..2 {
+            sqlx::query("INSERT INTO audit_log(ts,actor_name,action,target_type,target_id,detail) VALUES('2026-01-01 00:00:00','system','JOB_FINALIZED','socks5_health_job','job-1','status=SUCCEEDED; succeeded=1; failed=0; cancelled=0')")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO socks5_check_jobs
+             (id,source,status,request_fingerprint,snapshot_hash,resource_selector_json,
+              node_selector_json,matrix_mode,retry_policy_version,cancel_requested,total_items,
+              queued_count,running_count,succeeded_count,failed_count,cancelled_count,
+              created_at_ms,finished_at_ms)
+             VALUES('job-missing-audit','MANUAL','FAILED',?,?,'{}','{}','CARTESIAN','v1',
+                    0,1,0,0,0,1,0,1000,2000)",
+        )
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+        migrate_sqlite_health_finalized_audit(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            53
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id='job-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id='job-missing-audit'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1,
+            "migration 53 must repair a pre-existing terminal Job missing its audit"
+        );
+        migrate_sqlite_health_finalized_audit(&pool)
+            .await
+            .expect("migration 53 rerun must validate and pass");
+
+        let failed = version_52_pool().await;
+        for _ in 0..2 {
+            sqlx::query("INSERT INTO audit_log(ts,actor_name,action,target_type,target_id,detail) VALUES('2026-01-01 00:00:00','system','JOB_FINALIZED','socks5_health_job','job-rollback','status=FAILED; succeeded=0; failed=1; cancelled=0')")
+                .execute(&failed)
+                .await
+                .unwrap();
+        }
+        sqlx::query("CREATE INDEX uq_audit_health_job_finalized ON audit_log(target_id)")
+            .execute(&failed)
+            .await
+            .unwrap();
+        assert!(migrate_sqlite_health_finalized_audit(&failed)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&failed)
+                .await
+                .unwrap(),
+            52
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log WHERE target_id='job-rollback'"
+            )
+            .fetch_one(&failed)
+            .await
+            .unwrap(),
+            2,
+            "failed migration 53 must roll back duplicate cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_53_version_schema_mismatch_fails_loudly() {
+        let pool = fresh_pool().await;
+        sqlx::query("DROP INDEX uq_audit_health_job_finalized")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = run_migrations(&pool).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("migration 53 version/schema mismatch"));
     }
 
     #[tokio::test]

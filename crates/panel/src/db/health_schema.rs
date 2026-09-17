@@ -180,6 +180,15 @@ pub const SQLITE_MIGRATION_51: [&str; 15] = [
 pub const SQLITE_MIGRATION_52: &str =
     "ALTER TABLE socks5_check_job_items ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0)";
 
+/// Stage 5.2.1: make one health-job finalization audit the durable identity for
+/// each Job. Duplicate rows created by the pre-fix timestamp heuristic are
+/// collapsed before the unique partial index is installed.
+pub const SQLITE_MIGRATION_53: [&str; 3] = [
+    "DELETE FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND id NOT IN (SELECT MIN(id) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' GROUP BY target_id)",
+    "INSERT INTO audit_log(ts,actor_id,actor_name,action,target_type,target_id,detail) SELECT strftime('%Y-%m-%d %H:%M:%S','now'),NULL,'system','JOB_FINALIZED','socks5_health_job',j.id,'status='||j.status||'; succeeded='||j.succeeded_count||'; failed='||j.failed_count||'; cancelled='||j.cancelled_count FROM socks5_check_jobs j WHERE j.status IN ('SUCCEEDED','FAILED','PARTIAL','CANCELLED','PARTIAL_CANCELLED') AND NOT EXISTS(SELECT 1 FROM audit_log a WHERE a.action='JOB_FINALIZED' AND a.target_type='socks5_health_job' AND a.target_id=j.id)",
+    "CREATE UNIQUE INDEX uq_audit_health_job_finalized ON audit_log(target_id) WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'",
+];
+
 pub const POSTGRES_MIGRATION_35: [&str; 15] = [
     r#"CREATE TABLE socks5_check_policies (
         id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE CHECK(length(btrim(name)) > 0),
@@ -280,3 +289,10 @@ pub const POSTGRES_MIGRATION_35: [&str; 15] = [
 /// Stage 5.2 audit remediation. Historical migration 35 remains immutable.
 pub const POSTGRES_MIGRATION_36: &str =
     "ALTER TABLE socks5_check_job_items ADD COLUMN retry_count BIGINT NOT NULL DEFAULT 0 CHECK(retry_count >= 0)";
+
+/// Stage 5.2.1 PostgreSQL counterpart of SQLite migration 53.
+pub const POSTGRES_MIGRATION_37: [&str; 3] = [
+    "DELETE FROM audit_log a USING audit_log b WHERE a.action='JOB_FINALIZED' AND a.target_type='socks5_health_job' AND b.action=a.action AND b.target_type=a.target_type AND b.target_id=a.target_id AND a.id>b.id",
+    "INSERT INTO audit_log(ts,actor_id,actor_name,action,target_type,target_id,detail) SELECT to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'),NULL,'system','JOB_FINALIZED','socks5_health_job',j.id,'status='||j.status||'; succeeded='||j.succeeded_count||'; failed='||j.failed_count||'; cancelled='||j.cancelled_count FROM socks5_check_jobs j WHERE j.status IN ('SUCCEEDED','FAILED','PARTIAL','CANCELLED','PARTIAL_CANCELLED') AND NOT EXISTS(SELECT 1 FROM audit_log a WHERE a.action='JOB_FINALIZED' AND a.target_type='socks5_health_job' AND a.target_id=j.id)",
+    "CREATE UNIQUE INDEX uq_audit_health_job_finalized ON audit_log(target_id) WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'",
+];

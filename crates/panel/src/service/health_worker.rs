@@ -7,8 +7,7 @@ use crate::api::socks5_health::{
 use crate::api::AppState;
 use crate::db::health_orchestration::{
     ConditionalWriteOutcome, HealthItemClaimRequest, HealthItemDispatchRequest,
-    HealthItemTransition, HealthJobItemRecord, HealthJobItemState, HealthJobStatus,
-    HealthLeaseRenewRequest,
+    HealthItemTransition, HealthJobItemRecord, HealthJobItemState, HealthLeaseRenewRequest,
 };
 use relay_shared::protocol::{SecretString, Socks5CheckRequest, Socks5CheckResult};
 use std::time::Duration;
@@ -515,7 +514,6 @@ impl Runtime {
             Ok(ConditionalWriteOutcome::Applied)
         ) {
             self.release_pair(&item, pair_fence).await;
-            self.audit_if_final(&item.job_id, transition.now_ms).await;
         }
     }
 
@@ -586,7 +584,6 @@ impl Runtime {
             Ok(ConditionalWriteOutcome::Applied)
         ) {
             self.release_pair(item, pair_fence).await;
-            self.audit_if_final(&item.job_id, now).await;
         }
     }
 
@@ -620,7 +617,6 @@ impl Runtime {
             Ok(ConditionalWriteOutcome::Applied)
         ) {
             self.release_pair(item, pair_fence).await;
-            self.audit_if_final(&item.job_id, now).await;
         }
     }
 
@@ -702,7 +698,6 @@ impl Runtime {
                     now_ms: now,
                 };
                 let _ = self.state.db.transition_health_job_item(&transition).await;
-                self.audit_if_final(&item.job_id, now).await;
             }
         }
     }
@@ -726,34 +721,9 @@ impl Runtime {
                         "counters_rebuilt_from_items=true",
                     )
                     .await;
-                    if outcome.finalized {
-                        self.audit_if_final(&outcome.job_id, transition_ms).await;
-                    }
                 }
             }
             Err(error) => tracing::warn!("durable health counter reconciliation failed: {error}"),
-        }
-    }
-
-    async fn audit_if_final(&self, job_id: &str, transition_ms: i64) {
-        let Ok(Some(job)) = self.state.db.find_health_job(job_id).await else {
-            return;
-        };
-        if HealthJobStatus::parse(&job.status).is_some_and(HealthJobStatus::is_terminal)
-            && job.finished_at_ms == Some(transition_ms)
-        {
-            crate::service::audit::record(
-                &self.state,
-                None,
-                "JOB_FINALIZED",
-                "socks5_health_job",
-                job_id,
-                &format!(
-                    "status={}; succeeded={}; failed={}; cancelled={}",
-                    job.status, job.succeeded_count, job.failed_count, job.cancelled_count
-                ),
-            )
-            .await;
         }
     }
 }
@@ -1021,7 +991,8 @@ mod tests {
             crate::api::socks5_health::receive_result(State(state.clone()), headers, Json(result))
                 .await;
         assert_eq!(response.0.code, 0);
-        worker.await.unwrap();
+        let (worker_result, _) = tokio::join!(worker, runtime.reconcile());
+        worker_result.unwrap();
 
         let item = state
             .db
@@ -1144,6 +1115,138 @@ mod tests {
             .cancel_health_job(&recovery_job.id, now_ms())
             .await
             .unwrap();
+
+        // Cancel and Reaper may both be the path that completes the last item.
+        // Their shared repository primitive must still create one audit row.
+        let race_now = now_ms();
+        let cancel_reaper_job = NewHealthJob {
+            id: "worker-cancel-reaper-job".into(),
+            source: HealthJobSource::Manual,
+            policy_id: None,
+            parent_job_id: None,
+            actor_id: None,
+            request_fingerprint: "d".repeat(64),
+            snapshot_hash: snapshot_hash(&[(resource, node)]),
+            resource_selector_json: "{}".into(),
+            node_selector_json: "{}".into(),
+            scheduled_for_ms: None,
+            created_at_ms: race_now - 2_000,
+        };
+        state
+            .db
+            .create_health_job(
+                &cancel_reaper_job,
+                &[NewHealthJobItem {
+                    resource_id: resource,
+                    relay_node_id: node,
+                    not_before_ms: race_now - 2_000,
+                    deadline_at_ms: Some(race_now + MAX_RETRY_AGE_MS),
+                }],
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: runtime.owner.clone(),
+                now_ms: race_now - 1_000,
+                lease_expires_at_ms: race_now - 1,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 16,
+            })
+            .await
+            .unwrap();
+        let (_, cancelled) = tokio::join!(
+            runtime.reap(),
+            state.db.cancel_health_job(&cancel_reaper_job.id, race_now)
+        );
+        assert!(cancelled.unwrap());
+        runtime.reap().await;
+        assert_eq!(
+            state
+                .db
+                .find_health_job(&cancel_reaper_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "CANCELLED"
+        );
+        let finalized_audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_id='worker-cancel-reaper-job'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(finalized_audits, 1);
+
+        // Reaper and reconciliation race on an overdue final item. The Job
+        // state, counters, finished_at and audit remain stable.
+        let overdue_now = now_ms();
+        let reaper_reconcile_job = NewHealthJob {
+            id: "worker-reaper-reconcile-job".into(),
+            source: HealthJobSource::Manual,
+            policy_id: None,
+            parent_job_id: None,
+            actor_id: None,
+            request_fingerprint: "e".repeat(64),
+            snapshot_hash: snapshot_hash(&[(resource, node)]),
+            resource_selector_json: "{}".into(),
+            node_selector_json: "{}".into(),
+            scheduled_for_ms: None,
+            created_at_ms: overdue_now - 2_000,
+        };
+        state
+            .db
+            .create_health_job(
+                &reaper_reconcile_job,
+                &[NewHealthJobItem {
+                    resource_id: resource,
+                    relay_node_id: node,
+                    not_before_ms: overdue_now - 2_000,
+                    deadline_at_ms: Some(overdue_now - 1),
+                }],
+            )
+            .await
+            .unwrap();
+        let overdue_claims = state
+            .db
+            .claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: runtime.owner.clone(),
+                now_ms: overdue_now - 1_000,
+                lease_expires_at_ms: overdue_now - 1,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 16,
+            })
+            .await
+            .unwrap();
+        assert!(overdue_claims
+            .iter()
+            .any(|item| item.job_id == reaper_reconcile_job.id));
+        tokio::join!(runtime.reap(), runtime.reconcile());
+        runtime.reap().await;
+        let reaped = state
+            .db
+            .find_health_job(&reaper_reconcile_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reaped.status, "FAILED");
+        assert_eq!((reaped.queued_count, reaped.failed_count), (0, 1));
+        assert!(reaped.finished_at_ms.is_some());
+        let finalized_audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_id='worker-reaper-reconcile-job'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(finalized_audits, 1);
 
         // A persistently offline Node consumes orchestration retries without
         // inventing network attempts, then terminates at the retry limit.

@@ -531,7 +531,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 36;
+pub const PG_SCHEMA_VERSION: i32 = 37;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1978,6 +1978,18 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 36: durable orchestration retry counter present");
     }
 
+    if current < 37 {
+        let mut tx = pool.begin().await?;
+        for statement in crate::db::health_schema::POSTGRES_MIGRATION_37 {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query("INSERT INTO schema_version(version) VALUES(37)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 37: health Job finalization audit is unique");
+    }
+
     validate_pg_health_schema(pool).await?;
 
     Ok(())
@@ -2050,6 +2062,33 @@ async fn validate_pg_health_schema(pool: &sqlx::PgPool) -> Result<(), sqlx::Erro
     if !retry_check {
         return Err(sqlx::Error::Protocol(
             "PostgreSQL migration 36 version/schema mismatch: retry_count constraint missing"
+                .into(),
+        ));
+    }
+    let finalized_audit_index: Option<(bool, String, String)> = sqlx::query_as(
+        "SELECT i.indisunique,pg_get_indexdef(i.indexrelid),pg_get_expr(i.indpred,i.indrelid)
+         FROM pg_index i
+         JOIN pg_class idx ON idx.oid=i.indexrelid
+         JOIN pg_class tbl ON tbl.oid=i.indrelid
+         JOIN pg_namespace n ON n.oid=tbl.relnamespace
+         WHERE n.nspname=current_schema() AND idx.relname='uq_audit_health_job_finalized'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let valid_finalized_audit_index =
+        finalized_audit_index
+            .as_ref()
+            .is_some_and(|(unique, definition, predicate)| {
+                let definition = crate::db::health_schema::normalize_schema_sql(definition);
+                let predicate = crate::db::health_schema::normalize_schema_sql(predicate);
+                *unique
+                    && definition.contains("audit_logusingbtree(target_id)")
+                    && predicate.contains("action='job_finalized'::text")
+                    && predicate.contains("target_type='socks5_health_job'::text")
+            });
+    if !valid_finalized_audit_index {
+        return Err(sqlx::Error::Protocol(
+            "PostgreSQL migration 37 version/schema mismatch: health finalization audit index differs"
                 .into(),
         ));
     }

@@ -148,6 +148,126 @@ async fn pg_user_find_by_username_distinguishes_banned() {
 }
 
 #[tokio::test]
+async fn pg_health_job_finalized_audit_is_atomic_and_exactly_once() {
+    let Some(db) = repo_with_connections("health_finalized_audit", 32).await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('finalized','in','finalized-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('finalized-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'finalized-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+
+    let new_job = |id: &str| NewHealthJob {
+        id: id.into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let items = [NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: Some(10_000),
+    }];
+
+    let job = new_job("pg-finalized-cancel-storm");
+    db.create_health_job(&job, &items).await.unwrap();
+    let db = std::sync::Arc::new(db);
+    let results = futures_util::future::join_all((0..100).map(|_| {
+        let db = db.clone();
+        let job_id = job.id.clone();
+        async move { db.cancel_health_job(&job_id, 2_000).await.unwrap() }
+    }))
+    .await;
+    assert!(results.into_iter().all(|result| result));
+    let stored = db.find_health_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, "CANCELLED");
+    let finished_at = stored.finished_at_ms;
+    for now in 3_000..3_100 {
+        db.reconcile_health_job_counters(now, 500).await.unwrap();
+    }
+    assert_eq!(
+        db.find_health_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .finished_at_ms,
+        finished_at
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1")
+            .bind(&job.id).fetch_one(&db.pool).await.unwrap(),
+        1
+    );
+
+    let rollback_job = new_job("pg-finalized-rollback");
+    db.create_health_job(&rollback_job, &items).await.unwrap();
+    sqlx::query(
+        "CREATE FUNCTION fail_health_finalized() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.action='JOB_FINALIZED' AND NEW.target_id='pg-finalized-rollback' THEN
+             RAISE EXCEPTION 'forced finalized audit failure';
+           END IF;
+           RETURN NEW;
+         END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_health_finalized BEFORE INSERT ON audit_log
+         FOR EACH ROW EXECUTE FUNCTION fail_health_finalized()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(db.cancel_health_job(&rollback_job.id, 4_000).await.is_err());
+    let rolled_back = db.find_health_job(&rollback_job.id).await.unwrap().unwrap();
+    assert_eq!(rolled_back.status, "QUEUED");
+    assert_eq!(rolled_back.finished_at_ms, None);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE target_id=$1")
+            .bind(&rollback_job.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    sqlx::query("DROP TRIGGER fail_health_finalized ON audit_log")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION fail_health_finalized()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db.cancel_health_job(&rollback_job.id, 4_100).await.unwrap());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1")
+            .bind(&rollback_job.id).fetch_one(&db.pool).await.unwrap(),
+        1
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_user_insert_returns_unique_violation_on_duplicate() {
     let Some(db) = repo("user_dup").await else {
         return;
@@ -7198,6 +7318,10 @@ async fn pg_migration_34_cleans_orphans_preserves_fingerprints_and_adds_cascade(
             .await
             .unwrap();
     }
+    sqlx::query("DROP INDEX uq_audit_health_job_finalized")
+        .execute(&db.pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM schema_version WHERE version>=34")
         .execute(&db.pool)
         .await
@@ -7391,7 +7515,7 @@ async fn pg_health_orchestration_persistence_contract() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(version, 36);
+    assert_eq!(version, 37);
     run_pg_migrations(&db.pool).await.unwrap();
     for index in crate::db::health_schema::HEALTH_INDEXES {
         let present: i64 = sqlx::query_scalar(
@@ -9258,7 +9382,7 @@ async fn pg_retry_snapshot_survives_deleted_live_resource_and_node() {
 }
 
 #[tokio::test]
-async fn pg_migration_35_36_upgrade_rollback_rerun_and_mismatch_detection() {
+async fn pg_migration_35_37_upgrade_rollback_rerun_and_mismatch_detection() {
     let Some(db) = repo("migration_35_health").await else {
         return;
     };
@@ -9270,6 +9394,10 @@ async fn pg_migration_35_36_upgrade_rollback_rerun_and_mismatch_detection() {
     .await
     .unwrap();
     sqlx::query("DELETE FROM schema_version WHERE version>=35")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX IF EXISTS uq_audit_health_job_finalized")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -9300,10 +9428,94 @@ async fn pg_migration_35_36_upgrade_rollback_rerun_and_mismatch_detection() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(version, 36);
+    assert_eq!(version, 37);
     run_pg_migrations(&db.pool).await.unwrap();
 
-    sqlx::query("DELETE FROM schema_version WHERE version=36")
+    sqlx::query("DELETE FROM schema_version WHERE version=37")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX uq_audit_health_job_finalized")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO audit_log(ts,actor_name,action,target_type,target_id,detail) VALUES('2026-01-01 00:00:00','system','JOB_FINALIZED','socks5_health_job','pg-migration-37-rollback','status=FAILED; succeeded=0; failed=1; cancelled=0')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let mut finalized_audit_tx = db.pool.begin().await.unwrap();
+    for statement in crate::db::health_schema::POSTGRES_MIGRATION_37 {
+        sqlx::query(statement)
+            .execute(&mut *finalized_audit_tx)
+            .await
+            .unwrap();
+    }
+    assert!(
+        sqlx::query("INSERT INTO definitely_missing_table VALUES(1)")
+            .execute(&mut *finalized_audit_tx)
+            .await
+            .is_err()
+    );
+    finalized_audit_tx.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE target_id='pg-migration-37-rollback'"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        2,
+        "failed migration 37 must roll back duplicate cleanup"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        36
+    );
+    sqlx::query(
+        "INSERT INTO socks5_check_jobs
+         (id,source,status,request_fingerprint,snapshot_hash,resource_selector_json,
+          node_selector_json,matrix_mode,retry_policy_version,cancel_requested,total_items,
+          queued_count,running_count,succeeded_count,failed_count,cancelled_count,
+          created_at_ms,finished_at_ms)
+         VALUES('pg-migration-37-missing','MANUAL','FAILED',$1,$2,'{}','{}','CARTESIAN','v1',
+                FALSE,1,0,0,0,1,0,1000,2000)",
+    )
+    .bind("a".repeat(64))
+    .bind("b".repeat(64))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE target_id='pg-migration-37-rollback'"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE target_id='pg-migration-37-missing'"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1,
+        "migration 37 must repair a pre-existing terminal Job missing its audit"
+    );
+
+    sqlx::query("DELETE FROM schema_version WHERE version>=36")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX uq_audit_health_job_finalized")
         .execute(&db.pool)
         .await
         .unwrap();

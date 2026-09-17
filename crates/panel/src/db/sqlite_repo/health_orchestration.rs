@@ -104,18 +104,27 @@ fn counter_column(category: HealthCounterCategory) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AggregateFinalizeOutcome {
+    updated: bool,
+    transitioned_to_terminal: bool,
+}
+
 async fn aggregate_and_finalize(
     conn: &mut SqliteConnection,
     job_id: &str,
     now_ms: i64,
-) -> Result<(bool, bool), DbError> {
+) -> Result<AggregateFinalizeOutcome, DbError> {
     let current: Option<(bool, String)> =
         sqlx::query_as("SELECT cancel_requested,status FROM socks5_check_jobs WHERE id=?")
             .bind(job_id)
             .fetch_optional(&mut *conn)
             .await?;
     let Some((cancel_requested, previous_status)) = current else {
-        return Ok((false, false));
+        return Ok(AggregateFinalizeOutcome {
+            updated: false,
+            transitioned_to_terminal: false,
+        });
     };
     let counts: Option<(i64, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT
@@ -130,7 +139,10 @@ async fn aggregate_and_finalize(
     .fetch_optional(&mut *conn)
     .await?;
     let Some((queued, running, succeeded, failed, cancelled)) = counts else {
-        return Ok((false, false));
+        return Ok(AggregateFinalizeOutcome {
+            updated: false,
+            transitioned_to_terminal: false,
+        });
     };
     let total = queued + running + succeeded + failed + cancelled;
     let terminal = queued == 0 && running == 0;
@@ -153,7 +165,7 @@ async fn aggregate_and_finalize(
             "RUNNING"
         }
     };
-    let finalized = terminal
+    let transitioned_to_terminal = terminal
         && !HealthJobStatus::parse(&previous_status).is_some_and(HealthJobStatus::is_terminal);
     let result = sqlx::query(
         "UPDATE socks5_check_jobs SET status=?,total_items=?,queued_count=?,running_count=?,
@@ -172,7 +184,28 @@ async fn aggregate_and_finalize(
     .bind(job_id)
     .execute(&mut *conn)
     .await?;
-    Ok((result.rows_affected() == 1, finalized))
+    if terminal {
+        let detail = format!(
+            "status={status}; succeeded={succeeded}; failed={failed}; cancelled={cancelled}"
+        );
+        sqlx::query(
+            "INSERT INTO audit_log
+             (ts,actor_id,actor_name,action,target_type,target_id,detail)
+             VALUES(strftime('%Y-%m-%d %H:%M:%S','now'),NULL,'system',
+                    'JOB_FINALIZED','socks5_health_job',?,?)
+             ON CONFLICT(target_id)
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'
+             DO NOTHING",
+        )
+        .bind(job_id)
+        .bind(detail)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(AggregateFinalizeOutcome {
+        updated: result.rows_affected() == 1,
+        transitioned_to_terminal,
+    })
 }
 
 #[async_trait]
@@ -756,9 +789,18 @@ impl HealthOrchestrationRepository for SqliteRepository {
         .await?;
         let mut reconciled = Vec::with_capacity(jobs.len());
         for job_id in jobs {
-            let (updated, finalized) = aggregate_and_finalize(&mut conn, &job_id, now_ms).await?;
-            if updated {
-                reconciled.push(HealthJobReconcileOutcome { job_id, finalized });
+            let outcome = match aggregate_and_finalize(&mut conn, &job_id, now_ms).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    rollback(&mut conn).await;
+                    return Err(error);
+                }
+            };
+            if outcome.updated {
+                reconciled.push(HealthJobReconcileOutcome {
+                    job_id,
+                    finalized: outcome.transitioned_to_terminal,
+                });
             }
         }
         sqlx::query("COMMIT").execute(&mut *conn).await?;
@@ -827,7 +869,10 @@ impl HealthOrchestrationRepository for SqliteRepository {
                 .await?;
         }
         if terminal {
-            aggregate_and_finalize(&mut conn, &job_id, t.now_ms).await?;
+            if let Err(error) = aggregate_and_finalize(&mut conn, &job_id, t.now_ms).await {
+                rollback(&mut conn).await;
+                return Err(error);
+            }
         }
         sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(ConditionalWriteOutcome::Applied)
@@ -859,7 +904,10 @@ impl HealthOrchestrationRepository for SqliteRepository {
         .await?;
         sqlx::query("UPDATE socks5_check_job_items SET state='CANCELLED',item_fence_token=item_fence_token+1,lease_owner=NULL,lease_expires_at_ms=NULL,pair_fence_token=NULL,dispatch_attempt_id=NULL,request_id=NULL,not_before_ms=?,health_status=NULL,safe_error_code=NULL,safe_error_message=NULL,completed_after_cancel=0,finished_at_ms=?,updated_at_ms=? WHERE job_id=? AND state IN ('QUEUED','RETRY_WAIT')")
             .bind(now_ms).bind(now_ms).bind(now_ms).bind(job_id).execute(&mut *conn).await?;
-        aggregate_and_finalize(&mut conn, job_id, now_ms).await?;
+        if let Err(error) = aggregate_and_finalize(&mut conn, job_id, now_ms).await {
+            rollback(&mut conn).await;
+            return Err(error);
+        }
         sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(true)
     }
@@ -870,7 +918,7 @@ impl HealthOrchestrationRepository for SqliteRepository {
         match result {
             Ok(value) => {
                 sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(value.0)
+                Ok(value.updated)
             }
             Err(error) => {
                 rollback(&mut conn).await;
@@ -1306,6 +1354,105 @@ mod tests {
         assert_eq!(cancelled_job.status, "CANCELLED");
         assert_eq!(cancelled_job.cancelled_count, 1);
         assert!(repo.cancel_health_job(&job.id, 2_300).await.unwrap());
+    }
+
+    async fn finalized_audit_count(repo: &SqliteRepository, job_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=?",
+        )
+        .bind(job_id)
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn finalized_audit_is_exactly_once_under_one_hundred_cancel_storms() {
+        let (repo, resource, node) = fixture().await;
+        let repo = std::sync::Arc::new(repo);
+        for round in 0..100 {
+            let id = format!("cancel-finalized-{round}");
+            let (job, items) = job(&id, resource, node, None);
+            repo.create_health_job(&job, &items).await.unwrap();
+            let results = futures_util::future::join_all((0..100).map(|_| {
+                let repo = repo.clone();
+                let id = id.clone();
+                async move { repo.cancel_health_job(&id, 2_000).await.unwrap() }
+            }))
+            .await;
+            assert!(results.into_iter().all(|result| result));
+            let stored = repo.find_health_job(&id).await.unwrap().unwrap();
+            assert_eq!(stored.status, "CANCELLED");
+            assert_eq!(stored.cancelled_count, 1);
+            assert_eq!(finalized_audit_count(&repo, &id).await, 1);
+            let finished_at = stored.finished_at_ms;
+            for now in 3_000..3_100 {
+                repo.reconcile_health_job_counters(now, 500).await.unwrap();
+            }
+            let reconciled = repo.find_health_job(&id).await.unwrap().unwrap();
+            assert_eq!(reconciled.finished_at_ms, finished_at);
+            assert_eq!(finalized_audit_count(&repo, &id).await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_audit_and_terminal_transition_share_one_transaction() {
+        let (repo, resource, node) = fixture().await;
+        let (rollback_job, items) = job("finalized-audit-rollback", resource, node, None);
+        repo.create_health_job(&rollback_job, &items).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_health_finalized BEFORE INSERT ON audit_log
+             WHEN NEW.action='JOB_FINALIZED' AND NEW.target_id='finalized-audit-rollback'
+             BEGIN SELECT RAISE(ABORT,'forced finalized audit failure'); END",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        assert!(repo
+            .cancel_health_job(&rollback_job.id, 2_000)
+            .await
+            .is_err());
+        let rolled_back = repo
+            .find_health_job(&rollback_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rolled_back.status, "QUEUED");
+        assert_eq!(rolled_back.finished_at_ms, None);
+        assert_eq!(finalized_audit_count(&repo, &rollback_job.id).await, 0);
+        sqlx::query("DROP TRIGGER fail_health_finalized")
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        assert!(repo
+            .cancel_health_job(&rollback_job.id, 2_100)
+            .await
+            .unwrap());
+        assert_eq!(finalized_audit_count(&repo, &rollback_job.id).await, 1);
+
+        let (job, items) = job("finalized-audit-precommit-crash", resource, node, None);
+        repo.create_health_job(&job, &items).await.unwrap();
+        let mut conn = begin_immediate(&repo.pool).await.unwrap();
+        sqlx::query(
+            "UPDATE socks5_check_job_items SET state='CANCELLED',finished_at_ms=3000,
+             updated_at_ms=3000 WHERE job_id=?",
+        )
+        .bind(&job.id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        aggregate_and_finalize(&mut conn, &job.id, 3_000)
+            .await
+            .unwrap();
+        rollback(&mut conn).await;
+        drop(conn);
+        let rolled_back = repo.find_health_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(rolled_back.status, "QUEUED");
+        assert_eq!(rolled_back.finished_at_ms, None);
+        assert_eq!(finalized_audit_count(&repo, &job.id).await, 0);
+        assert!(repo.cancel_health_job(&job.id, 3_100).await.unwrap());
+        assert_eq!(finalized_audit_count(&repo, &job.id).await, 1);
     }
 
     #[tokio::test]

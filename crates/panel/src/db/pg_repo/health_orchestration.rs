@@ -82,11 +82,17 @@ fn counter_column(category: HealthCounterCategory) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AggregateFinalizeOutcome {
+    updated: bool,
+    transitioned_to_terminal: bool,
+}
+
 async fn aggregate_and_finalize(
     tx: &mut Transaction<'_, Postgres>,
     job_id: &str,
     now_ms: i64,
-) -> Result<(bool, bool), DbError> {
+) -> Result<AggregateFinalizeOutcome, DbError> {
     let current: Option<(bool, String)> = sqlx::query_as(
         "SELECT cancel_requested,status FROM socks5_check_jobs WHERE id=$1 FOR UPDATE",
     )
@@ -94,7 +100,10 @@ async fn aggregate_and_finalize(
     .fetch_optional(&mut **tx)
     .await?;
     let Some((cancel, previous_status)) = current else {
-        return Ok((false, false));
+        return Ok(AggregateFinalizeOutcome {
+            updated: false,
+            transitioned_to_terminal: false,
+        });
     };
     let _: Vec<i64> = sqlx::query_scalar(
         "SELECT id FROM socks5_check_job_items WHERE job_id=$1 ORDER BY id FOR UPDATE",
@@ -113,7 +122,10 @@ async fn aggregate_and_finalize(
     .fetch_optional(&mut **tx)
     .await?;
     let Some((queued, running, succeeded, failed, cancelled)) = counts else {
-        return Ok((false, false));
+        return Ok(AggregateFinalizeOutcome {
+            updated: false,
+            transitioned_to_terminal: false,
+        });
     };
     let total = queued + running + succeeded + failed + cancelled;
     let terminal = queued == 0 && running == 0;
@@ -136,11 +148,32 @@ async fn aggregate_and_finalize(
             "RUNNING"
         }
     };
-    let finalized = terminal
+    let transitioned_to_terminal = terminal
         && !HealthJobStatus::parse(&previous_status).is_some_and(HealthJobStatus::is_terminal);
     let result=sqlx::query("UPDATE socks5_check_jobs SET status=$1,total_items=$2,queued_count=$3,running_count=$4,succeeded_count=$5,failed_count=$6,cancelled_count=$7,finished_at_ms=CASE WHEN $8 THEN COALESCE(finished_at_ms,$9) ELSE NULL END WHERE id=$10")
         .bind(status).bind(total).bind(queued).bind(running).bind(succeeded).bind(failed).bind(cancelled).bind(terminal).bind(now_ms).bind(job_id).execute(&mut **tx).await?;
-    Ok((result.rows_affected() == 1, finalized))
+    if terminal {
+        let detail = format!(
+            "status={status}; succeeded={succeeded}; failed={failed}; cancelled={cancelled}"
+        );
+        sqlx::query(
+            "INSERT INTO audit_log
+             (ts,actor_id,actor_name,action,target_type,target_id,detail)
+             VALUES(to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'),
+                    NULL,'system','JOB_FINALIZED','socks5_health_job',$1,$2)
+             ON CONFLICT(target_id)
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'
+             DO NOTHING",
+        )
+        .bind(job_id)
+        .bind(detail)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(AggregateFinalizeOutcome {
+        updated: result.rows_affected() == 1,
+        transitioned_to_terminal,
+    })
 }
 
 #[async_trait]
@@ -712,9 +745,12 @@ impl HealthOrchestrationRepository for PgRepository {
         let mut reconciled = Vec::new();
         for job_id in jobs {
             let mut tx = self.pool.begin().await?;
-            let (updated, finalized) = aggregate_and_finalize(&mut tx, &job_id, now_ms).await?;
-            if updated {
-                reconciled.push(HealthJobReconcileOutcome { job_id, finalized });
+            let outcome = aggregate_and_finalize(&mut tx, &job_id, now_ms).await?;
+            if outcome.updated {
+                reconciled.push(HealthJobReconcileOutcome {
+                    job_id,
+                    finalized: outcome.transitioned_to_terminal,
+                });
             }
             tx.commit().await?;
         }
@@ -832,7 +868,7 @@ impl HealthOrchestrationRepository for PgRepository {
         let mut tx = self.pool.begin().await?;
         let value = aggregate_and_finalize(&mut tx, job_id, now_ms).await?;
         tx.commit().await?;
-        Ok(value.0)
+        Ok(value.updated)
     }
     async fn retry_failed_health_pairs(
         &self,

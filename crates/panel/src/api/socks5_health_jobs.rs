@@ -499,22 +499,6 @@ pub async fn cancel(
                     )
                     .await;
                 }
-                if HealthJobStatus::parse(&job.status).is_some_and(HealthJobStatus::is_terminal)
-                    && job.finished_at_ms == Some(transition_ms)
-                {
-                    crate::service::audit::record(
-                        &state,
-                        Some(admin.user_id),
-                        "JOB_FINALIZED",
-                        "socks5_health_job",
-                        &job_id,
-                        &format!(
-                            "status={}; succeeded={}; failed={}; cancelled={}",
-                            job.status, job.succeeded_count, job.failed_count, job.cancelled_count
-                        ),
-                    )
-                    .await;
-                }
                 success(StatusCode::OK, job_response(job))
             }
             _ => error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
