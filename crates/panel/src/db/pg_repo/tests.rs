@@ -268,6 +268,259 @@ async fn pg_health_job_finalized_audit_is_atomic_and_exactly_once() {
 }
 
 #[tokio::test]
+async fn pg_reconciliation_repairs_missing_finalized_audit_without_rewriting_health_truth() {
+    let Some(db) = repo_with_connections("health_missing_finalized_repair", 32).await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid)
+         VALUES('missing-finalized','in','missing-finalized-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port)
+         VALUES('missing-finalized-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar(
+        "INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at)
+         VALUES($1,'missing-finalized-n','2026-01-01','2026-01-01') RETURNING id",
+    )
+    .bind(group)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let new_job = |id: &str| NewHealthJob {
+        id: id.into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let items = [NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: Some(10_000),
+    }];
+
+    let normal_job = new_job("z-pg-finalized-normal");
+    db.create_health_job(&normal_job, &items).await.unwrap();
+    assert!(db.cancel_health_job(&normal_job.id, 2_000).await.unwrap());
+    let normal_payload: (Option<i64>, String, String) = sqlx::query_as(
+        "SELECT actor_id,actor_name,detail FROM audit_log
+         WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1",
+    )
+    .bind(&normal_job.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let missing_job = new_job("b-pg-finalized-missing");
+    db.create_health_job(&missing_job, &items).await.unwrap();
+    assert!(db.cancel_health_job(&missing_job.id, 2_000).await.unwrap());
+    let before = db.find_health_job(&missing_job.id).await.unwrap().unwrap();
+    sqlx::query(
+        "DELETE FROM audit_log
+         WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1",
+    )
+    .bind(&missing_job.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let drift_job = new_job("a-pg-counter-drift");
+    db.create_health_job(&drift_job, &items).await.unwrap();
+    sqlx::query(
+        "UPDATE socks5_check_jobs
+         SET status='RUNNING',queued_count=0,running_count=1,started_at_ms=1500 WHERE id=$1",
+    )
+    .bind(&drift_job.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let audited_job = new_job("c-pg-finalized-audited");
+    db.create_health_job(&audited_job, &items).await.unwrap();
+    assert!(db.cancel_health_job(&audited_job.id, 2_000).await.unwrap());
+    let live_job = new_job("d-pg-live-correct");
+    db.create_health_job(&live_job, &items).await.unwrap();
+
+    let db = std::sync::Arc::new(db);
+    let outcomes = futures_util::future::join_all((0..32).map(|round| {
+        let db = db.clone();
+        async move {
+            db.reconcile_health_job_counters(3_000 + round, 500)
+                .await
+                .unwrap()
+        }
+    }))
+    .await;
+    let repaired_ids: Vec<String> = outcomes
+        .into_iter()
+        .flatten()
+        .map(|outcome| outcome.job_id)
+        .collect();
+    assert!(repaired_ids.contains(&drift_job.id));
+    assert!(repaired_ids.contains(&missing_job.id));
+    assert!(!repaired_ids.contains(&audited_job.id));
+    assert!(!repaired_ids.contains(&live_job.id));
+
+    let repaired = db.find_health_job(&missing_job.id).await.unwrap().unwrap();
+    assert_eq!(repaired.status, before.status);
+    assert_eq!(repaired.total_items, before.total_items);
+    assert_eq!(repaired.queued_count, before.queued_count);
+    assert_eq!(repaired.running_count, before.running_count);
+    assert_eq!(repaired.succeeded_count, before.succeeded_count);
+    assert_eq!(repaired.failed_count, before.failed_count);
+    assert_eq!(repaired.cancelled_count, before.cancelled_count);
+    assert_eq!(repaired.finished_at_ms, before.finished_at_ms);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1"
+        )
+        .bind(&missing_job.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let repaired_payload: (Option<i64>, String, String) = sqlx::query_as(
+        "SELECT actor_id,actor_name,detail FROM audit_log
+         WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1",
+    )
+    .bind(&missing_job.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(repaired_payload, normal_payload);
+
+    let drift_repaired = db.find_health_job(&drift_job.id).await.unwrap().unwrap();
+    assert_eq!(drift_repaired.status, "RUNNING");
+    assert_eq!(
+        (drift_repaired.queued_count, drift_repaired.running_count),
+        (1, 0)
+    );
+    assert!(db
+        .reconcile_health_job_counters(4_000, 500)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let cancel_replays = futures_util::future::join_all((0..32).map(|_| {
+        let db = db.clone();
+        let job_id = missing_job.id.clone();
+        async move { db.cancel_health_job(&job_id, 5_000).await.unwrap() }
+    }))
+    .await;
+    assert!(cancel_replays.into_iter().all(|result| result));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1"
+        )
+        .bind(&missing_job.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let after_replay = db.find_health_job(&missing_job.id).await.unwrap().unwrap();
+    assert_eq!(after_replay.finished_at_ms, before.finished_at_ms);
+    assert_eq!(after_replay.cancelled_count, before.cancelled_count);
+
+    sqlx::query(
+        "INSERT INTO socks5_check_jobs
+         (id,source,status,request_fingerprint,snapshot_hash,resource_selector_json,
+          node_selector_json,matrix_mode,retry_policy_version,cancel_requested,total_items,
+          queued_count,running_count,succeeded_count,failed_count,cancelled_count,
+          created_at_ms,finished_at_ms)
+         SELECT 'pg-missing-audit-'||lpad(g::text,4,'0'),'MANUAL','CANCELLED',
+                repeat('a',64),repeat('b',64),'{}','{}','CARTESIAN','v1',TRUE,
+                1,0,0,0,0,1,10000+g,2000
+         FROM generate_series(0,999) g",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_check_job_items
+         (job_id,resource_id,relay_node_id,resource_id_snapshot,relay_node_id_snapshot,
+          state,attempt_count,item_fence_token,not_before_ms,completed_after_cancel,
+          created_at_ms,updated_at_ms,finished_at_ms)
+         SELECT id,$1,$2,$1,$2,'CANCELLED',0,0,1000,FALSE,1000,2000,2000
+         FROM socks5_check_jobs WHERE id LIKE 'pg-missing-audit-%'",
+    )
+    .bind(resource)
+    .bind(node)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.reconcile_health_job_counters(6_000, 10_000)
+            .await
+            .unwrap()
+            .len(),
+        500
+    );
+    assert_eq!(
+        db.reconcile_health_job_counters(6_001, 10_000)
+            .await
+            .unwrap()
+            .len(),
+        500
+    );
+    assert!(db
+        .reconcile_health_job_counters(6_002, 10_000)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'
+               AND target_id LIKE 'pg-missing-audit-%'"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1_000
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM (
+               SELECT target_id FROM audit_log
+               WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'
+                 AND target_id LIKE 'pg-missing-audit-%'
+               GROUP BY target_id HAVING COUNT(*)<>1) duplicates"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        0
+    );
+    let integrity: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*),SUM(cancelled_count)::BIGINT,MIN(finished_at_ms),MAX(finished_at_ms)
+         FROM socks5_check_jobs WHERE id LIKE 'pg-missing-audit-%'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(integrity, (1_000, 1_000, 2_000, 2_000));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_user_insert_returns_unique_violation_on_duplicate() {
     let Some(db) = repo("user_dup").await else {
         return;

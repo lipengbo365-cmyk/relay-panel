@@ -782,6 +782,12 @@ impl HealthOrchestrationRepository for SqliteRepository {
                ) x WHERE x.total<>j.total_items OR x.queued<>j.queued_count
                    OR x.running<>j.running_count OR x.succeeded<>j.succeeded_count
                    OR x.failed<>j.failed_count OR x.cancelled<>j.cancelled_count)
+                OR (j.status IN ('SUCCEEDED','FAILED','PARTIAL','CANCELLED','PARTIAL_CANCELLED')
+                    AND NOT EXISTS(
+                      SELECT 1 FROM audit_log a
+                      WHERE a.action='JOB_FINALIZED'
+                        AND a.target_type='socks5_health_job'
+                        AND a.target_id=j.id))
              ORDER BY j.created_at_ms,j.id LIMIT ?",
         )
         .bind(limit.clamp(0, 500))
@@ -1453,6 +1459,237 @@ mod tests {
         assert_eq!(finalized_audit_count(&repo, &job.id).await, 0);
         assert!(repo.cancel_health_job(&job.id, 3_100).await.unwrap());
         assert_eq!(finalized_audit_count(&repo, &job.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_repairs_missing_finalized_audit_without_rewriting_health_truth() {
+        let (repo, resource, node) = fixture().await;
+        let repo = std::sync::Arc::new(repo);
+
+        let (normal_job, items) = job("z-finalized-normal", resource, node, None);
+        repo.create_health_job(&normal_job, &items).await.unwrap();
+        assert!(repo.cancel_health_job(&normal_job.id, 2_000).await.unwrap());
+        let normal_payload: (Option<i64>, String, String) = sqlx::query_as(
+            "SELECT actor_id,actor_name,detail FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=?",
+        )
+        .bind(&normal_job.id)
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+
+        let (missing_job, items) = job("b-finalized-missing", resource, node, None);
+        repo.create_health_job(&missing_job, &items).await.unwrap();
+        assert!(repo
+            .cancel_health_job(&missing_job.id, 2_000)
+            .await
+            .unwrap());
+        let before = repo
+            .find_health_job(&missing_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=?",
+        )
+        .bind(&missing_job.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+        let (drift_job, items) = job("a-counter-drift", resource, node, None);
+        repo.create_health_job(&drift_job, &items).await.unwrap();
+        sqlx::query(
+            "UPDATE socks5_check_jobs
+             SET status='RUNNING',queued_count=0,running_count=1,started_at_ms=1500 WHERE id=?",
+        )
+        .bind(&drift_job.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+        let (audited_job, items) = job("c-finalized-audited", resource, node, None);
+        repo.create_health_job(&audited_job, &items).await.unwrap();
+        assert!(repo
+            .cancel_health_job(&audited_job.id, 2_000)
+            .await
+            .unwrap());
+        let (live_job, items) = job("d-live-correct", resource, node, None);
+        repo.create_health_job(&live_job, &items).await.unwrap();
+
+        let outcomes = futures_util::future::join_all((0..32).map(|round| {
+            let repo = repo.clone();
+            async move {
+                repo.reconcile_health_job_counters(3_000 + round, 500)
+                    .await
+                    .unwrap()
+            }
+        }))
+        .await;
+        let repaired_ids: Vec<String> = outcomes
+            .into_iter()
+            .flatten()
+            .map(|outcome| outcome.job_id)
+            .collect();
+        assert_eq!(
+            repaired_ids
+                .iter()
+                .filter(|id| *id == &drift_job.id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            repaired_ids
+                .iter()
+                .filter(|id| *id == &missing_job.id)
+                .count(),
+            1
+        );
+        assert!(!repaired_ids.contains(&audited_job.id));
+        assert!(!repaired_ids.contains(&live_job.id));
+
+        let repaired = repo
+            .find_health_job(&missing_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.status, before.status);
+        assert_eq!(repaired.total_items, before.total_items);
+        assert_eq!(repaired.queued_count, before.queued_count);
+        assert_eq!(repaired.running_count, before.running_count);
+        assert_eq!(repaired.succeeded_count, before.succeeded_count);
+        assert_eq!(repaired.failed_count, before.failed_count);
+        assert_eq!(repaired.cancelled_count, before.cancelled_count);
+        assert_eq!(repaired.finished_at_ms, before.finished_at_ms);
+        assert_eq!(finalized_audit_count(&repo, &missing_job.id).await, 1);
+        let repaired_payload: (Option<i64>, String, String) = sqlx::query_as(
+            "SELECT actor_id,actor_name,detail FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=?",
+        )
+        .bind(&missing_job.id)
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired_payload, normal_payload);
+
+        let drift_repaired = repo.find_health_job(&drift_job.id).await.unwrap().unwrap();
+        assert_eq!(drift_repaired.status, "RUNNING");
+        assert_eq!(
+            (drift_repaired.queued_count, drift_repaired.running_count),
+            (1, 0)
+        );
+        assert!(repo
+            .reconcile_health_job_counters(4_000, 500)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let cancel_replays = futures_util::future::join_all((0..32).map(|_| {
+            let repo = repo.clone();
+            let job_id = missing_job.id.clone();
+            async move { repo.cancel_health_job(&job_id, 5_000).await.unwrap() }
+        }))
+        .await;
+        assert!(cancel_replays.into_iter().all(|result| result));
+        assert_eq!(finalized_audit_count(&repo, &missing_job.id).await, 1);
+        let after_replay = repo
+            .find_health_job(&missing_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_replay.finished_at_ms, before.finished_at_ms);
+        assert_eq!(after_replay.cancelled_count, before.cancelled_count);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_repairs_large_missing_audit_backlog_in_bounded_batches() {
+        let (repo, resource, node) = fixture().await;
+        let mut tx = repo.pool.begin().await.unwrap();
+        for index in 0..1_000_i64 {
+            let job_id = format!("missing-audit-{index:04}");
+            sqlx::query(
+                "INSERT INTO socks5_check_jobs
+                 (id,source,status,request_fingerprint,snapshot_hash,resource_selector_json,
+                  node_selector_json,matrix_mode,retry_policy_version,cancel_requested,total_items,
+                  queued_count,running_count,succeeded_count,failed_count,cancelled_count,
+                  created_at_ms,finished_at_ms)
+                 VALUES(?,'MANUAL','CANCELLED',?,?,'{}','{}','CARTESIAN','v1',1,1,0,0,0,0,1,?,2000)",
+            )
+            .bind(&job_id)
+            .bind("a".repeat(64))
+            .bind("b".repeat(64))
+            .bind(1_000 + index)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO socks5_check_job_items
+                 (job_id,resource_id,relay_node_id,resource_id_snapshot,relay_node_id_snapshot,
+                  state,attempt_count,item_fence_token,not_before_ms,completed_after_cancel,
+                  created_at_ms,updated_at_ms,finished_at_ms)
+                 VALUES(?,?,?,?,?,'CANCELLED',0,0,1000,0,1000,2000,2000)",
+            )
+            .bind(&job_id)
+            .bind(resource)
+            .bind(node)
+            .bind(resource)
+            .bind(node)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            repo.reconcile_health_job_counters(3_000, 10_000)
+                .await
+                .unwrap()
+                .len(),
+            500
+        );
+        assert_eq!(
+            repo.reconcile_health_job_counters(3_001, 10_000)
+                .await
+                .unwrap()
+                .len(),
+            500
+        );
+        assert!(repo
+            .reconcile_health_job_counters(3_002, 10_000)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log
+                 WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'"
+            )
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap(),
+            1_000
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM (
+                   SELECT target_id FROM audit_log
+                   WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'
+                   GROUP BY target_id HAVING COUNT(*)<>1)"
+            )
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap(),
+            0
+        );
+        let integrity: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*),SUM(cancelled_count),MIN(finished_at_ms),MAX(finished_at_ms)
+             FROM socks5_check_jobs WHERE id LIKE 'missing-audit-%'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(integrity, (1_000, 1_000, 2_000, 2_000));
     }
 
     #[tokio::test]

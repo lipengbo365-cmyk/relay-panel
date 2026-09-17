@@ -734,9 +734,15 @@ impl HealthOrchestrationRepository for PgRepository {
                  COUNT(*) FILTER(WHERE state='CANCELLED') cancelled
                FROM socks5_check_job_items WHERE job_id=j.id
              ) x ON TRUE
-             WHERE x.total<>j.total_items OR x.queued<>j.queued_count
+             WHERE (x.total<>j.total_items OR x.queued<>j.queued_count
                 OR x.running<>j.running_count OR x.succeeded<>j.succeeded_count
-                OR x.failed<>j.failed_count OR x.cancelled<>j.cancelled_count
+                OR x.failed<>j.failed_count OR x.cancelled<>j.cancelled_count)
+                OR (j.status IN ('SUCCEEDED','FAILED','PARTIAL','CANCELLED','PARTIAL_CANCELLED')
+                    AND NOT EXISTS(
+                      SELECT 1 FROM audit_log a
+                      WHERE a.action='JOB_FINALIZED'
+                        AND a.target_type='socks5_health_job'
+                        AND a.target_id=j.id))
              ORDER BY j.created_at_ms,j.id LIMIT $1",
         )
         .bind(limit.clamp(0, 500))
