@@ -23,4 +23,23 @@ describe('useSafePolling', () => {
     expect(screen.getByTestId('poll-state')).toHaveTextContent('idle:0');
     vi.useRealTimers();
   });
+
+  it('pauses while hidden, refreshes on visibility, and backs off after failure', async () => {
+    vi.useFakeTimers();
+    const run = vi.fn().mockRejectedValueOnce(new Error('safe failure')).mockResolvedValue(undefined);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    render(<Probe run={run} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByTestId('poll-state')).toHaveTextContent('idle:1');
+
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(run).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')); await Promise.resolve(); });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('poll-state')).toHaveTextContent('idle:0');
+    vi.useRealTimers();
+  });
 });

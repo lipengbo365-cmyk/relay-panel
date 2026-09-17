@@ -39,7 +39,7 @@ describe('HealthJobDetailDrawer', () => {
     expect(screen.getByText(/selectors_reconstruct_snapshot = false/)).toBeInTheDocument();
     expect(screen.getByText('Resource #987')).toBeInTheDocument();
     expect(screen.getByText('Node #654')).toBeInTheDocument();
-    expect(screen.getByText('Completed')).toBeInTheDocument();
+    expect(screen.getByText('Completed after cancel')).toBeInTheDocument();
   });
 
   it('never renders raw transport details from an unsafe error object', () => {

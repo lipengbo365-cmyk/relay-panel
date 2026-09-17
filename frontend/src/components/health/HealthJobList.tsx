@@ -3,15 +3,17 @@ import { Button, Card, Select, Space, Table, Typography } from 'antd';
 import { LeftOutlined, RightOutlined } from '@ant-design/icons';
 import type {
   HealthJob,
+  HealthJobFilters,
   HealthJobSource,
   HealthJobStatus,
+  SafeError,
 } from '../../api/health';
 import {
   HealthJobProgress,
   JobStatusTag,
   TimestampDisplay,
 } from './HealthStatus';
-import { HealthEmptyState } from './HealthStates';
+import { HealthEmptyState, HealthErrorState } from './HealthStates';
 
 const JOB_STATUSES: HealthJobStatus[] = [
   'QUEUED', 'RUNNING', 'CANCEL_REQUESTED', 'SUCCEEDED',
@@ -22,11 +24,6 @@ const JOB_SOURCES: HealthJobSource[] = [
   'MANUAL', 'SCHEDULED', 'RETRY_FAILED', 'POLICY_RUN_NOW',
 ];
 
-export interface HealthJobFilters {
-  status?: HealthJobStatus;
-  source?: HealthJobSource;
-}
-
 interface HealthJobListProps {
   jobs: HealthJob[];
   loading?: boolean;
@@ -35,6 +32,9 @@ interface HealthJobListProps {
   onFiltersChange?: (filters: HealthJobFilters) => void;
   onCursorChange?: (cursor: string | undefined) => void;
   onCursorReset?: () => void;
+  error?: SafeError | null;
+  stale?: boolean;
+  onRetry?: () => void;
 }
 
 export function HealthJobList({
@@ -45,6 +45,9 @@ export function HealthJobList({
   onFiltersChange,
   onCursorChange,
   onCursorReset,
+  error = null,
+  stale = false,
+  onRetry,
 }: HealthJobListProps) {
   const [filters, setFilters] = useState<HealthJobFilters>({});
   const [cursorStack, setCursorStack] = useState<string[]>([]);
@@ -71,8 +74,16 @@ export function HealthJobList({
     });
   };
 
+  const resetToFirstPage = () => {
+    setCursorStack([]);
+    onCursorReset?.();
+    onCursorChange?.(undefined);
+    onRetry?.();
+  };
+
   return (
     <Card>
+      {stale ? <Typography.Paragraph type="warning">Data may be stale; the latest refresh failed.</Typography.Paragraph> : null}
       <Space wrap style={{ marginBottom: 16 }}>
         <Select<HealthJobStatus>
           allowClear
@@ -97,7 +108,7 @@ export function HealthJobList({
         </Typography.Text>
       </Space>
 
-      <Table
+      {error ? <HealthErrorState error={error} onRetry={error.code === 'INVALID_CURSOR' ? resetToFirstPage : onRetry} /> : <Table
         rowKey="id"
         loading={loading}
         dataSource={jobs}
@@ -119,7 +130,7 @@ export function HealthJobList({
           { title: 'Finished', dataIndex: 'finished_at', width: 180, render: (value: number | null) => <TimestampDisplay value={value} /> },
           { title: 'Actions', fixed: 'right', width: 100, render: (_value: unknown, job: HealthJob) => <Button size="small" onClick={() => onOpenJob(job.id)}>Detail</Button> },
         ]}
-      />
+      />}
 
       <Space style={{ width: '100%', justifyContent: 'flex-end', marginTop: 16 }}>
         <Button icon={<LeftOutlined />} disabled={cursorStack.length === 0} onClick={movePrevious}>Previous</Button>

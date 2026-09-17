@@ -161,6 +161,10 @@ export type HealthSafeErrorCode =
   | 'NO_FAILED_ITEMS'
   | 'DATABASE_ERROR'
   | 'INVALID_CURSOR'
+  | 'INVALID_STATUS'
+  | 'INVALID_SOURCE'
+  | 'INVALID_ITEM_STATE'
+  | 'INVALID_LIMIT'
   | 'UNKNOWN_ERROR';
 
 export interface SafeError {
@@ -173,6 +177,11 @@ export interface HealthJobListParams {
   source?: HealthJobSource;
   cursor?: string;
   limit?: number;
+}
+
+export interface HealthJobFilters {
+  status?: HealthJobStatus;
+  source?: HealthJobSource;
 }
 
 export interface HealthJobItemListParams {
@@ -223,6 +232,10 @@ const SAFE_CODES = new Set<HealthSafeErrorCode>([
   'NO_FAILED_ITEMS',
   'DATABASE_ERROR',
   'INVALID_CURSOR',
+  'INVALID_STATUS',
+  'INVALID_SOURCE',
+  'INVALID_ITEM_STATE',
+  'INVALID_LIMIT',
 ]);
 
 const SAFE_MESSAGES: Record<HealthSafeErrorCode, string> = {
@@ -236,6 +249,10 @@ const SAFE_MESSAGES: Record<HealthSafeErrorCode, string> = {
   NO_FAILED_ITEMS: 'This job has no execution failures to retry.',
   DATABASE_ERROR: 'The health service could not read its stored state.',
   INVALID_CURSOR: 'The page cursor is invalid or expired. Return to the first page.',
+  INVALID_STATUS: 'The selected job status is not supported.',
+  INVALID_SOURCE: 'The selected job source is not supported.',
+  INVALID_ITEM_STATE: 'The selected item state is not supported.',
+  INVALID_LIMIT: 'The requested page size is not supported.',
   UNKNOWN_ERROR: 'The health request failed safely. Try again.',
 };
 

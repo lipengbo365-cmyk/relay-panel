@@ -10,7 +10,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd';
-import type { HealthJob, HealthJobItem, SafeError } from '../../api/health';
+import type { HealthJob, HealthJobItem, HealthJobItemState, SafeError } from '../../api/health';
 import {
   HealthJobProgress,
   HealthStatusTag,
@@ -31,6 +31,17 @@ interface HealthJobDetailDrawerProps {
   resourceNames?: ReadonlyMap<number, string>;
   nodeNames?: ReadonlyMap<number, string>;
   onClose: () => void;
+  itemsLoading?: boolean;
+  itemsError?: SafeError | null;
+  nextItemsCursor?: string | null;
+  canPreviousItems?: boolean;
+  itemState?: HealthJobItemState;
+  safeErrorCode?: string;
+  onItemStateChange?: (state?: HealthJobItemState) => void;
+  onSafeErrorCodeChange?: (code: string) => void;
+  onNextItems?: () => void;
+  onPreviousItems?: () => void;
+  onRetry?: () => void;
 }
 
 function selectorText(value: object): string {
@@ -47,6 +58,17 @@ export function HealthJobDetailDrawer({
   resourceNames = new Map<number, string>(),
   nodeNames = new Map<number, string>(),
   onClose,
+  itemsLoading = false,
+  itemsError = null,
+  nextItemsCursor = null,
+  canPreviousItems = false,
+  itemState,
+  safeErrorCode = '',
+  onItemStateChange,
+  onSafeErrorCodeChange,
+  onNextItems,
+  onPreviousItems,
+  onRetry,
 }: HealthJobDetailDrawerProps) {
   return (
     <Drawer
@@ -74,7 +96,9 @@ export function HealthJobDetailDrawer({
               { key: 'semantics', label: 'Snapshot Semantics', children: job.snapshot_semantics },
               { key: 'matrix', label: 'Matrix Mode', children: job.matrix_mode },
               { key: 'policy', label: 'Retry Policy', children: job.retry_policy_version },
-              { key: 'hash', label: 'Snapshot Hash', span: 3, children: <Typography.Text code copyable>{job.snapshot_hash}</Typography.Text> },
+              { key: 'cancel', label: 'Cancel Requested', children: job.cancel_requested ? 'Yes' : 'No' },
+              { key: 'failure', label: 'Failure Code', children: job.failure_code ?? '—' },
+              { key: 'hash', label: 'Snapshot Hash', children: <Typography.Text code copyable>{job.snapshot_hash}</Typography.Text> },
               { key: 'created', label: 'Created', children: <TimestampDisplay value={job.created_at} /> },
               { key: 'started', label: 'Started', children: <TimestampDisplay value={job.started_at} /> },
               { key: 'finished', label: 'Finished', children: <TimestampDisplay value={job.finished_at} /> },
@@ -131,10 +155,19 @@ export function HealthJobDetailDrawer({
           <Table
             size="small"
             rowKey="id"
-            dataSource={items}
+            dataSource={itemsError ? [] : items}
+            loading={itemsLoading}
             pagination={false}
             scroll={{ x: 1450 }}
-            locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No job items" /> }}
+            title={() => <Space wrap>
+              <Typography.Text strong>Job Items</Typography.Text>
+              <select aria-label="Item state filter" value={itemState ?? ''} onChange={(event) => onItemStateChange?.((event.target.value || undefined) as HealthJobItemState | undefined)}>
+                <option value="">All states</option>
+                {['QUEUED', 'LEASED', 'DISPATCHING', 'IN_FLIGHT', 'RETRY_WAIT', 'SUCCEEDED', 'FAILED', 'CANCELLED'].map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
+              <input aria-label="Safe error code filter" placeholder="Safe error code" value={safeErrorCode} onChange={(event) => onSafeErrorCodeChange?.(event.target.value)} />
+            </Space>}
+            locale={{ emptyText: itemsError ? <HealthErrorState error={itemsError} onRetry={onRetry} /> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No job items" /> }}
             columns={[
               { title: 'Item', dataIndex: 'id', width: 80 },
               { title: 'Resource', width: 150, render: (_value: unknown, item: HealthJobItem) => resourceDisplayName(item.resource_id_snapshot, resourceNames) },
@@ -144,11 +177,15 @@ export function HealthJobDetailDrawer({
               { title: 'Attempts', dataIndex: 'attempt_count', width: 90 },
               { title: 'Retries', dataIndex: 'retry_count', width: 80 },
               { title: 'Safe Error', width: 230, render: (_value: unknown, item: HealthJobItem) => item.safe_error_code ? <span>{item.safe_error_code}: {item.safe_error_message ?? '—'}</span> : '—' },
-              { title: 'After Cancel', width: 120, render: (_value: unknown, item: HealthJobItem) => item.completed_after_cancel ? <Badge status="warning" text="Completed" /> : '—' },
+              { title: 'After Cancel', width: 170, render: (_value: unknown, item: HealthJobItem) => item.completed_after_cancel ? <Tooltip title="The check completed after cancellation was requested."><Badge status="warning" text="Completed after cancel" /></Tooltip> : '—' },
               { title: 'Started', dataIndex: 'last_started_at', width: 180, render: (value: number | null) => <TimestampDisplay value={value} /> },
               { title: 'Finished', dataIndex: 'finished_at', width: 180, render: (value: number | null) => <TimestampDisplay value={value} /> },
             ]}
           />
+          <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+            <Button disabled={!canPreviousItems} onClick={onPreviousItems}>Previous items</Button>
+            <Button disabled={!nextItemsCursor} onClick={onNextItems}>Next items</Button>
+          </Space>
         </Space>
       )}
     </Drawer>
