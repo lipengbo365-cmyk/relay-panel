@@ -58,6 +58,7 @@ interface AuthContextValue extends AuthState {
 const AuthContext = createContext<AuthContextValue | null>(null);
 // Exported (not just module-local) so useAuth.ts can consume it. The hook
 // itself lives in useAuth.ts to keep this file component-only (fast refresh).
+// eslint-disable-next-line react-refresh/only-export-components
 export { AuthContext };
 
 export function AuthProvider({ children }: { children: ReactNode }) {

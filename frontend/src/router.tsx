@@ -26,6 +26,7 @@ const Groups = lazy(() => import('./pages/Groups'));
 const Users = lazy(() => import('./pages/Users'));
 const NodeStatus = lazy(() => import('./pages/NodeStatus'));
 const RelayNodes = lazy(() => import('./pages/RelayNodes'));
+const HealthCenter = lazy(() => import('./pages/HealthCenter'));
 const Account = lazy(() => import('./pages/Account'));
 const SystemSettings = lazy(() => import('./pages/SystemSettings'));
 const Plans = lazy(() => import('./pages/Plans'));
@@ -77,6 +78,7 @@ export const router = createBrowserRouter([
       { path: 'nodes', element: <NodeStatus /> },
       { path: 'node-status', element: <NodeStatus /> },
       { path: 'relay-nodes', element: <RequireAdmin><RelayNodes /></RequireAdmin> },
+      { path: 'health-center', element: <RequireAdmin><HealthCenter /></RequireAdmin> },
       // v1.0.8: self-service shop (plan purchase + order history).
       { path: 'shop', element: <Shop /> },
       // v1.0.8: admin plan management (CRUD).

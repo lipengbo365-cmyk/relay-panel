@@ -220,6 +220,24 @@ html, body, #root {
   white-space: nowrap;
 }
 
+/* Health selectors are provenance, not editable JSON. Keep them compact and
+   horizontally scrollable so a large ID selector cannot break the drawer. */
+.rp-health-selector {
+  flex: 1 1 320px;
+  max-width: 100%;
+  max-height: 240px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--rp-border);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-table-header-bg);
+  font-family: var(--rp-font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* v0.4.17: country-flag pill wrapper. Outer layer sizes & rounds the slot;
  *  the inner .fi (from flag-icons) is pinned to a fixed flag size so the
  *  library's own .fi rules never disturb the surrounding table layout. */

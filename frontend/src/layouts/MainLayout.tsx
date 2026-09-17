@@ -12,6 +12,7 @@ import {
   ShoppingOutlined,
   TeamOutlined,
   NotificationOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons';
 import { useI18n } from '../i18n/context';
 import api from '../api/client';
@@ -74,6 +75,7 @@ export default function MainLayout() {
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
     { key: '/relay-nodes', icon: <CloudServerOutlined />, label: 'Relay Nodes' },
     { key: '/socks5', icon: <ApiOutlined />, label: 'SOCKS5 中转' },
+    { key: '/health-center', icon: <ExperimentOutlined />, label: t('healthCenter') },
     {
       key: 'grp-billing',
       icon: <TeamOutlined />,
