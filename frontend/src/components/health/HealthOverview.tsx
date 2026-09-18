@@ -74,30 +74,33 @@ export function HealthOverview({
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={8}>
           <Card title="Node Readiness" style={{ height: '100%' }}>
-            {nodeError ? <HealthErrorState error={nodeError} onRetry={onRetry} /> : <>
-            <Statistic title="Supports SOCKS5 Check" value={supportedNodes ?? unavailable} />
-            <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
-              Online and protocol capability are separate backend signals. Eligibility is not inferred in the browser.
-            </Typography.Paragraph>
-            <Table
-              size="small"
-              rowKey="id"
-              pagination={false}
-              dataSource={nodes}
-              style={{ marginTop: 12 }}
-              columns={[
-                { title: 'Node', dataIndex: 'name' },
-                { title: 'Online', dataIndex: 'online', render: (value: boolean) => value ? 'Yes' : 'No' },
-                { title: 'Protocol', dataIndex: 'config_protocol_version', render: (value: number | null) => value ?? '—' },
-                { title: 'Queue', dataIndex: 'socks5_check_queue', render: (value: number | null) => value ?? '—' },
-              ]}
-            />
-            </>}
+            {nodeError ? <HealthErrorState error={nodeError} onRetry={onRetry} /> : null}
+            {!nodeError || nodes.length > 0 ? <>
+              <Statistic title="Supports SOCKS5 Check" value={supportedNodes ?? unavailable} />
+              <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
+                Online and protocol capability are separate backend signals. Eligibility is not inferred in the browser.
+              </Typography.Paragraph>
+              <Table
+                size="small"
+                rowKey="id"
+                pagination={false}
+                dataSource={nodes}
+                style={{ marginTop: 12 }}
+                columns={[
+                  { title: 'Node', dataIndex: 'name' },
+                  { title: 'Online', dataIndex: 'online', render: (value: boolean) => value ? 'Yes' : 'No' },
+                  { title: 'Protocol', dataIndex: 'config_protocol_version', render: (value: number | null) => value ?? '—' },
+                  { title: 'Queue', dataIndex: 'socks5_check_queue', render: (value: number | null) => value ?? '—' },
+                ]}
+              />
+            </> : null}
           </Card>
         </Col>
         <Col xs={24} lg={16}>
           <Card title="Recent Jobs">
-            {jobsError ? <HealthErrorState error={jobsError} onRetry={onRetry} /> : recentJobs.length === 0 ? <HealthEmptyState kind="jobs" /> : (
+            {jobsError ? <HealthErrorState error={jobsError} onRetry={onRetry} /> : null}
+            {!jobsError && recentJobs.length === 0 ? <HealthEmptyState kind="jobs" /> : null}
+            {recentJobs.length > 0 ? (
               <Table
                 size="small"
                 rowKey="id"
@@ -111,7 +114,7 @@ export function HealthOverview({
                   { title: 'Created', dataIndex: 'created_at', render: (value: number) => <TimestampDisplay value={value} /> },
                 ]}
               />
-            )}
+            ) : null}
           </Card>
         </Col>
       </Row>

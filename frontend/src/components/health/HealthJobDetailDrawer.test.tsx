@@ -137,4 +137,25 @@ describe('HealthJobDetailDrawer', () => {
     expect(screen.getByRole('button', { name: 'Cancellation Requested' })).toBeDisabled();
     expect(screen.getByText('CANCEL_REQUESTED')).toBeInTheDocument();
   });
+
+  it('does not describe a terminal cancelled Job as still cancelling', () => {
+    render(
+      <HealthJobDetailDrawer
+        open
+        jobId={runningJob.id}
+        job={{
+          ...runningJob,
+          status: 'PARTIAL_CANCELLED',
+          cancel_requested: true,
+          queued_count: 0,
+          running_count: 0,
+          cancelled_count: 1,
+          finished_at: runningJob.created_at + 5_000,
+        }}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.queryByText('Cancellation in progress')).not.toBeInTheDocument();
+    expect(screen.getByText('PARTIAL_CANCELLED')).toBeInTheDocument();
+  });
 });

@@ -96,6 +96,19 @@ describe('HealthCenter F3', () => {
     expect(screen.getByText('Protocol')).toBeInTheDocument();
   });
 
+  it('keeps the last successful Overview visible and marks it stale while the backend is offline', async () => {
+    renderPage();
+    expect(await screen.findByText('US-LA-01')).toBeInTheDocument();
+    healthMocks.listHealthResources.mockRejectedValue(new Error('offline'));
+    healthMocks.listRelayNodes.mockRejectedValue(new Error('offline'));
+    healthMocks.listHealthJobs.mockRejectedValue(new Error('offline'));
+    await userEvent.click(screen.getByRole('button', { name: /refresh/i }));
+    expect(await screen.findByText('Data may be stale')).toBeInTheDocument();
+    expect(screen.getByText('US-LA-01')).toBeInTheDocument();
+    expect(screen.getByText(runningJob.id)).toBeInTheDocument();
+    expect(screen.getAllByText('UNKNOWN_ERROR').length).toBeGreaterThan(0);
+  });
+
   it('loads a copied Job URL and closes it without losing tab state', async () => {
     renderPage(`/health-center?tab=jobs&job=${exactPairsRetryJob.id}`);
     expect(await screen.findByText('Exact failed-pair snapshot')).toBeInTheDocument();

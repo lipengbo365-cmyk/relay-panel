@@ -145,7 +145,7 @@ export function HealthJobDetailDrawer({
             />
           ) : null}
 
-          {job.status === 'CANCEL_REQUESTED' || job.cancel_requested ? (
+          {job.status === 'CANCEL_REQUESTED' ? (
             <Alert
               type="warning"
               showIcon

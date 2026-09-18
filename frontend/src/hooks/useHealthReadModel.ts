@@ -176,6 +176,7 @@ export function useHealthOverview(refreshKey = 0, enabled = true) {
   const initial: OverviewData = {
     healthTotals: {}, nodes: [], recentJobs: [], resourceError: null, nodeError: null, jobsError: null,
   };
+  const lastOverview = useRef<OverviewData>(initial);
   const request = useLatestRequest<OverviewData>(initial);
   const runRequest = request.run;
   const load = useCallback(() => runRequest(async (signal) => {
@@ -187,21 +188,26 @@ export function useHealthOverview(refreshKey = 0, enabled = true) {
       listRelayNodes(signal).then((value) => ({ value })).catch((error) => ({ error })),
       listHealthJobs({ limit: 5 }, signal).then((value) => ({ value })).catch((error) => ({ error })),
     ]);
-    const healthTotals: Partial<Record<HealthStatus, number>> = {};
+    const healthTotals: Partial<Record<HealthStatus, number>> = { ...lastOverview.current.healthTotals };
     SUMMARY_STATUSES.forEach((status, index) => {
       const result = resourceResults[index + 1];
       if (result.status === 'fulfilled') healthTotals[status] = result.value.total;
     });
     const totalResult = resourceResults[0];
-    return {
-      resourceTotal: totalResult.status === 'fulfilled' ? totalResult.value.total : undefined,
+    const resourceFailure = resourceResults.find((result) => result.status === 'rejected');
+    const next: OverviewData = {
+      resourceTotal: totalResult.status === 'fulfilled'
+        ? totalResult.value.total
+        : lastOverview.current.resourceTotal,
       healthTotals,
-      nodes: 'value' in nodeResult ? nodeResult.value : [],
-      recentJobs: 'value' in jobsResult ? jobsResult.value.items : [],
-      resourceError: totalResult.status === 'rejected' ? toSafeHealthError(totalResult.reason) : null,
+      nodes: 'value' in nodeResult ? nodeResult.value : lastOverview.current.nodes,
+      recentJobs: 'value' in jobsResult ? jobsResult.value.items : lastOverview.current.recentJobs,
+      resourceError: resourceFailure?.status === 'rejected' ? toSafeHealthError(resourceFailure.reason) : null,
       nodeError: 'error' in nodeResult ? toSafeHealthError(nodeResult.error) : null,
       jobsError: 'error' in jobsResult ? toSafeHealthError(jobsResult.error) : null,
     };
+    lastOverview.current = next;
+    return next;
   }), [runRequest]);
   const polling = useSafePolling({ enabled, intervalMs: 10_000, run: async () => { await load(); } });
   useEffect(() => {

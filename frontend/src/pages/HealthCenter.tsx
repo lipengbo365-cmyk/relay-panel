@@ -72,7 +72,9 @@ export default function HealthCenter() {
         resourceError={overview.data.resourceError}
         nodeError={overview.data.nodeError}
         jobsError={overview.data.jobsError}
-        stale={overview.consecutiveFailures > 0}
+        stale={overview.consecutiveFailures > 0 || Boolean(
+          overview.data.resourceError || overview.data.nodeError || overview.data.jobsError,
+        )}
         onRetry={() => void overview.reload()}
         onOpenJob={openJob}
       />,
