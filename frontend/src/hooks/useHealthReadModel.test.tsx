@@ -3,12 +3,14 @@ import { act, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HealthJobStatus } from '../api/health';
 import { runningJob, succeededJob } from '../test/healthFixtures';
-import { useHealthJobPage } from './useHealthReadModel';
+import { useHealthJobDetail, useHealthJobPage } from './useHealthReadModel';
 
 const mockList = vi.hoisted(() => vi.fn());
+const mockGet = vi.hoisted(() => vi.fn());
 vi.mock('../api/health', async (importOriginal) => ({
   ...await importOriginal<typeof import('../api/health')>(),
   listHealthJobs: mockList,
+  getHealthJob: mockGet,
 }));
 
 function Probe({ status }: { status?: HealthJobStatus }) {
@@ -17,10 +19,37 @@ function Probe({ status }: { status?: HealthJobStatus }) {
   return <output data-testid="jobs">{result.data.items.map((job) => job.status).join(',')}</output>;
 }
 
+function DetailProbe() {
+  const result = useHealthJobDetail(runningJob.id);
+  return <>
+    <output data-testid="detail-status">{result.data?.status ?? 'loading'}</output>
+    <button onClick={() => result.commitActionData({
+      ...runningJob,
+      status: 'CANCEL_REQUESTED',
+      cancel_requested: true,
+    })}>commit action</button>
+  </>;
+}
+
 beforeEach(() => {
   vi.useRealTimers();
   mockList.mockReset();
+  mockGet.mockReset();
   Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+});
+
+describe('useHealthJobDetail action fencing', () => {
+  it('does not let an older GET overwrite a newer POST action result', async () => {
+    let resolveSlow: ((value: typeof runningJob) => void) | undefined;
+    mockGet.mockReturnValue(new Promise((resolve) => { resolveSlow = resolve; }));
+    render(<DetailProbe />);
+    await act(async () => {
+      screen.getByRole('button', { name: 'commit action' }).click();
+    });
+    expect(screen.getByTestId('detail-status')).toHaveTextContent('CANCEL_REQUESTED');
+    await act(async () => { resolveSlow?.(runningJob); });
+    await waitFor(() => expect(screen.getByTestId('detail-status')).toHaveTextContent('CANCEL_REQUESTED'));
+  });
 });
 
 describe('useHealthJobPage', () => {

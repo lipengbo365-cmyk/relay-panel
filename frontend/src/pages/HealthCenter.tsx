@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Tabs } from 'antd';
+import { Alert, Tabs } from 'antd';
 import { useSearchParams } from 'react-router-dom';
 import { HealthCenterHeader } from '../components/health/HealthCenterHeader';
 import { HealthOverview } from '../components/health/HealthOverview';
@@ -29,6 +29,7 @@ export default function HealthCenter() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [jobFilters, setJobFilters] = useState<HealthJobFilters>({});
   const [jobCursor, setJobCursor] = useState<string | undefined>();
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
   const activeTab = tabFromQuery(searchParams.get('tab'));
   const jobId = searchParams.get('job');
   const stableFilters = useMemo(() => jobFilters, [jobFilters]);
@@ -101,6 +102,16 @@ export default function HealthCenter() {
 
   return (
     <div data-testid="health-center-page">
+      {actionNotice ? (
+        <Alert
+          type="success"
+          showIcon
+          closable
+          title={actionNotice}
+          onClose={() => setActionNotice(null)}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
       <HealthCenterHeader
         title={t('healthCenter')}
         createLabel={t('healthCreateJob')}
@@ -128,9 +139,23 @@ export default function HealthCenter() {
         nodeNames={names.nodeNames}
         refreshKey={refreshKey}
         onClose={closeJob}
+        onOpenJob={openJob}
+        onJobsChanged={() => setRefreshKey((value) => value + 1)}
+        onNotice={setActionNotice}
       />
 
-      <CreateHealthJobModal open={createOpen} onClose={() => setCreateOpen(false)} />
+      <CreateHealthJobModal
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onCreated={(result) => {
+          setCreateOpen(false);
+          setActionNotice(result.replayed
+            ? 'This request already exists; the original health Job was opened.'
+            : 'Health Job created.');
+          setRefreshKey((value) => value + 1);
+          openJob(result.job_id);
+        }}
+      />
     </div>
   );
 }

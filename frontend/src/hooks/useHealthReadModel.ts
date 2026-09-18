@@ -51,8 +51,21 @@ function useLatestRequest<T>(initial: T) {
     }
   }, []);
 
+  const commit = useCallback((data: T) => {
+    generation.current += 1;
+    controller.current?.abort();
+    controller.current = null;
+    setState({ data, loading: false, error: null });
+  }, []);
+
+  const invalidate = useCallback(() => {
+    generation.current += 1;
+    controller.current?.abort();
+    controller.current = null;
+  }, []);
+
   useEffect(() => () => controller.current?.abort(), []);
-  return { state, run };
+  return { state, run, commit, invalidate };
 }
 
 export function useHealthJobPage(filters: HealthJobFilters, cursor?: string, refreshKey = 0, enabled = true) {
@@ -99,7 +112,13 @@ export function useHealthJobDetail(jobId: string | null, refreshKey = 0) {
   useEffect(() => {
     if (jobId) void load().catch(() => undefined);
   }, [jobId, load, refreshKey]);
-  return { ...request.state, ...polling, reload: load };
+  return {
+    ...request.state,
+    ...polling,
+    reload: load,
+    commitActionData: request.commit,
+    invalidate: request.invalidate,
+  };
 }
 
 export function useHealthJobItems(

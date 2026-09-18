@@ -238,6 +238,18 @@ html, body, #root {
   word-break: break-word;
 }
 
+.rp-health-selector-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+@media (max-width: 900px) {
+  .rp-health-selector-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* v0.4.17: country-flag pill wrapper. Outer layer sizes & rounds the slot;
  *  the inner .fi (from flag-icons) is pinned to a fixed flag size so the
  *  library's own .fi rules never disturb the surrounding table layout. */

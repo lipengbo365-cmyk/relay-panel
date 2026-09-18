@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   Alert,
   Badge,
@@ -5,12 +6,19 @@ import {
   Descriptions,
   Drawer,
   Empty,
+  Modal,
   Space,
   Table,
   Tooltip,
   Typography,
 } from 'antd';
-import type { HealthJob, HealthJobItem, HealthJobItemState, SafeError } from '../../api/health';
+import {
+  isTerminalHealthJob,
+  type HealthJob,
+  type HealthJobItem,
+  type HealthJobItemState,
+  type SafeError,
+} from '../../api/health';
 import {
   HealthJobProgress,
   HealthStatusTag,
@@ -42,6 +50,13 @@ interface HealthJobDetailDrawerProps {
   onNextItems?: () => void;
   onPreviousItems?: () => void;
   onRetry?: () => void;
+  cancelLoading?: boolean;
+  retryLoading?: boolean;
+  cancelOutcomeUnknown?: boolean;
+  retryOutcomeUnknown?: boolean;
+  actionError?: SafeError | null;
+  onCancelJob?: () => void;
+  onRetryFailed?: () => void;
 }
 
 function selectorText(value: object): string {
@@ -69,15 +84,29 @@ export function HealthJobDetailDrawer({
   onNextItems,
   onPreviousItems,
   onRetry,
+  cancelLoading = false,
+  retryLoading = false,
+  cancelOutcomeUnknown = false,
+  retryOutcomeUnknown = false,
+  actionError = null,
+  onCancelJob,
+  onRetryFailed,
 }: HealthJobDetailDrawerProps) {
+  const [cancelConfirm, setCancelConfirm] = useState(false);
+  const [retryConfirm, setRetryConfirm] = useState(false);
+  const terminal = job ? isTerminalHealthJob(job.status) : false;
+  const canCancel = Boolean(job && !terminal && !job.cancel_requested && job.status !== 'CANCEL_REQUESTED');
+  const canRetry = Boolean(job && terminal && job.failed_count > 0);
+
   return (
-    <Drawer
-      title={<Space>Health Job <Typography.Text code>{jobId ?? '—'}</Typography.Text></Space>}
-      open={open}
-      onClose={onClose}
-      size="min(1120px, 96vw)"
-      destroyOnHidden
-    >
+    <>
+      <Drawer
+        title={<Space>Health Job <Typography.Text code>{jobId ?? '—'}</Typography.Text></Space>}
+        open={open}
+        onClose={onClose}
+        size="min(1120px, 96vw)"
+        destroyOnHidden
+      >
       {loading ? <HealthLoadingState rows={8} /> : error ? <HealthErrorState error={error} /> : !job ? (
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
@@ -116,6 +145,33 @@ export function HealthJobDetailDrawer({
             />
           ) : null}
 
+          {job.status === 'CANCEL_REQUESTED' || job.cancel_requested ? (
+            <Alert
+              type="warning"
+              showIcon
+              title="Cancellation in progress"
+              description="The backend is cancelling work that has not started. In-flight checks may still complete and record a health result."
+            />
+          ) : null}
+
+          {actionError ? <Alert type="error" showIcon title={actionError.code} description={actionError.message} /> : null}
+          {cancelOutcomeUnknown ? (
+            <Alert
+              type="warning"
+              showIcon
+              title="Cancel outcome unknown"
+              description="Refresh or retry the same cancellation request; backend state remains authoritative."
+            />
+          ) : null}
+          {retryOutcomeUnknown ? (
+            <Alert
+              type="warning"
+              showIcon
+              title="Retry outcome unknown"
+              description="Retry the same request to discover the original child Job without creating a duplicate."
+            />
+          ) : null}
+
           <div>
             <Typography.Title level={5}>Progress from backend counters</Typography.Title>
             <HealthJobProgress job={job} />
@@ -144,11 +200,24 @@ export function HealthJobDetailDrawer({
           />
 
           <Space wrap>
-            <Tooltip title="Enabled in F3 Actions/State Handling">
-              <Button disabled>Cancel Job</Button>
+            <Tooltip title={canCancel ? 'Request cancellation; in-flight checks may still finish.' : 'Available only while a Job is non-terminal.'}>
+              <Button
+                danger
+                loading={cancelLoading}
+                disabled={(!canCancel && !cancelOutcomeUnknown) || cancelLoading}
+                onClick={() => setCancelConfirm(true)}
+              >
+                {cancelOutcomeUnknown ? 'Retry Cancel Request' : job.cancel_requested ? 'Cancellation Requested' : 'Cancel Job'}
+              </Button>
             </Tooltip>
             <Tooltip title="Retries execution failures only; it does not recheck every unhealthy proxy.">
-              <Button disabled>Retry Execution Failures</Button>
+              <Button
+                loading={retryLoading}
+                disabled={(!canRetry && !retryOutcomeUnknown) || retryLoading}
+                onClick={() => setRetryConfirm(true)}
+              >
+                {retryOutcomeUnknown ? 'Retry Same Request' : 'Retry Execution Failures'}
+              </Button>
             </Tooltip>
           </Space>
 
@@ -188,6 +257,36 @@ export function HealthJobDetailDrawer({
           </Space>
         </Space>
       )}
-    </Drawer>
+      </Drawer>
+
+      <Modal
+        title="Cancel this health Job?"
+        open={cancelConfirm}
+        okText={cancelOutcomeUnknown ? 'Retry Cancel Request' : 'Request Cancellation'}
+        okButtonProps={{ danger: true }}
+        confirmLoading={cancelLoading}
+        onCancel={() => setCancelConfirm(false)}
+        onOk={() => {
+          setCancelConfirm(false);
+          onCancelJob?.();
+        }}
+      >
+        Cancellation stops checks that have not started or can still be cancelled. Checks already in flight may finish and legally record health results.
+      </Modal>
+
+      <Modal
+        title="Retry execution failures?"
+        open={retryConfirm}
+        okText={retryOutcomeUnknown ? 'Retry Same Request' : 'Retry Execution Failures'}
+        confirmLoading={retryLoading}
+        onCancel={() => setRetryConfirm(false)}
+        onOk={() => {
+          setRetryConfirm(false);
+          onRetryFailed?.();
+        }}
+      >
+        Only orchestration Items in the FAILED execution state are retried. Health results such as OFFLINE, AUTH_FAILED, or CONNECT_FAILED are not automatically rechecked.
+      </Modal>
+    </>
   );
 }

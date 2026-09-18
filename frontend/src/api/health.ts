@@ -165,6 +165,13 @@ export type HealthSafeErrorCode =
   | 'INVALID_SOURCE'
   | 'INVALID_ITEM_STATE'
   | 'INVALID_LIMIT'
+  | 'SELECTOR_TOO_LARGE'
+  | 'INVALID_SELECTOR_ID'
+  | 'INVALID_SELECTOR_VALUE'
+  | 'INVALID_RESOURCE_STATUS'
+  | 'INVALID_MATRIX_MODE'
+  | 'INVALID_MAX_ITEMS'
+  | 'IDEMPOTENCY_LEDGER_ORPHANED'
   | 'UNKNOWN_ERROR';
 
 export interface SafeError {
@@ -236,6 +243,13 @@ const SAFE_CODES = new Set<HealthSafeErrorCode>([
   'INVALID_SOURCE',
   'INVALID_ITEM_STATE',
   'INVALID_LIMIT',
+  'SELECTOR_TOO_LARGE',
+  'INVALID_SELECTOR_ID',
+  'INVALID_SELECTOR_VALUE',
+  'INVALID_RESOURCE_STATUS',
+  'INVALID_MATRIX_MODE',
+  'INVALID_MAX_ITEMS',
+  'IDEMPOTENCY_LEDGER_ORPHANED',
 ]);
 
 const SAFE_MESSAGES: Record<HealthSafeErrorCode, string> = {
@@ -253,6 +267,13 @@ const SAFE_MESSAGES: Record<HealthSafeErrorCode, string> = {
   INVALID_SOURCE: 'The selected job source is not supported.',
   INVALID_ITEM_STATE: 'The selected item state is not supported.',
   INVALID_LIMIT: 'The requested page size is not supported.',
+  SELECTOR_TOO_LARGE: 'The selector contains too many values.',
+  INVALID_SELECTOR_ID: 'A selector contains an invalid identifier.',
+  INVALID_SELECTOR_VALUE: 'A selector contains an invalid value.',
+  INVALID_RESOURCE_STATUS: 'The selected Resource health status is not supported.',
+  INVALID_MATRIX_MODE: 'The selected matrix mode is not supported.',
+  INVALID_MAX_ITEMS: 'The requested item limit is not supported.',
+  IDEMPOTENCY_LEDGER_ORPHANED: 'The original request record is unavailable. Start a new intent.',
   UNKNOWN_ERROR: 'The health request failed safely. Try again.',
 };
 
@@ -274,12 +295,19 @@ export function toSafeHealthError(error: unknown): SafeError {
 
 export class SafeHealthRequestError extends Error {
   readonly safe: SafeError;
+  readonly outcomeUnknown: boolean;
 
-  constructor(safe: SafeError) {
+  constructor(safe: SafeError, outcomeUnknown = false) {
     super(safe.message);
     this.name = 'SafeHealthRequestError';
     this.safe = safe;
+    this.outcomeUnknown = outcomeUnknown;
   }
+}
+
+function isUnknownTransportOutcome(error: unknown): boolean {
+  return objectValue(error, 'response') === undefined
+    && objectValue(error, 'code') !== 'ERR_CANCELED';
 }
 
 async function healthRequest<T>(request: Promise<ApiEnvelope<T>>): Promise<T> {
@@ -295,7 +323,7 @@ async function healthRequest<T>(request: Promise<ApiEnvelope<T>>): Promise<T> {
     return response.data;
   } catch (error) {
     if (error instanceof SafeHealthRequestError) throw error;
-    throw new SafeHealthRequestError(toSafeHealthError(error));
+    throw new SafeHealthRequestError(toSafeHealthError(error), isUnknownTransportOutcome(error));
   }
 }
 

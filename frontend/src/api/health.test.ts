@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  cancelHealthJob,
+  createHealthJob,
+  dryRunHealthJob,
   getHealthJob,
   getResourceHealth,
   getResourceHealthHistory,
@@ -9,15 +12,19 @@ import {
   listHealthJobs,
   listHealthResources,
   listRelayNodes,
+  retryFailedHealthJob,
   toSafeHealthError,
 } from './health';
 
 const mockGet = vi.hoisted(() => vi.fn());
-vi.mock('./client', () => ({ default: { get: mockGet }, ApiEnvelope: {} }));
+const mockPost = vi.hoisted(() => vi.fn());
+vi.mock('./client', () => ({ default: { get: mockGet, post: mockPost }, ApiEnvelope: {} }));
 
 beforeEach(() => {
   mockGet.mockReset();
+  mockPost.mockReset();
   mockGet.mockResolvedValue({ code: 0, message: 'ok', data: { items: [], next_cursor: null } });
+  mockPost.mockResolvedValue({ code: 0, message: 'ok', data: {} });
 });
 
 describe('health API safety helpers', () => {
@@ -79,5 +86,50 @@ describe('health read-only API client', () => {
       '/admin/socks5-resources/page?page=1&page_size=50&status=ONLINE',
       '/admin/relay-nodes',
     ]);
+  });
+});
+
+describe('health F3 write API client', () => {
+  const request = {
+    resource_selector: { ids: [11], enabled: true, country_codes: [], statuses: [], tags: [], tag_match: 'ALL' as const },
+    node_selector: { ids: [31], enabled: true, country_codes: [], tags: [], tag_match: 'ALL' as const },
+    matrix_mode: 'CARTESIAN' as const,
+    max_items: 10_000,
+  };
+
+  it('uses only the four durable Job write endpoints', async () => {
+    await dryRunHealthJob(request);
+    await createHealthJob(request, '00000000-0000-4000-8000-000000000001');
+    await cancelHealthJob('job/id');
+    await retryFailedHealthJob('job/id', '00000000-0000-4000-8000-000000000002');
+
+    expect(mockPost.mock.calls.map(([url]) => url)).toEqual([
+      '/admin/socks5-health/jobs/dry-run',
+      '/admin/socks5-health/jobs',
+      '/admin/socks5-health/jobs/job%2Fid/cancel',
+      '/admin/socks5-health/jobs/job%2Fid/retry-failed',
+    ]);
+    expect(mockPost.mock.calls[1][2].headers).toEqual({
+      'Idempotency-Key': '00000000-0000-4000-8000-000000000001',
+    });
+    expect(mockPost.mock.calls[3][2].headers).toEqual({
+      'Idempotency-Key': '00000000-0000-4000-8000-000000000002',
+    });
+  });
+
+  it('classifies response-less transport failure as unknown outcome without exposing details', async () => {
+    mockPost.mockRejectedValueOnce({ code: 'ECONNABORTED', config: { headers: { Authorization: 'hidden' } } });
+    await expect(createHealthJob(request, '00000000-0000-4000-8000-000000000001')).rejects.toMatchObject({
+      outcomeUnknown: true,
+      safe: { code: 'UNKNOWN_ERROR' },
+    });
+  });
+
+  it('does not classify semantic HTTP errors as unknown outcomes', async () => {
+    mockPost.mockRejectedValueOnce({ response: { status: 409, data: { message: 'IDEMPOTENCY_KEY_REUSED' } } });
+    await expect(createHealthJob(request, '00000000-0000-4000-8000-000000000001')).rejects.toMatchObject({
+      outcomeUnknown: false,
+      safe: { code: 'IDEMPOTENCY_KEY_REUSED' },
+    });
   });
 });
