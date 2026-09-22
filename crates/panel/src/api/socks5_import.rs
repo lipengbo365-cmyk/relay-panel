@@ -227,3 +227,192 @@ fn encrypt_row(
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::diagnose::DiagnoseRegistry;
+    use crate::api::socks5_health::Socks5CheckRegistry;
+    use crate::api::system::ReleaseCache;
+    use crate::api::ws::NodeConnections;
+    use crate::config::Config;
+    use crate::db::schema::SCHEMA_SQL;
+    use crate::db::sqlite_repo::SqliteRepository;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PreviewPersistenceSnapshot {
+        resources: i64,
+        bindings: i64,
+        health: i64,
+        history: i64,
+        rules: i64,
+        receipts: i64,
+        idempotency_keys: i64,
+    }
+
+    async fn persistence_snapshot(pool: &sqlx::SqlitePool) -> PreviewPersistenceSnapshot {
+        PreviewPersistenceSnapshot {
+            resources: sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            bindings: sqlx::query_scalar("SELECT COUNT(*) FROM socks5_rule_bindings")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            health: sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resource_health")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            history: sqlx::query_scalar("SELECT COUNT(*) FROM socks5_check_history")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            rules: sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            receipts: sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            idempotency_keys: sqlx::query_scalar(
+                "SELECT COUNT(*) FROM relay_creation_idempotency_keys",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        }
+    }
+
+    async fn state() -> (AppState, sqlx::SqlitePool) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        let state = AppState {
+            db: Arc::new(SqliteRepository::new(pool.clone())),
+            config: Config {
+                database_path: "sqlite::memory:".into(),
+                listen: "127.0.0.1:0".into(),
+                key: "test-key".into(),
+                jwt_secret: "test-secret".into(),
+                public_dir: "public".into(),
+                public_panel_url: String::new(),
+                registration_enabled: false,
+                cors_origins: vec![],
+                geoip_enabled: false,
+                geoip_cache_ttl: 604_800,
+                socks5_credential_key: Some("11".repeat(32)),
+                socks5_check_urls: vec!["https://api.ipify.org".into()],
+                socks5_check_concurrency: 50,
+                socks5_check_retention_days: 30,
+                relay_recommend_health_ttl_seconds: 600,
+                relay_recommend_max_cpu_percent: 95.0,
+                relay_recommend_max_memory_percent: 95.0,
+            },
+            release_cache: ReleaseCache::new(),
+            node_connections: NodeConnections::new(),
+            diagnose: DiagnoseRegistry::new(),
+            socks5_checks: Socks5CheckRegistry::new(),
+            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        };
+        (state, pool)
+    }
+
+    #[tokio::test]
+    async fn preview_sizes_are_read_only() {
+        let (state, pool) = state().await;
+        let before = persistence_snapshot(&pool).await;
+        for size in [1, 5, 100] {
+            let text = (0..size)
+                .map(|index| format!("preview-{size}-{index}.example:1080"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let Json(response) = preview(
+                AdminOnly { user_id: 1 },
+                State(state.clone()),
+                Json(ImportPreviewRequest { text }),
+            )
+            .await;
+            let data = response.data.unwrap();
+            assert_eq!((data.total, data.valid, data.new), (size, size, size));
+            assert_eq!((data.invalid, data.duplicate), (0, 0));
+        }
+        assert_eq!(
+            persistence_snapshot(&pool).await,
+            before,
+            "preview must not change persistent business state"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_reports_input_and_database_duplicates_without_leaking_credentials() {
+        let (state, pool) = state().await;
+        sqlx::query("INSERT INTO socks5_resources(name,host,port) VALUES('existing','existing.example',1080)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let secret = "never-return-this:密 码";
+        let text = format!(
+            "existing.example:1080\nexisting.example:1080\nno-auth.example:1081\nauth.example:1082:user:{secret}\nbad host:1080:user:{secret}\nbad-port.example:70000"
+        );
+        let before = persistence_snapshot(&pool).await;
+        let Json(response) = preview(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(ImportPreviewRequest { text: text.clone() }),
+        )
+        .await;
+        assert_eq!(response.code, 0);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("never-return-this"));
+        let data = response.data.unwrap();
+        assert_eq!(data.total, 6);
+        assert_eq!(data.valid, 4);
+        assert_eq!(data.invalid, 2);
+        assert_eq!(data.duplicate, 2);
+        assert_eq!(data.new, 2);
+        assert!(data
+            .invalid_lines
+            .iter()
+            .all(|line| line.raw_masked == "***"));
+        assert_eq!(
+            persistence_snapshot(&pool).await,
+            before,
+            "preview must not change persistent business state"
+        );
+
+        let Json(confirm_response) = confirm(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Json(ImportConfirmRequest {
+                text,
+                strategy: ImportStrategy::SkipDuplicate,
+            }),
+        )
+        .await;
+        assert_eq!(confirm_response.code, 0);
+        let serialized = serde_json::to_string(&confirm_response).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("never-return-this"));
+        assert!(!serialized.contains("user:"));
+        let data = confirm_response.data.unwrap();
+        assert_eq!((data.created, data.updated), (2, 0));
+        assert_eq!((data.skipped, data.failed), (2, 2));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "confirm must import exactly the previewed new rows"
+        );
+    }
+}

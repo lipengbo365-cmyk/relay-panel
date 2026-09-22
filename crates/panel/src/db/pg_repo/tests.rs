@@ -19,6 +19,65 @@ use crate::db::repo::*;
 use relay_shared::protocol::TrafficEntry;
 use sqlx::postgres::PgPoolOptions;
 
+#[tokio::test]
+async fn socks5_bulk_preview_lookup_is_read_only_and_matches_exact_keys() {
+    let Some(db) = repo("socks5_preview_lookup").await else {
+        return;
+    };
+    let mut keys = Vec::new();
+    for index in 0..100 {
+        let host = format!("preview-{index}.example");
+        let port = 1080 + index;
+        let username = (index % 2 == 0).then(|| format!("user:name+{index}@example"));
+        db.insert_socks5_resource(
+            &format!("existing-{index}"),
+            &host,
+            port,
+            username.as_deref(),
+            username.as_ref().map(|_| "ciphertext"),
+            username.as_ref().map(|_| "nonce"),
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        keys.push((host, port, username));
+    }
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    for size in [1, 5, 100] {
+        let found = db
+            .find_socks5_resources_by_keys(&keys[..size])
+            .await
+            .unwrap();
+        assert_eq!(found.len(), size, "lookup size {size}");
+    }
+    let mut with_missing = keys.clone();
+    with_missing.push(("missing.example".into(), 2080, None));
+    assert_eq!(
+        db.find_socks5_resources_by_keys(&with_missing)
+            .await
+            .unwrap()
+            .len(),
+        100
+    );
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!((before, after), (100, 100), "preview lookup must not write");
+    cleanup(&db).await;
+}
+
 /// Read TEST_PG_URL. Returns None if unset → tests skip.
 fn pg_url() -> Option<String> {
     std::env::var("TEST_PG_URL").ok().filter(|s| !s.is_empty())

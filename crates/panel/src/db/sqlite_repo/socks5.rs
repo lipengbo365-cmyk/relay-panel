@@ -235,9 +235,11 @@ impl Socks5Repository for SqliteRepository {
                 continue;
             }
             let mut query = sqlx::QueryBuilder::new("SELECT * FROM socks5_resources WHERE ");
-            let mut separated = query.separated(" OR ");
-            for (host, port, username) in chunk {
-                separated
+            for (index, (host, port, username)) in chunk.iter().enumerate() {
+                if index > 0 {
+                    query.push(" OR ");
+                }
+                query
                     .push("(host=")
                     .push_bind(host)
                     .push(" AND port=")
