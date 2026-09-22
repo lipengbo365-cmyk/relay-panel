@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { SafeHealthRequestError } from '../../api/health';
+import { I18nContext, type Lang } from '../../i18n/context';
+import { enUS } from '../../i18n/en-US';
+import { zhCN } from '../../i18n/zh-CN';
 import { CreateHealthJobModal } from './CreateHealthJobModal';
 import { buildHealthJobRequest, type HealthSelectorForm } from './healthSelectors';
 
@@ -57,6 +60,15 @@ function renderModal(onCreated = vi.fn()) {
   return { onCreated };
 }
 
+function renderModalInLanguage(lang: Lang) {
+  const dictionary = lang === 'zh-CN' ? zhCN : enUS;
+  return render(
+    <I18nContext.Provider value={{ lang, setLang: vi.fn(), t: (key) => dictionary[key] }}>
+      <CreateHealthJobModal open onClose={() => {}} onCreated={vi.fn()} />
+    </I18nContext.Provider>,
+  );
+}
+
 async function preview() {
   const button = screen.getByRole('button', { name: 'Preview Checks' });
   await waitFor(() => expect(button).toBeEnabled());
@@ -86,6 +98,19 @@ beforeEach(() => {
 });
 
 describe('CreateHealthJobModal F3', () => {
+  it('renders tag examples in the active language', () => {
+    const english = renderModalInLanguage('en-US');
+    expect(screen.getByPlaceholderText('residential, provider-a')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('premium, west')).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('住宅, 供应商-A')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('优质, 西部')).not.toBeInTheDocument();
+    english.unmount();
+
+    renderModalInLanguage('zh-CN');
+    expect(screen.getByPlaceholderText('住宅, 供应商-A')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('优质, 西部')).toBeInTheDocument();
+  });
+
   it('canonicalizes supported selectors with backend defaults', () => {
     const form: HealthSelectorForm = {
       resource_ids: [12, 11, 12], resource_country_codes: 'us, JP, us',

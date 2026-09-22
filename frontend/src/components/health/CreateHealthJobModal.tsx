@@ -245,7 +245,7 @@ export function CreateHealthJobModal({ open, onClose, onCreated }: CreateHealthJ
               <Form.Item name="resource_statuses" label={c.healthStatuses}>
                 <Select mode="multiple" allowClear options={HEALTH_STATUSES.map((status) => ({ value: status, label: healthStatus(status) }))} />
               </Form.Item>
-              <Form.Item name="resource_tags" label={c.tags}><Input placeholder="住宅, 供应商-A" /></Form.Item>
+              <Form.Item name="resource_tags" label={c.tags}><Input placeholder={c.resourceTagsPlaceholder} /></Form.Item>
               <Space wrap>
                 <Form.Item name="resource_enabled" label={c.enabled}>
                   <Select style={{ width: 130 }} options={[
@@ -267,7 +267,7 @@ export function CreateHealthJobModal({ open, onClose, onCreated }: CreateHealthJ
                 />
               </Form.Item>
               <Form.Item name="node_country_codes" label={c.countryCodes}><Input placeholder="US, JP" /></Form.Item>
-              <Form.Item name="node_tags" label={c.tags}><Input placeholder="优质, 西部" /></Form.Item>
+              <Form.Item name="node_tags" label={c.tags}><Input placeholder={c.nodeTagsPlaceholder} /></Form.Item>
               <Space wrap>
                 <Form.Item name="node_enabled" label={c.enabled}>
                   <Select style={{ width: 130 }} options={[
