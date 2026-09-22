@@ -14,6 +14,7 @@ import {
   TimestampDisplay,
 } from './HealthStatus';
 import { HealthEmptyState, HealthErrorState } from './HealthStates';
+import { useHealthLocale } from './healthLocale';
 
 const JOB_STATUSES: HealthJobStatus[] = [
   'QUEUED', 'RUNNING', 'CANCEL_REQUESTED', 'SUCCEEDED',
@@ -49,6 +50,7 @@ export function HealthJobList({
   stale = false,
   onRetry,
 }: HealthJobListProps) {
+  const { copy: c, jobStatus, source } = useHealthLocale();
   const [filters, setFilters] = useState<HealthJobFilters>({});
   const [cursorStack, setCursorStack] = useState<string[]>([]);
 
@@ -83,28 +85,28 @@ export function HealthJobList({
 
   return (
     <Card>
-      {stale ? <Typography.Paragraph type="warning">Data may be stale; the latest refresh failed.</Typography.Paragraph> : null}
+      {stale ? <Typography.Paragraph type="warning">{c.dataMayBeStale}；{c.dataMayBeStaleDescription}</Typography.Paragraph> : null}
       <Space wrap style={{ marginBottom: 16 }}>
         <Select<HealthJobStatus>
           allowClear
-          aria-label="Job status filter"
-          placeholder="Status"
+          aria-label={c.jobStatusFilter}
+          placeholder={c.filterStatus}
           style={{ width: 210 }}
           value={filters.status}
-          options={JOB_STATUSES.map((value) => ({ value, label: value }))}
+          options={JOB_STATUSES.map((value) => ({ value, label: jobStatus(value) }))}
           onChange={(status) => changeFilters({ ...filters, status })}
         />
         <Select<HealthJobSource>
           allowClear
-          aria-label="Job source filter"
-          placeholder="Source"
+          aria-label={c.jobSourceFilter}
+          placeholder={c.filterSource}
           style={{ width: 190 }}
           value={filters.source}
-          options={JOB_SOURCES.map((value) => ({ value, label: value }))}
+          options={JOB_SOURCES.map((value) => ({ value, label: source(value) }))}
           onChange={(source) => changeFilters({ ...filters, source })}
         />
         <Typography.Text type="secondary">
-          Cursors are opaque and reset when filters change.
+          {c.cursorHint}
         </Typography.Text>
       </Space>
 
@@ -116,25 +118,25 @@ export function HealthJobList({
         scroll={{ x: 1550 }}
         locale={{ emptyText: <HealthEmptyState kind={filters.status || filters.source ? 'filtered-jobs' : 'jobs'} /> }}
         columns={[
-          { title: 'Job ID', dataIndex: 'id', width: 220, render: (id: string) => <Typography.Link className="rp-mono" onClick={() => onOpenJob(id)}>{id}</Typography.Link> },
-          { title: 'Source', dataIndex: 'source', width: 130 },
-          { title: 'Status', dataIndex: 'status', width: 170, render: (status: HealthJobStatus) => <JobStatusTag status={status} /> },
-          { title: 'Progress', width: 190, render: (_value: unknown, job: HealthJob) => <HealthJobProgress job={job} /> },
-          { title: 'Queued', dataIndex: 'queued_count', width: 85 },
-          { title: 'Running', dataIndex: 'running_count', width: 85 },
-          { title: 'Succeeded', dataIndex: 'succeeded_count', width: 100 },
-          { title: 'Failed', dataIndex: 'failed_count', width: 80 },
-          { title: 'Cancelled', dataIndex: 'cancelled_count', width: 95 },
-          { title: 'Created', dataIndex: 'created_at', width: 180, render: (value: number) => <TimestampDisplay value={value} /> },
-          { title: 'Started', dataIndex: 'started_at', width: 180, render: (value: number | null) => <TimestampDisplay value={value} /> },
-          { title: 'Finished', dataIndex: 'finished_at', width: 180, render: (value: number | null) => <TimestampDisplay value={value} /> },
-          { title: 'Actions', fixed: 'right', width: 100, render: (_value: unknown, job: HealthJob) => <Button size="small" onClick={() => onOpenJob(job.id)}>Detail</Button> },
+          { title: c.jobId, dataIndex: 'id', width: 220, render: (id: string) => <Typography.Link className="rp-mono" onClick={() => onOpenJob(id)}>{id}</Typography.Link> },
+          { title: c.source, dataIndex: 'source', width: 130, render: (value: HealthJobSource) => source(value) },
+          { title: c.status, dataIndex: 'status', width: 170, render: (status: HealthJobStatus) => <JobStatusTag status={status} /> },
+          { title: c.progress, width: 190, render: (_value: unknown, job: HealthJob) => <HealthJobProgress job={job} /> },
+          { title: c.queued, dataIndex: 'queued_count', width: 85 },
+          { title: c.running, dataIndex: 'running_count', width: 85 },
+          { title: c.succeeded, dataIndex: 'succeeded_count', width: 100 },
+          { title: c.failed, dataIndex: 'failed_count', width: 80 },
+          { title: c.cancelled, dataIndex: 'cancelled_count', width: 95 },
+          { title: c.created, dataIndex: 'created_at', width: 180, render: (value: number) => <TimestampDisplay value={value} /> },
+          { title: c.started, dataIndex: 'started_at', width: 180, render: (value: number | null) => <TimestampDisplay value={value} /> },
+          { title: c.finished, dataIndex: 'finished_at', width: 180, render: (value: number | null) => <TimestampDisplay value={value} /> },
+          { title: c.actions, fixed: 'right', width: 100, render: (_value: unknown, job: HealthJob) => <Button size="small" onClick={() => onOpenJob(job.id)}>{c.detail}</Button> },
         ]}
       />}
 
       <Space style={{ width: '100%', justifyContent: 'flex-end', marginTop: 16 }}>
-        <Button icon={<LeftOutlined />} disabled={cursorStack.length === 0} onClick={movePrevious}>Previous</Button>
-        <Button icon={<RightOutlined />} iconPlacement="end" disabled={!nextCursor} onClick={moveNext}>Next</Button>
+        <Button icon={<LeftOutlined />} disabled={cursorStack.length === 0} onClick={movePrevious}>{c.previous}</Button>
+        <Button icon={<RightOutlined />} iconPlacement="end" disabled={!nextCursor} onClick={moveNext}>{c.next}</Button>
       </Space>
     </Card>
   );

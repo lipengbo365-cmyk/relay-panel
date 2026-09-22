@@ -7,6 +7,7 @@ import type {
   SafeError,
 } from '../../api/health';
 import { healthJobProgress } from '../../api/health';
+import { useHealthLocale } from './healthLocale';
 
 const JOB_COLORS: Record<HealthJobStatus, string> = {
   QUEUED: 'default',
@@ -41,16 +42,19 @@ const HEALTH_COLORS: Record<HealthStatusValue, string> = {
 };
 
 export function JobStatusTag({ status }: { status: HealthJobStatus }) {
-  return <Tag color={JOB_COLORS[status]}>{status}</Tag>;
+  const { jobStatus } = useHealthLocale();
+  return <Tag color={JOB_COLORS[status]}>{jobStatus(status)}</Tag>;
 }
 
 export function ItemStateTag({ state }: { state: HealthJobItemState }) {
-  return <Tag color={ITEM_COLORS[state]}>{state}</Tag>;
+  const { itemState } = useHealthLocale();
+  return <Tag color={ITEM_COLORS[state]}>{itemState(state)}</Tag>;
 }
 
 export function HealthStatusTag({ status }: { status: HealthStatusValue | null }) {
+  const { healthStatus } = useHealthLocale();
   return status
-    ? <Tag color={HEALTH_COLORS[status]}>{status}</Tag>
+    ? <Tag color={HEALTH_COLORS[status]}>{healthStatus(status)}</Tag>
     : <Typography.Text type="secondary">—</Typography.Text>;
 }
 

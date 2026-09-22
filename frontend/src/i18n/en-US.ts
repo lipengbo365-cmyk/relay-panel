@@ -30,6 +30,8 @@ export const enUS: Dict = {
   healthResourceHealth: 'Resource Health',
   healthCreateJob: 'Create Health Job',
   healthLastRefresh: 'Last Refresh',
+  relayNodes: 'Relay Nodes',
+  socks5Relay: 'SOCKS5 Relay',
   nodeStatusDelete: 'Clear status record',
   nodeStatusDeleteConfirm: 'Clear this node\'s status record?',
   nodeStatusDeleted: 'Cleared',

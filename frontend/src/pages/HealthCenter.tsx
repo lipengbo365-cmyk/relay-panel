@@ -15,6 +15,7 @@ import {
   useHealthOverview,
   useNodeReadiness,
 } from '../hooks/useHealthReadModel';
+import { useHealthLocale } from '../components/health/healthLocale';
 
 type HealthTab = 'overview' | 'jobs' | 'resources';
 
@@ -24,6 +25,7 @@ function tabFromQuery(value: string | null): HealthTab {
 
 export default function HealthCenter() {
   const { t } = useI18n();
+  const { copy: healthCopy } = useHealthLocale();
   const [searchParams, setSearchParams] = useSearchParams();
   const [createOpen, setCreateOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -152,8 +154,8 @@ export default function HealthCenter() {
         onCreated={(result) => {
           setCreateOpen(false);
           setActionNotice(result.replayed
-            ? 'This request already exists; the original health Job was opened.'
-            : 'Health Job created.');
+            ? healthCopy.createReplayNotice
+            : healthCopy.createSuccessNotice);
           setRefreshKey((value) => value + 1);
           openJob(result.job_id);
         }}

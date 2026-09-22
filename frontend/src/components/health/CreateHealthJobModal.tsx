@@ -11,6 +11,7 @@ import {
 } from '../../api/health';
 import type { RelayNode, Socks5Resource } from '../../api/types';
 import { buildHealthJobRequest, type HealthSelectorForm } from './healthSelectors';
+import { useHealthLocale } from './healthLocale';
 
 interface CreateHealthJobModalProps {
   open: boolean;
@@ -50,6 +51,7 @@ function SafeActionError({ error }: { error: SafeError }) {
 }
 
 export function CreateHealthJobModal({ open, onClose, onCreated }: CreateHealthJobModalProps) {
+  const { copy: c, healthStatus, matrix, tagMatch } = useHealthLocale();
   const [form] = Form.useForm<HealthSelectorForm>();
   const [draft, setDraft] = useState<HealthSelectorForm>(INITIAL_DRAFT);
   const [resources, setResources] = useState<Socks5Resource[]>([]);
@@ -181,44 +183,44 @@ export function CreateHealthJobModal({ open, onClose, onCreated }: CreateHealthJ
   };
 
   const selectorSummary = verified ? [
-    `${verified.request.resource_selector.ids?.length || 'all matching'} resource IDs`,
-    `${verified.request.node_selector.ids?.length || 'all matching'} node IDs`,
-    `resource tags ${verified.request.resource_selector.tag_match}`,
-    `node tags ${verified.request.node_selector.tag_match}`,
+    `${c.resourceIds}：${verified.request.resource_selector.ids?.length || c.allMatching}`,
+    `${c.nodeIds}：${verified.request.node_selector.ids?.length || c.allMatching}`,
+    `${c.resourceTags}：${tagMatch(verified.request.resource_selector.tag_match ?? 'ALL')}`,
+    `${c.nodeTags}：${tagMatch(verified.request.node_selector.tag_match ?? 'ALL')}`,
   ].join(' · ') : '';
 
   return (
     <>
       <Modal
-        title="Create Health Job"
+        title={c.createHealthJob}
         open={open}
         onCancel={closeAndReset}
         width="min(960px, 96vw)"
         destroyOnHidden
         footer={[
-          <Button key="close" onClick={closeAndReset}>Close</Button>,
+          <Button key="close" onClick={closeAndReset}>{c.close}</Button>,
           <Button key="dry" loading={dryRunLoading} disabled={!canDryRun} onClick={() => void handleDryRun()}>
-            Preview Checks
+            {c.previewChecks}
           </Button>,
           <Button key="create" type="primary" loading={createLoading} disabled={!canCreate} onClick={() => setConfirmOpen(true)}>
-            {intent?.outcomeUnknown ? 'Retry Same Create Request' : 'Create Job'}
+            {intent?.outcomeUnknown ? c.retrySameCreateRequest : c.createJob}
           </Button>,
         ]}
       >
         <Alert
-          type="info" showIcon title="Durable manual health job"
-          description="The backend Dry Run is authoritative. Detection combinations use Resource × Node (CARTESIAN) semantics."
+          type="info" showIcon title={c.durableManualJob}
+          description={c.durableManualJobDescription}
           style={{ marginBottom: 16 }}
         />
         {catalogError ? <div style={{ marginBottom: 16 }}><SafeActionError error={catalogError} /></div> : null}
-        {noResources ? <Alert type="warning" showIcon title="No SOCKS5 Resources are available." style={{ marginBottom: 16 }} /> : null}
-        {noNodes ? <Alert type="warning" showIcon title="No Relay Nodes are available." style={{ marginBottom: 16 }} /> : null}
-        {noSupportedNodes ? <Alert type="warning" showIcon title="No Relay Node currently advertises SOCKS5 health-check support." style={{ marginBottom: 16 }} /> : null}
+        {noResources ? <Alert type="warning" showIcon title={c.noResourcesAvailable} style={{ marginBottom: 16 }} /> : null}
+        {noNodes ? <Alert type="warning" showIcon title={c.noNodesAvailable} style={{ marginBottom: 16 }} /> : null}
+        {noSupportedNodes ? <Alert type="warning" showIcon title={c.noSupportedNodes} style={{ marginBottom: 16 }} /> : null}
         {actionError ? <div style={{ marginBottom: 16 }}><SafeActionError error={actionError} /></div> : null}
         {intent?.outcomeUnknown ? (
           <Alert
-            type="warning" showIcon title="Create outcome unknown"
-            description="Retry the same request to safely discover the original result. The request identity is reused in memory."
+            type="warning" showIcon title={c.createOutcomeUnknown}
+            description={c.createOutcomeUnknownDescription}
             style={{ marginBottom: 16 }}
           />
         ) : null}
@@ -228,83 +230,83 @@ export function CreateHealthJobModal({ open, onClose, onCreated }: CreateHealthJ
           onValuesChange={(_changed, values: HealthSelectorForm) => invalidatePreview(values)}
         >
           <div className="rp-health-selector-grid">
-            <Card title="Resource Selector" size="small">
-              <Form.Item name="resource_ids" label="Resource IDs">
+            <Card title={c.resourceSelector} size="small">
+              <Form.Item name="resource_ids" label={c.resourceIds}>
                 <Select
                   mode="multiple" allowClear showSearch filterOption={false} loading={catalogLoading}
-                  onSearch={setResourceSearch} placeholder="All matching Resources"
+                  onSearch={setResourceSearch} placeholder={c.allMatchingResources}
                   options={resources.map((resource) => ({
                     value: resource.id,
-                    label: `${resource.name} · ${resource.country_code || '—'} · ${resource.status}`,
+                    label: `${resource.name} · ${resource.country_code || '—'} · ${healthStatus(resource.status as HealthStatus)}`,
                   }))}
                 />
               </Form.Item>
-              <Form.Item name="resource_country_codes" label="Country Codes"><Input placeholder="US, JP" /></Form.Item>
-              <Form.Item name="resource_statuses" label="Health Statuses">
-                <Select mode="multiple" allowClear options={HEALTH_STATUSES.map((status) => ({ value: status, label: status }))} />
+              <Form.Item name="resource_country_codes" label={c.countryCodes}><Input placeholder="US, JP" /></Form.Item>
+              <Form.Item name="resource_statuses" label={c.healthStatuses}>
+                <Select mode="multiple" allowClear options={HEALTH_STATUSES.map((status) => ({ value: status, label: healthStatus(status) }))} />
               </Form.Item>
-              <Form.Item name="resource_tags" label="Tags"><Input placeholder="residential, provider-a" /></Form.Item>
+              <Form.Item name="resource_tags" label={c.tags}><Input placeholder="住宅, 供应商-A" /></Form.Item>
               <Space wrap>
-                <Form.Item name="resource_enabled" label="Enabled">
+                <Form.Item name="resource_enabled" label={c.enabled}>
                   <Select style={{ width: 130 }} options={[
-                    { value: 'true', label: 'Enabled' }, { value: 'false', label: 'Disabled' }, { value: 'any', label: 'Any' },
+                    { value: 'true', label: c.enabledValue }, { value: 'false', label: c.disabledValue }, { value: 'any', label: c.anyValue },
                   ]} />
                 </Form.Item>
-                <Form.Item name="resource_tag_match" label="Tag Match"><Radio.Group options={['ALL', 'ANY']} optionType="button" /></Form.Item>
+                <Form.Item name="resource_tag_match" label={c.tagMatch}><Radio.Group options={['ALL', 'ANY'].map((value) => ({ value, label: tagMatch(value) }))} optionType="button" /></Form.Item>
               </Space>
             </Card>
 
-            <Card title="Node Selector" size="small">
-              <Form.Item name="node_ids" label="Node IDs">
+            <Card title={c.nodeSelector} size="small">
+              <Form.Item name="node_ids" label={c.nodeIds}>
                 <Select
-                  mode="multiple" allowClear showSearch optionFilterProp="label" placeholder="All matching Nodes"
+                  mode="multiple" allowClear showSearch optionFilterProp="label" placeholder={c.allMatchingNodes}
                   options={nodes.map((node) => ({
                     value: node.id,
-                    label: `${node.name} · ${node.country_code || '—'} · ${node.online ? 'Online' : 'Offline'} · ${node.supports_socks5_check ? 'SOCKS5 check supported' : 'No check support'}`,
+                    label: `${node.name} · ${node.country_code || '—'} · ${node.online ? c.online : c.offline} · ${node.supports_socks5_check ? c.checkSupported : c.noCheckSupport}`,
                   }))}
                 />
               </Form.Item>
-              <Form.Item name="node_country_codes" label="Country Codes"><Input placeholder="US, JP" /></Form.Item>
-              <Form.Item name="node_tags" label="Tags"><Input placeholder="premium, west" /></Form.Item>
+              <Form.Item name="node_country_codes" label={c.countryCodes}><Input placeholder="US, JP" /></Form.Item>
+              <Form.Item name="node_tags" label={c.tags}><Input placeholder="优质, 西部" /></Form.Item>
               <Space wrap>
-                <Form.Item name="node_enabled" label="Enabled">
+                <Form.Item name="node_enabled" label={c.enabled}>
                   <Select style={{ width: 130 }} options={[
-                    { value: 'true', label: 'Enabled' }, { value: 'false', label: 'Disabled' }, { value: 'any', label: 'Any' },
+                    { value: 'true', label: c.enabledValue }, { value: 'false', label: c.disabledValue }, { value: 'any', label: c.anyValue },
                   ]} />
                 </Form.Item>
-                <Form.Item name="node_tag_match" label="Tag Match"><Radio.Group options={['ALL', 'ANY']} optionType="button" /></Form.Item>
+                <Form.Item name="node_tag_match" label={c.tagMatch}><Radio.Group options={['ALL', 'ANY'].map((value) => ({ value, label: tagMatch(value) }))} optionType="button" /></Form.Item>
               </Space>
               <Alert
                 type="info" showIcon
-                title={`${nodes.filter((node) => node.online).length}/${nodes.length} online · ${nodes.filter((node) => node.supports_socks5_check).length}/${nodes.length} support SOCKS5 checks`}
-                description="Readiness is displayed only; it does not silently change the Node selector."
+                title={`${nodes.filter((node) => node.online).length}/${nodes.length} ${c.online} · ${nodes.filter((node) => node.supports_socks5_check).length}/${nodes.length} ${c.checkSupported}`}
+                description={c.readinessDescription}
               />
             </Card>
           </div>
-          <Form.Item name="max_items" label="Maximum Items" style={{ marginTop: 16 }}>
+          <Form.Item name="max_items" label={c.maximumItems} style={{ marginTop: 16 }}>
             <InputNumber min={1} max={20_000} />
           </Form.Item>
         </Form>
 
-        <Card title="Backend Dry Run Summary" size="small">
+        <Card title={c.dryRunSummary} size="small">
           {!verifiedCurrent || !verified ? (
-            <Typography.Text type="secondary">Preview is required after every selector change.</Typography.Text>
+            <Typography.Text type="secondary">{c.previewRequired}</Typography.Text>
           ) : (
             <Space orientation="vertical" style={{ width: '100%' }}>
               <Descriptions
                 size="small" bordered column={{ xs: 1, sm: 2, lg: 3 }}
                 items={[
-                  { key: 'resources', label: 'Resources', children: verified.result.resource_count },
-                  { key: 'nodes', label: 'Nodes', children: verified.result.node_count },
-                  { key: 'items', label: 'Checks', children: verified.result.item_count },
-                  { key: 'limit', label: 'Effective limit', children: verified.result.effective_limit },
-                  { key: 'matrix', label: 'Matrix', children: verified.result.matrix_mode },
-                  { key: 'within', label: 'Within limit', children: verified.result.within_limit ? 'Yes' : 'No' },
+                  { key: 'resources', label: c.resources, children: verified.result.resource_count },
+                  { key: 'nodes', label: c.nodes, children: verified.result.node_count },
+                  { key: 'items', label: c.checks, children: verified.result.item_count },
+                  { key: 'limit', label: c.effectiveLimit, children: verified.result.effective_limit },
+                  { key: 'matrix', label: c.matrix, children: matrix(verified.result.matrix_mode) },
+                  { key: 'within', label: c.withinLimit, children: verified.result.within_limit ? c.yes : c.no },
                 ]}
               />
               <Typography.Text type="secondary">{selectorSummary}</Typography.Text>
               {!verified.result.within_limit ? (
-                <Alert type="error" showIcon title="MATRIX_TOO_LARGE" description={`The ${verified.result.item_count} checks exceed the ${verified.result.effective_limit} item limit. Narrow the selectors.`} />
+                <Alert type="error" showIcon title="MATRIX_TOO_LARGE" description={`${verified.result.item_count} > ${verified.result.effective_limit}。${c.matrixTooLarge}`} />
               ) : null}
             </Space>
           )}
@@ -312,17 +314,17 @@ export function CreateHealthJobModal({ open, onClose, onCreated }: CreateHealthJ
       </Modal>
 
       <Modal
-        title={intent?.outcomeUnknown ? 'Retry same create request?' : 'Create this health job?'}
+        title={intent?.outcomeUnknown ? c.retryCreateConfirmTitle : c.createConfirmTitle}
         open={confirmOpen} onCancel={() => setConfirmOpen(false)} onOk={() => void handleCreate()}
-        confirmLoading={createLoading} okText={intent?.outcomeUnknown ? 'Retry Same Request' : 'Create Job'}
+        confirmLoading={createLoading} okText={intent?.outcomeUnknown ? c.retrySameRequest : c.createJob}
       >
         {verified ? (
           <Space orientation="vertical">
-            <Typography.Text>Resources: {verified.result.resource_count}</Typography.Text>
-            <Typography.Text>Nodes: {verified.result.node_count}</Typography.Text>
-            <Typography.Text strong>Final checks: {verified.result.item_count}</Typography.Text>
-            <Typography.Text>Limit: {verified.result.effective_limit}</Typography.Text>
-            <Typography.Text>Matrix: Resource × Node ({verified.result.matrix_mode})</Typography.Text>
+            <Typography.Text>{c.resources}：{verified.result.resource_count}</Typography.Text>
+            <Typography.Text>{c.nodes}：{verified.result.node_count}</Typography.Text>
+            <Typography.Text strong>{c.finalChecks}：{verified.result.item_count}</Typography.Text>
+            <Typography.Text>{c.limit}：{verified.result.effective_limit}</Typography.Text>
+            <Typography.Text>{c.matrix}：{matrix(verified.result.matrix_mode)}</Typography.Text>
             <Typography.Text type="secondary">{selectorSummary}</Typography.Text>
           </Space>
         ) : null}

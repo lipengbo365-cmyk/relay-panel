@@ -29,6 +29,8 @@ export const zhCN = {
   healthResourceHealth: '资源健康',
   healthCreateJob: '新建检测任务',
   healthLastRefresh: '最后刷新',
+  relayNodes: '中转节点',
+  socks5Relay: 'SOCKS5 中转',
   nodeStatusDelete: '清除状态记录',
   nodeStatusDeleteConfirm: '确定清除该节点的状态记录？',
   nodeStatusDeleted: '已清除',

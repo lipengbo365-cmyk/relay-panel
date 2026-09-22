@@ -73,8 +73,8 @@ export default function MainLayout() {
   ];
   const adminOnlyItems = [
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
-    { key: '/relay-nodes', icon: <CloudServerOutlined />, label: 'Relay Nodes' },
-    { key: '/socks5', icon: <ApiOutlined />, label: 'SOCKS5 中转' },
+    { key: '/relay-nodes', icon: <CloudServerOutlined />, label: t('relayNodes') },
+    { key: '/socks5', icon: <ApiOutlined />, label: t('socks5Relay') },
     { key: '/health-center', icon: <ExperimentOutlined />, label: t('healthCenter') },
     {
       key: 'grp-billing',

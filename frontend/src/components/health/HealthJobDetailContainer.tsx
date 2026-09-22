@@ -11,6 +11,7 @@ import {
 } from '../../api/health';
 import { useHealthJobDetail, useHealthJobItems } from '../../hooks/useHealthReadModel';
 import { HealthJobDetailDrawer } from './HealthJobDetailDrawer';
+import { useHealthLocale } from './healthLocale';
 
 interface Props {
   open: boolean;
@@ -41,6 +42,7 @@ export function HealthJobDetailContainer({
   onJobsChanged,
   onNotice,
 }: Props) {
+  const { copy: c } = useHealthLocale();
   const [state, setState] = useState<HealthJobItemState | undefined>();
   const [safeErrorCode, setSafeErrorCode] = useState('');
   const [cursorStack, setCursorStack] = useState<string[]>([]);
@@ -117,7 +119,7 @@ export function HealthJobDetailContainer({
       if (controller.signal.aborted) return;
       detail.commitActionData(updated);
       onJobsChanged();
-      onNotice('Cancellation requested. Backend status remains authoritative.');
+      onNotice(c.cancelNotice);
     } catch (error) {
       if (controller.signal.aborted) return;
       const safe = error instanceof SafeHealthRequestError ? error.safe : toSafeHealthError(error);
@@ -154,8 +156,8 @@ export function HealthJobDetailContainer({
       void detail.reload().catch(() => undefined);
       onJobsChanged();
       onNotice(child.replayed
-        ? 'This retry request already exists; the original child Job was opened.'
-        : 'Execution failures were queued in a new child Job.');
+        ? c.retryReplayNotice
+        : c.retrySuccessNotice);
       onOpenJob(child.job_id);
     } catch (error) {
       if (controller.signal.aborted) return;
