@@ -3,6 +3,7 @@ mod diagnose;
 mod forwarder;
 mod poller;
 mod reporter;
+mod socks5_check;
 mod updater;
 mod ws_client;
 
@@ -198,6 +199,10 @@ async fn run() {
     }
 
     let manager = Arc::new(Mutex::new(manager_inner));
+    let socks5_checks = Arc::new(socks5_check::Socks5CheckRuntime::new(
+        config.socks5_check_concurrency,
+        config.socks5_check_queue_limit,
+    ));
 
     // Unified sampler: CPU/mem + disk + network rate + cumulative traffic.
     let metrics = Arc::new(NodeMetrics::new(&config.network_interface));
@@ -230,14 +235,30 @@ async fn run() {
     // node-id file, so the panel can tell multiple nodes sharing one group
     // token apart (otherwise their status entries overwrite each other).
     let node_id = poller::get_or_create_node_id();
+    let node_identity_secret = match poller::get_or_create_node_identity_secret() {
+        Ok(secret) => secret,
+        Err(error) => {
+            eprintln!("FATAL: cannot establish persistent node identity: {error}");
+            std::process::exit(1);
+        }
+    };
 
     // --- Fork 1: WebSocket control channel (real-time config push) ---
     {
         let config_ws = config.clone();
         let manager_ws = manager.clone();
         let node_id_ws = node_id.clone();
+        let node_identity_secret_ws = node_identity_secret.clone();
+        let socks5_checks_ws = socks5_checks.clone();
         tokio::spawn(async move {
-            ws_client::run_ws_loop(&config_ws, &manager_ws, &node_id_ws).await;
+            ws_client::run_ws_loop(
+                &config_ws,
+                &manager_ws,
+                &node_id_ws,
+                &node_identity_secret_ws,
+                socks5_checks_ws,
+            )
+            .await;
         });
     }
 
@@ -256,7 +277,7 @@ async fn run() {
     loop {
         interval.tick().await;
 
-        match poller::fetch_config(&config).await {
+        match poller::fetch_config(&config, &node_id, &node_identity_secret).await {
             poller::FetchResult::Ok(resp) => {
                 let mut mgr = manager.lock().await;
                 mgr.apply_config(&resp).await;
@@ -268,6 +289,15 @@ async fn run() {
                 }
             }
             poller::FetchResult::ProtocolMismatch => {
+                // A mismatched panel cannot authoritatively describe current
+                // ingress/upstream semantics. Drop every current listener;
+                // retaining a SOCKS listener here would keep forwarding
+                // after a panel downgrade, defeating the version gate.
+                let mut mgr = manager.lock().await;
+                mgr.apply_config(&relay_shared::protocol::NodeConfigResponse {
+                    listeners: Vec::new(),
+                })
+                .await;
                 // Permanent: upgrade required. Switch to a long interval if we
                 // haven't already (avoids re-logging every tick).
                 if !in_mismatch_backoff {
@@ -294,7 +324,7 @@ async fn run() {
         // channel — these values reflect real active TCP/UDP forwarding state
         // and are reported over plain HTTP, so they keep working even if WS
         // is down.
-        reporter::report_traffic(&config, &counter).await;
+        reporter::report_traffic(&config, &counter, &node_id, &node_identity_secret).await;
         // Drain any listener bind/runtime errors captured since the last cycle
         // and forward them to the panel so an operator can see WHY a rule isn't
         // forwarding (port in use, permission denied, etc.).
@@ -308,7 +338,11 @@ async fn run() {
             &connections,
             start_time,
             &node_id,
-            listener_errors,
+            &node_identity_secret,
+            reporter::StatusDiagnostics {
+                listener_errors,
+                socks5_check_queue_depth: socks5_checks.queue_depth(),
+            },
         )
         .await;
     }

@@ -105,10 +105,16 @@ async fn main() {
         release_cache: api::system::ReleaseCache::new(),
         node_connections: api::ws::NodeConnections::new(),
         diagnose: api::diagnose::DiagnoseRegistry::new(),
+        socks5_checks: api::socks5_health::Socks5CheckRegistry::new(),
         geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::new(),
         )),
     };
+
+    let health_worker_config =
+        service::health_worker::HealthWorkerConfig::load(&config.database_path)
+            .expect("invalid durable health worker configuration");
+    service::health_worker::spawn(state.clone(), health_worker_config);
 
     // v1.2.0: scheduled rule restarts. Shares the AppState (and therefore the
     // same node WS registry) with the HTTP handlers, so a scheduled restart goes

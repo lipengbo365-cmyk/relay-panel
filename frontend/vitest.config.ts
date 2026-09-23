@@ -13,6 +13,11 @@ export default mergeConfig(
       environment: 'jsdom',
       setupFiles: ['./src/test/setup.ts'],
       exclude: ['node_modules', 'dist'],
+      // Ant Design 6 mounts several measurement/portal layers in jsdom. On
+      // slower Windows runners the interaction is correct but can exceed
+      // Vitest's 5s default, especially when the full suite runs in parallel.
+      // Keep every assertion active and allow the render to finish.
+      testTimeout: 30_000,
     },
   })
 );

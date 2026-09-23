@@ -21,9 +21,12 @@ const Login = lazy(() => import('./pages/Login'));
 const Register = lazy(() => import('./pages/Register'));
 const ForcePasswordChange = lazy(() => import('./pages/ForcePasswordChange'));
 const Rules = lazy(() => import('./pages/Rules'));
+const Socks5 = lazy(() => import('./pages/Socks5'));
 const Groups = lazy(() => import('./pages/Groups'));
 const Users = lazy(() => import('./pages/Users'));
 const NodeStatus = lazy(() => import('./pages/NodeStatus'));
+const RelayNodes = lazy(() => import('./pages/RelayNodes'));
+const HealthCenter = lazy(() => import('./pages/HealthCenter'));
 const Account = lazy(() => import('./pages/Account'));
 const SystemSettings = lazy(() => import('./pages/SystemSettings'));
 const Plans = lazy(() => import('./pages/Plans'));
@@ -70,9 +73,12 @@ export const router = createBrowserRouter([
       { index: true, element: <RoleHome /> },
       // Owner-scoped resources — any authenticated user manages their own.
       { path: 'rules', element: <Rules /> },
+      { path: 'socks5', element: <RequireAdmin><Socks5 /></RequireAdmin> },
       { path: 'groups', element: <Groups /> },
       { path: 'nodes', element: <NodeStatus /> },
       { path: 'node-status', element: <NodeStatus /> },
+      { path: 'relay-nodes', element: <RequireAdmin><RelayNodes /></RequireAdmin> },
+      { path: 'health-center', element: <RequireAdmin><HealthCenter /></RequireAdmin> },
       // v1.0.8: self-service shop (plan purchase + order history).
       { path: 'shop', element: <Shop /> },
       // v1.0.8: admin plan management (CRUD).

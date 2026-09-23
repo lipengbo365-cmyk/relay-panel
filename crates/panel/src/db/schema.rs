@@ -1,4 +1,8 @@
 pub const SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,
@@ -196,6 +200,196 @@ CREATE TABLE IF NOT EXISTS forward_rule_targets (
 CREATE INDEX IF NOT EXISTS idx_forward_rule_targets_rule_position
     ON forward_rule_targets (rule_id, position);
 
+-- v2.0: administrator-managed SOCKS5 upstream inventory. Credentials are
+-- application-layer encrypted; the database never stores a plaintext password.
+CREATE TABLE IF NOT EXISTS socks5_resources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+    username TEXT,
+    password_ciphertext TEXT,
+    password_nonce TEXT,
+    password_key_version INTEGER NOT NULL DEFAULT 1,
+    country TEXT NOT NULL DEFAULT '',
+    country_code TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    isp TEXT NOT NULL DEFAULT '',
+    remark TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'UNKNOWN'
+        CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    detected_exit_ip TEXT,
+    detected_country TEXT,
+    latency_ms INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    health_generation INTEGER NOT NULL DEFAULT 0,
+    last_check_at TEXT,
+    last_success_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+        OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+    UNIQUE(host, port, username)
+);
+
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter
+    ON socks5_resources(enabled, status, country_code);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
+    ON socks5_resources(host, port, COALESCE(username, ''));
+
+-- One-to-one extension of forward_rules. Inbound and upstream credentials are
+-- deliberately separate encrypted values.
+CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
+    rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+    socks5_resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+    relay_node_id INTEGER REFERENCES relay_nodes(id) ON DELETE RESTRICT,
+    selection_mode TEXT NOT NULL DEFAULT 'LEGACY'
+        CHECK (selection_mode IN ('LEGACY','RECOMMENDED','MANUAL')),
+    remote_dns INTEGER NOT NULL DEFAULT 1,
+    relay_username TEXT,
+    relay_password_ciphertext TEXT,
+    relay_password_nonce TEXT,
+    relay_password_key_version INTEGER NOT NULL DEFAULT 1,
+    allow_no_auth INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK ((allow_no_auth = 1 AND relay_username IS NULL
+             AND relay_password_ciphertext IS NULL AND relay_password_nonce IS NULL)
+        OR (allow_no_auth = 0 AND relay_username IS NOT NULL
+             AND relay_password_ciphertext IS NOT NULL AND relay_password_nonce IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
+    ON socks5_rule_bindings(socks5_resource_id);
+CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_node
+    ON socks5_rule_bindings(relay_node_id);
+
+-- A physical relay-node identity. KVS remains the real-time metrics store;
+-- this table provides stable relational ids for health checks and metadata.
+CREATE TABLE IF NOT EXISTS relay_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    node_key TEXT NOT NULL,
+    identity_secret_hash TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT '',
+    country_code TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    public_ip TEXT NOT NULL DEFAULT '',
+    advertise_host TEXT NOT NULL DEFAULT '',
+    bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps >= 0),
+    remark TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(device_group_id, node_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id);
+CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled);
+
+CREATE TABLE IF NOT EXISTS socks5_check_generations (
+    resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(resource_id, relay_node_id)
+);
+
+CREATE TABLE IF NOT EXISTS socks5_resource_health (
+    resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN
+        ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+    tcp_latency_ms INTEGER,
+    handshake_latency_ms INTEGER,
+    connect_latency_ms INTEGER,
+    total_latency_ms INTEGER,
+    exit_ip TEXT,
+    country TEXT,
+    error_stage TEXT,
+    error_code TEXT,
+    safe_error_message TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    resource_revision INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
+    checked_at TEXT NOT NULL,
+    last_success_at TEXT,
+    PRIMARY KEY(resource_id, relay_node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_health_node_status
+    ON socks5_resource_health(relay_node_id, status, checked_at);
+CREATE INDEX IF NOT EXISTS idx_socks5_health_exit_ip
+    ON socks5_resource_health(exit_ip);
+
+CREATE TABLE IF NOT EXISTS socks5_check_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN
+        ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+    tcp_latency_ms INTEGER,
+    handshake_latency_ms INTEGER,
+    connect_latency_ms INTEGER,
+    total_latency_ms INTEGER,
+    exit_ip TEXT,
+    country TEXT,
+    error_stage TEXT,
+    error_code TEXT,
+    safe_error_message TEXT,
+    checked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node
+    ON socks5_check_history(resource_id, relay_node_id, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at
+    ON socks5_check_history(checked_at);
+
+CREATE TABLE IF NOT EXISTS relay_creation_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+    relay_node_id INTEGER NOT NULL,
+    resource_id INTEGER NOT NULL,
+    endpoint_host TEXT NOT NULL,
+    listen_port INTEGER NOT NULL,
+    relay_username TEXT NOT NULL,
+    exit_ip TEXT NOT NULL,
+    exit_country TEXT,
+    selection_mode TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(actor_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created
+    ON relay_creation_receipts(created_at);
+
+-- Keeps the request fingerprint for the seven-day idempotency window even
+-- when deleting a rule cascades its live replay receipt. This lets an
+-- identical request create a replacement while a different request using the
+-- same key remains a conflict.
+CREATE TABLE IF NOT EXISTS relay_creation_idempotency_keys (
+    actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY(actor_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_creation_idempotency_keys_created
+    ON relay_creation_idempotency_keys(created_at);
+
 CREATE TABLE IF NOT EXISTS statistics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     stat_type TEXT NOT NULL,
@@ -288,6 +482,18 @@ CREATE TABLE IF NOT EXISTS traffic_history (
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts);
 CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts);
+
+-- Protocol v5 traffic-report idempotency. The node retries an identical UUID
+-- until acknowledgement; this receipt and the accounting delta are committed
+-- in the same transaction so a lost HTTP response cannot double-charge.
+CREATE TABLE IF NOT EXISTS traffic_report_receipts (
+    group_id INTEGER NOT NULL,
+    report_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (group_id, report_id)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_report_receipts_created
+    ON traffic_report_receipts(created_at);
 -- NOTE: the index on group_id is deliberately NOT here — it lives in Migration
 -- 41, next to the ALTER that adds the column. This schema re-runs on every
 -- boot, and `CREATE TABLE IF NOT EXISTS` is a no-op against a database whose
@@ -933,7 +1139,9 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         r#"INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled)
            SELECT fr.id, fr.target_addr, fr.target_port, 1, 1
            FROM forward_rules fr
-           WHERE NOT EXISTS (
+           WHERE fr.target_port BETWEEN 1 AND 65535
+             AND NULLIF(TRIM(fr.target_addr), '') IS NOT NULL
+             AND NOT EXISTS (
                SELECT 1 FROM forward_rule_targets t WHERE t.rule_id = fr.id
            )"#,
     )
@@ -1794,6 +2002,812 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         carried
     );
 
+    // ── Migration 45: v2.0 SOCKS5 resources + rule bindings ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_resources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            host TEXT NOT NULL,
+            port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+            username TEXT,
+            password_ciphertext TEXT,
+            password_nonce TEXT,
+            password_key_version INTEGER NOT NULL DEFAULT 1,
+            country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+            region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+            isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'UNKNOWN'
+                CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            last_check_at TEXT, last_success_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+                OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+            UNIQUE(host, port, username)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter
+         ON socks5_resources(enabled, status, country_code)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name)")
+        .execute(pool)
+        .await?;
+    for statement in [
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at,id)",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
+         ON socks5_resources(host, port, COALESCE(username, ''))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
+            rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+            socks5_resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+            remote_dns INTEGER NOT NULL DEFAULT 1,
+            relay_username TEXT,
+            relay_password_ciphertext TEXT,
+            relay_password_nonce TEXT,
+            relay_password_key_version INTEGER NOT NULL DEFAULT 1,
+            allow_no_auth INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK ((allow_no_auth = 1 AND relay_username IS NULL
+                     AND relay_password_ciphertext IS NULL AND relay_password_nonce IS NULL)
+                OR (allow_no_auth = 0 AND relay_username IS NOT NULL
+                     AND relay_password_ciphertext IS NOT NULL AND relay_password_nonce IS NOT NULL))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
+         ON socks5_rule_bindings(socks5_resource_id)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 45: SOCKS5 resources and rule bindings present");
+
+    // ── Migration 46: idempotent node traffic reports ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS traffic_report_receipts (
+            group_id INTEGER NOT NULL,
+            report_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (group_id, report_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_traffic_report_receipts_created
+         ON traffic_report_receipts(created_at)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 46: traffic report receipts present");
+
+    // ── Migration 47: relay-node inventory + per-node SOCKS5 health ──
+    add_column_if_missing(
+        pool,
+        "socks5_resources",
+        "tags",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_resources",
+        "health_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS relay_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+            node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+            identity_secret_hash TEXT NOT NULL DEFAULT '',
+            country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+            region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
+            bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps >= 0), remark TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+            first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(device_group_id, node_key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    add_column_if_missing(
+        pool,
+        "relay_nodes",
+        "identity_secret_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_check_generations (
+            resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+            relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+            generation INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(resource_id,relay_node_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_resource_health (
+            resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+            relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+            tcp_latency_ms INTEGER, handshake_latency_ms INTEGER, connect_latency_ms INTEGER,
+            total_latency_ms INTEGER, exit_ip TEXT, country TEXT, error_stage TEXT,
+            error_code TEXT, safe_error_message TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            checked_at TEXT NOT NULL, last_success_at TEXT,
+            PRIMARY KEY(resource_id, relay_node_id)
+        )",
+    ).execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_health_node_status ON socks5_resource_health(relay_node_id, status, checked_at)").execute(pool).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_socks5_health_exit_ip ON socks5_resource_health(exit_ip)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS socks5_check_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            resource_id INTEGER NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+            relay_node_id INTEGER NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')), tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
+            connect_latency_ms INTEGER, total_latency_ms INTEGER, exit_ip TEXT, country TEXT,
+            error_stage TEXT, error_code TEXT, safe_error_message TEXT, checked_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node ON socks5_check_history(resource_id, relay_node_id, checked_at DESC)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at ON socks5_check_history(checked_at)").execute(pool).await?;
+    for statement in [
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms,id)",
+        "CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at,id)",
+        "CREATE TRIGGER IF NOT EXISTS validate_socks5_history_status_insert BEFORE INSERT ON socks5_check_history WHEN NEW.status NOT IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN') BEGIN SELECT RAISE(ABORT,'invalid SOCKS5 history status'); END",
+        "CREATE TRIGGER IF NOT EXISTS validate_socks5_history_status_update BEFORE UPDATE OF status ON socks5_check_history WHEN NEW.status NOT IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN') BEGIN SELECT RAISE(ABORT,'invalid SOCKS5 history status'); END",
+        "CREATE TRIGGER IF NOT EXISTS validate_relay_node_metadata_insert BEFORE INSERT ON relay_nodes WHEN NEW.bandwidth_mbps < 0 OR NEW.enabled NOT IN (0,1) BEGIN SELECT RAISE(ABORT,'invalid relay node metadata'); END",
+        "CREATE TRIGGER IF NOT EXISTS validate_relay_node_metadata_update BEFORE UPDATE OF bandwidth_mbps,enabled ON relay_nodes WHEN NEW.bandwidth_mbps < 0 OR NEW.enabled NOT IN (0,1) BEGIN SELECT RAISE(ABORT,'invalid relay node metadata'); END",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
+    migrate_sqlite_socks5_resource_status(pool).await?;
+    tracing::info!("Migration 47: relay nodes and SOCKS5 health tables present");
+
+    // ── Migration 49: Stage 4 physical-node binding + smart relay receipts ──
+    add_column_if_missing(
+        pool,
+        "relay_nodes",
+        "advertise_host",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_rule_bindings",
+        "relay_node_id",
+        "INTEGER REFERENCES relay_nodes(id) ON DELETE RESTRICT",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_rule_bindings",
+        "selection_mode",
+        "TEXT NOT NULL DEFAULT 'LEGACY' CHECK(selection_mode IN ('LEGACY','RECOMMENDED','MANUAL'))",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_resource_health",
+        "resource_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "socks5_resource_health",
+        "generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_node ON socks5_rule_bindings(relay_node_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS relay_creation_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            idempotency_key TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            rule_id INTEGER NOT NULL,
+            relay_node_id INTEGER NOT NULL,
+            resource_id INTEGER NOT NULL,
+            endpoint_host TEXT NOT NULL,
+            listen_port INTEGER NOT NULL,
+            relay_username TEXT NOT NULL,
+            exit_ip TEXT NOT NULL,
+            exit_country TEXT,
+            selection_mode TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(actor_id,idempotency_key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created ON relay_creation_receipts(created_at)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 49: Stage 4 smart relay binding present");
+
+    // ── Migration 50: smart-relay receipt lifecycle integrity ──
+    migrate_sqlite_relay_receipt_integrity(pool).await?;
+
+    // ── Migration 51: Stage 5.1 durable health orchestration persistence ──
+    migrate_sqlite_health_orchestration(pool).await?;
+
+    // ── Migration 52: independent durable orchestration retry counter ──
+    migrate_sqlite_health_retry_count(pool).await?;
+
+    // ── Migration 53: exactly-once durable health Job finalization audit ──
+    migrate_sqlite_health_finalized_audit(pool).await?;
+
+    Ok(())
+}
+
+async fn validate_sqlite_health_schema(
+    conn: &mut sqlx::SqliteConnection,
+    retry_count_present: bool,
+) -> Result<(), sqlx::Error> {
+    let migration = if retry_count_present { 52 } else { 51 };
+    for table in crate::db::health_schema::HEALTH_TABLES {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(table)
+                .fetch_one(&mut *conn)
+                .await?;
+        if count != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "SQLite migration {migration} version/schema mismatch: missing {table}"
+            )));
+        }
+    }
+    for (table, expected) in crate::db::health_schema::HEALTH_TABLES
+        .into_iter()
+        .zip(crate::db::health_schema::SQLITE_MIGRATION_51.iter().take(5))
+    {
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(table)
+                .fetch_optional(&mut *conn)
+                .await?
+                .flatten();
+        let expected = if retry_count_present && table == "socks5_check_job_items" {
+            expected.replacen(
+                "        CHECK((lease_owner IS NULL",
+                "        retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0),\n        CHECK((lease_owner IS NULL",
+                1,
+            )
+        } else {
+            (*expected).to_owned()
+        };
+        if actual
+            .as_deref()
+            .map(crate::db::health_schema::normalize_schema_sql)
+            != Some(crate::db::health_schema::normalize_schema_sql(&expected))
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "SQLite migration {migration} version/schema mismatch: {table} table manifest differs"
+            )));
+        }
+    }
+    for (index, expected) in crate::db::health_schema::HEALTH_INDEXES
+        .into_iter()
+        .zip(crate::db::health_schema::SQLITE_MIGRATION_51.iter().skip(5))
+    {
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='index' AND name=?")
+                .bind(index)
+                .fetch_optional(&mut *conn)
+                .await?
+                .flatten();
+        if actual
+            .as_deref()
+            .map(crate::db::health_schema::normalize_schema_sql)
+            != Some(crate::db::health_schema::normalize_schema_sql(expected))
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "SQLite migration {migration} version/schema mismatch: {index} index manifest differs"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn migrate_sqlite_health_orchestration(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    const VERSION: i64 = 51;
+    // Some pre-version-tracker SQLite databases are still supported by the
+    // historical migration chain. Establishing the tracker is distinct from
+    // creating Stage 5 tables: those remain strict, versioned DDL below.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let current: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version),0) FROM schema_version")
+        .fetch_one(pool)
+        .await?;
+    if current == VERSION {
+        let mut conn = pool.acquire().await?;
+        return validate_sqlite_health_schema(&mut conn, false).await;
+    } else if current > VERSION {
+        return Ok(());
+    }
+
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+         ('socks5_check_policies','socks5_check_jobs','socks5_check_job_items',
+          'socks5_check_pair_leases','socks5_health_job_idempotency')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if existing != 0 {
+        return Err(sqlx::Error::Protocol(
+            "SQLite migration 51 found unversioned Stage 5.1 schema".into(),
+        ));
+    }
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let migration = async {
+        for statement in crate::db::health_schema::SQLITE_MIGRATION_51 {
+            sqlx::query(statement).execute(&mut *conn).await?;
+        }
+        sqlx::query("INSERT INTO schema_version(version) VALUES(?)")
+            .bind(VERSION)
+            .execute(&mut *conn)
+            .await?;
+        validate_sqlite_health_schema(&mut conn, false).await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    migration?;
+    tracing::info!("Migration 51: durable health orchestration persistence present");
+    Ok(())
+}
+
+async fn validate_sqlite_health_retry_count(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    let row: Option<(String, i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT name,\"notnull\",dflt_value,pk FROM pragma_table_info('socks5_check_job_items') WHERE name='retry_count'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if row != Some(("retry_count".into(), 1, Some("0".into()), 0)) {
+        return Err(sqlx::Error::Protocol(
+            "SQLite migration 52 version/schema mismatch: retry_count column differs".into(),
+        ));
+    }
+    let table_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='socks5_check_job_items'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .flatten();
+    let normalized = table_sql
+        .as_deref()
+        .map(crate::db::health_schema::normalize_schema_sql)
+        .unwrap_or_default();
+    if !normalized.contains("retry_countintegernotnulldefault0check(retry_count>=0)") {
+        return Err(sqlx::Error::Protocol(
+            "SQLite migration 52 version/schema mismatch: retry_count constraint missing".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn migrate_sqlite_health_retry_count(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    const VERSION: i64 = 52;
+    let current: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version),0) FROM schema_version")
+        .fetch_one(pool)
+        .await?;
+    if current >= VERSION {
+        let mut conn = pool.acquire().await?;
+        validate_sqlite_health_schema(&mut conn, true).await?;
+        validate_sqlite_health_retry_count(&mut conn).await?;
+        return Ok(());
+    }
+    if current != 51 {
+        return Err(sqlx::Error::Protocol(format!(
+            "SQLite migration 52 requires version 51, found {current}"
+        )));
+    }
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let migration = async {
+        sqlx::query(crate::db::health_schema::SQLITE_MIGRATION_52)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("INSERT INTO schema_version(version) VALUES(?)")
+            .bind(VERSION)
+            .execute(&mut *conn)
+            .await?;
+        validate_sqlite_health_schema(&mut conn, true).await?;
+        validate_sqlite_health_retry_count(&mut conn).await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    migration?;
+    tracing::info!("Migration 52: durable orchestration retry counter present");
+    Ok(())
+}
+
+async fn validate_sqlite_health_finalized_audit(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    let sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_audit_health_job_finalized'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .flatten();
+    let normalized = sql
+        .as_deref()
+        .map(crate::db::health_schema::normalize_schema_sql)
+        .unwrap_or_default();
+    if normalized
+        != "createuniqueindexuq_audit_health_job_finalizedonaudit_log(target_id)whereaction='job_finalized'andtarget_type='socks5_health_job'"
+    {
+        return Err(sqlx::Error::Protocol(
+            "SQLite migration 53 version/schema mismatch: health finalization audit index differs"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn migrate_sqlite_health_finalized_audit(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    const VERSION: i64 = 53;
+    let current: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version),0) FROM schema_version")
+        .fetch_one(pool)
+        .await?;
+    if current >= VERSION {
+        let mut conn = pool.acquire().await?;
+        validate_sqlite_health_finalized_audit(&mut conn).await?;
+        return Ok(());
+    }
+    if current != 52 {
+        return Err(sqlx::Error::Protocol(format!(
+            "SQLite migration 53 requires version 52, found {current}"
+        )));
+    }
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let migration = async {
+        for statement in crate::db::health_schema::SQLITE_MIGRATION_53 {
+            sqlx::query(statement).execute(&mut *conn).await?;
+        }
+        sqlx::query("INSERT INTO schema_version(version) VALUES(?)")
+            .bind(VERSION)
+            .execute(&mut *conn)
+            .await?;
+        validate_sqlite_health_finalized_audit(&mut conn).await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    migration?;
+    tracing::info!("Migration 53: health Job finalization audit is unique");
+    Ok(())
+}
+
+async fn migrate_sqlite_relay_receipt_integrity(
+    pool: &sqlx::SqlitePool,
+) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let migration = async {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_creation_idempotency_keys (
+                actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY(actor_id,idempotency_key)
+            )",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_relay_creation_idempotency_keys_created
+             ON relay_creation_idempotency_keys(created_at)",
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        // Preserve the fingerprint before removing legacy orphan receipts.
+        sqlx::query(
+            "INSERT OR IGNORE INTO relay_creation_idempotency_keys
+             (actor_id,idempotency_key,request_fingerprint,created_at)
+             SELECT actor_id,idempotency_key,request_fingerprint,created_at
+             FROM relay_creation_receipts",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "DELETE FROM relay_creation_receipts
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM forward_rules
+                 WHERE forward_rules.id=relay_creation_receipts.rule_id
+             )",
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        let has_rule_fk: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('relay_creation_receipts')
+             WHERE \"table\"='forward_rules' AND \"from\"='rule_id' AND on_delete='CASCADE'",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        if has_rule_fk == 0 {
+            sqlx::query(
+                "CREATE TABLE relay_creation_receipts_v50 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+                    relay_node_id INTEGER NOT NULL,
+                    resource_id INTEGER NOT NULL,
+                    endpoint_host TEXT NOT NULL,
+                    listen_port INTEGER NOT NULL,
+                    relay_username TEXT NOT NULL,
+                    exit_ip TEXT NOT NULL,
+                    exit_country TEXT,
+                    selection_mode TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(actor_id,idempotency_key)
+                )",
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                "INSERT INTO relay_creation_receipts_v50
+                 (id,actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,
+                  resource_id,endpoint_host,listen_port,relay_username,exit_ip,exit_country,
+                  selection_mode,created_at)
+                 SELECT id,actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,
+                        resource_id,endpoint_host,listen_port,relay_username,exit_ip,exit_country,
+                        selection_mode,created_at
+                 FROM relay_creation_receipts",
+            )
+            .execute(&mut *conn)
+            .await?;
+            let old_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts")
+                .fetch_one(&mut *conn)
+                .await?;
+            let new_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts_v50")
+                    .fetch_one(&mut *conn)
+                    .await?;
+            if old_count != new_count {
+                return Err(sqlx::Error::Protocol(
+                    "relay receipt migration row-count mismatch".into(),
+                ));
+            }
+            sqlx::query("DROP TABLE relay_creation_receipts")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query(
+                "ALTER TABLE relay_creation_receipts_v50 RENAME TO relay_creation_receipts",
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                "CREATE INDEX idx_relay_creation_receipts_created
+                 ON relay_creation_receipts(created_at)",
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    migration?;
+    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&mut *conn)
+        .await?;
+    if violations != 0 {
+        return Err(sqlx::Error::Protocol(
+            "relay receipt migration left foreign-key violations".into(),
+        ));
+    }
+    tracing::info!("Migration 50: smart relay receipt lifecycle integrity present");
+    Ok(())
+}
+
+/// SQLite cannot alter an inline CHECK constraint. Alpha2 omitted
+/// CONNECT_FAILED from the resource projection even though the per-node health
+/// table and protocol support it, so upgrade the parent table atomically while
+/// preserving ids and every Stage 2/3 column.
+async fn migrate_sqlite_socks5_resource_status(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    let table_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='socks5_resources'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    if table_sql.contains("'CONNECT_FAILED'") {
+        return Ok(());
+    }
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys=OFF")
+        .execute(&mut *conn)
+        .await?;
+    let migration = async {
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        sqlx::query(
+            "CREATE TABLE socks5_resources_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, host TEXT NOT NULL,
+                port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+                username TEXT, password_ciphertext TEXT, password_nonce TEXT,
+                password_key_version INTEGER NOT NULL DEFAULT 1,
+                country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+                isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK (status IN
+                    ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+                detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                health_generation INTEGER NOT NULL DEFAULT 0,
+                last_check_at TEXT, last_success_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+                    OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+                UNIQUE(host, port, username)
+            )",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO socks5_resources_new
+             (id,name,host,port,username,password_ciphertext,password_nonce,password_key_version,
+              country,country_code,region,city,isp,remark,tags,status,enabled,detected_exit_ip,
+              detected_country,latency_ms,consecutive_failures,health_generation,last_check_at,
+              last_success_at,created_at,updated_at)
+             SELECT id,name,host,port,username,password_ciphertext,password_nonce,password_key_version,
+              country,country_code,region,city,isp,remark,tags,status,enabled,detected_exit_ip,
+              detected_country,latency_ms,consecutive_failures,health_generation,last_check_at,
+              last_success_at,created_at,updated_at FROM socks5_resources",
+        )
+        .execute(&mut *conn)
+        .await?;
+        let old_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources")
+            .fetch_one(&mut *conn)
+            .await?;
+        let new_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources_new")
+            .fetch_one(&mut *conn)
+            .await?;
+        if old_count != new_count {
+            return Err(sqlx::Error::Protocol(
+                "SOCKS5 resource status migration row-count mismatch".into(),
+            ));
+        }
+        sqlx::query("DROP TABLE socks5_resources")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("ALTER TABLE socks5_resources_new RENAME TO socks5_resources")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX idx_socks5_resources_filter ON socks5_resources(enabled,status,country_code)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query("CREATE INDEX idx_socks5_resources_name ON socks5_resources(name)")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_socks5_resources_endpoint_auth ON socks5_resources(host,port,COALESCE(username,''))",
+        )
+        .execute(&mut *conn)
+        .await?;
+        for statement in [
+            "CREATE INDEX idx_socks5_resources_country ON socks5_resources(country_code,id)",
+            "CREATE INDEX idx_socks5_resources_status ON socks5_resources(status,id)",
+            "CREATE INDEX idx_socks5_resources_enabled ON socks5_resources(enabled,id)",
+            "CREATE INDEX idx_socks5_resources_latency ON socks5_resources(latency_ms,id)",
+            "CREATE INDEX idx_socks5_resources_last_check ON socks5_resources(last_check_at,id)",
+        ] {
+            sqlx::query(statement).execute(&mut *conn).await?;
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if migration.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    }
+    let foreign_keys = sqlx::query("PRAGMA foreign_keys=ON")
+        .execute(&mut *conn)
+        .await;
+    migration?;
+    foreign_keys?;
+    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&mut *conn)
+        .await?;
+    if violations != 0 {
+        return Err(sqlx::Error::Protocol(
+            "SOCKS5 resource status migration produced foreign-key violations".into(),
+        ));
+    }
+    tracing::info!("Migration 48: SOCKS5 CONNECT_FAILED resource status enabled");
     Ok(())
 }
 
@@ -1867,6 +2881,143 @@ mod tests {
             .expect("schema");
         run_migrations(&pool).await.expect("migrations on fresh db");
         pool
+    }
+
+    #[tokio::test]
+    async fn migration_50_removes_orphans_adds_rule_fk_and_is_idempotent() {
+        let pool = fresh_pool().await;
+        let fresh_rule_fk: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('relay_creation_receipts')
+             WHERE \"table\"='forward_rules' AND \"from\"='rule_id' AND on_delete='CASCADE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            fresh_rule_fk, 1,
+            "fresh SQLite schema must carry the cascade FK"
+        );
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE relay_creation_receipts")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE relay_creation_idempotency_keys")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE relay_creation_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                rule_id INTEGER NOT NULL,
+                relay_node_id INTEGER NOT NULL,
+                resource_id INTEGER NOT NULL,
+                endpoint_host TEXT NOT NULL,
+                listen_port INTEGER NOT NULL,
+                relay_username TEXT NOT NULL,
+                exit_ip TEXT NOT NULL,
+                exit_country TEXT,
+                selection_mode TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(actor_id,idempotency_key)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users(id,username,password,max_rules,admin)
+             VALUES(1,'migration-50','x',0,1)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups(id,name,group_type,token,uid)
+             VALUES(1,'migration-50','in','migration-50',1)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules(id,name,uid,listen_port,device_group_in,target_addr,target_port)
+             VALUES(1,'live',1,10001,1,'127.0.0.1',80)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (key, fingerprint, rule_id) in [
+            ("live-key", "live-fingerprint", 1_i64),
+            ("orphan-key", "orphan-fingerprint", 999_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO relay_creation_receipts
+                 (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+                  endpoint_host,listen_port,relay_username,exit_ip,selection_mode)
+                 VALUES(1,?,?,?,1,1,'node.example',10001,'relay','192.0.2.1','RECOMMENDED')",
+            )
+            .bind(key)
+            .bind(fingerprint)
+            .bind(rule_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_migrations(&pool).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let orphan_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM relay_creation_receipts r
+             WHERE NOT EXISTS(SELECT 1 FROM forward_rules f WHERE f.id=r.rule_id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphan_count, 0);
+        let ledger_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_idempotency_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            ledger_count, 2,
+            "both historical fingerprints survive migration"
+        );
+        let rule_fk: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('relay_creation_receipts')
+             WHERE \"table\"='forward_rules' AND \"from\"='rule_id' AND on_delete='CASCADE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rule_fk, 1);
+        sqlx::query("DELETE FROM forward_rules WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0);
+        run_migrations(&pool).await.unwrap();
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 
     /// Assert a column exists on a table (via pragma_table_info).
@@ -2032,6 +3183,62 @@ mod tests {
         assert_eq!(
             before, after,
             "second migration run must not duplicate seed rows"
+        );
+    }
+
+    /// SOCKS5 relay rules intentionally have no fixed target: the CONNECT
+    /// destination arrives in the inbound SOCKS5 request, so their legacy
+    /// `target_port` sentinel is zero. Migration 19 runs on every SQLite boot
+    /// and must not try to backfill that sentinel into forward_rule_targets,
+    /// whose port CHECK correctly rejects zero.
+    #[tokio::test]
+    async fn migrations_are_idempotent_with_dynamic_socks5_rule_target() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (1, 'socks-in', 'in', 'socks-token', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_resources \
+             (id, name, host, port, enabled) \
+             VALUES (1, 'upstream', '127.0.0.1', 1080, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, device_group_in, \
+              target_addr, target_port, route_mode, forward_mode) \
+             VALUES (1, 'dynamic-socks', 1, 31080, 'tcp', 1, '', 0, \
+                     'socks5', 'socks5')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_rule_bindings \
+             (rule_id, socks5_resource_id, allow_no_auth) VALUES (1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool)
+            .await
+            .expect("second boot with a dynamic SOCKS5 target must succeed");
+
+        let targets: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM forward_rule_targets WHERE rule_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            targets.0, 0,
+            "dynamic SOCKS5 rules have no fixed target row"
         );
     }
 
@@ -2590,5 +3797,367 @@ mod tests {
             .await
             .expect("re-run baseline");
         run_migrations(&pool).await.expect("re-run migrations");
+    }
+
+    #[tokio::test]
+    async fn migration_53_fresh_rerun_constraints_indexes_and_fk_actions() {
+        let pool = fresh_pool().await;
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 53);
+        run_migrations(&pool)
+            .await
+            .expect("second startup validates");
+        for table in crate::db::health_schema::HEALTH_TABLES {
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(present, 1, "missing {table}");
+        }
+        for index in crate::db::health_schema::HEALTH_INDEXES {
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?",
+            )
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(present, 1, "missing {index}");
+        }
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(violations, 0);
+        let item_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='socks5_check_job_items'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(item_sql.contains("ON DELETE SET NULL"));
+        assert!(item_sql.contains("ON DELETE CASCADE"));
+        assert!(item_sql.contains("retry_count INTEGER NOT NULL DEFAULT 0"));
+        let mut conn = pool.acquire().await.unwrap();
+        validate_sqlite_health_finalized_audit(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_52_upgrades_version_51_and_rolls_back_failed_upgrade() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        migrate_sqlite_health_orchestration(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            51
+        );
+        migrate_sqlite_health_retry_count(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            52
+        );
+        migrate_sqlite_health_retry_count(&pool)
+            .await
+            .expect("migration 52 rerun must validate and pass");
+
+        let failed = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&failed).await.unwrap();
+        migrate_sqlite_health_orchestration(&failed).await.unwrap();
+        sqlx::query("ALTER TABLE socks5_check_job_items ADD COLUMN retry_count INTEGER")
+            .execute(&failed)
+            .await
+            .unwrap();
+        assert!(migrate_sqlite_health_retry_count(&failed).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&failed)
+                .await
+                .unwrap(),
+            51,
+            "a failed migration 52 must not advance the schema version"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_52_version_schema_mismatch_fails_loudly() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "ALTER TABLE socks5_check_job_items RENAME COLUMN retry_count TO retry_count_bad",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = run_migrations(&pool).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("migration 52 version/schema mismatch"));
+    }
+
+    #[tokio::test]
+    async fn migration_53_deduplicates_finalized_audits_and_rolls_back_atomically() {
+        async fn version_52_pool() -> sqlx::SqlitePool {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+            migrate_sqlite_health_orchestration(&pool).await.unwrap();
+            migrate_sqlite_health_retry_count(&pool).await.unwrap();
+            pool
+        }
+
+        let pool = version_52_pool().await;
+        for _ in 0..2 {
+            sqlx::query("INSERT INTO audit_log(ts,actor_name,action,target_type,target_id,detail) VALUES('2026-01-01 00:00:00','system','JOB_FINALIZED','socks5_health_job','job-1','status=SUCCEEDED; succeeded=1; failed=0; cancelled=0')")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO socks5_check_jobs
+             (id,source,status,request_fingerprint,snapshot_hash,resource_selector_json,
+              node_selector_json,matrix_mode,retry_policy_version,cancel_requested,total_items,
+              queued_count,running_count,succeeded_count,failed_count,cancelled_count,
+              created_at_ms,finished_at_ms)
+             VALUES('job-missing-audit','MANUAL','FAILED',?,?,'{}','{}','CARTESIAN','v1',
+                    0,1,0,0,0,1,0,1000,2000)",
+        )
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+        migrate_sqlite_health_finalized_audit(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            53
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id='job-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id='job-missing-audit'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1,
+            "migration 53 must repair a pre-existing terminal Job missing its audit"
+        );
+        migrate_sqlite_health_finalized_audit(&pool)
+            .await
+            .expect("migration 53 rerun must validate and pass");
+
+        let failed = version_52_pool().await;
+        for _ in 0..2 {
+            sqlx::query("INSERT INTO audit_log(ts,actor_name,action,target_type,target_id,detail) VALUES('2026-01-01 00:00:00','system','JOB_FINALIZED','socks5_health_job','job-rollback','status=FAILED; succeeded=0; failed=1; cancelled=0')")
+                .execute(&failed)
+                .await
+                .unwrap();
+        }
+        sqlx::query("CREATE INDEX uq_audit_health_job_finalized ON audit_log(target_id)")
+            .execute(&failed)
+            .await
+            .unwrap();
+        assert!(migrate_sqlite_health_finalized_audit(&failed)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&failed)
+                .await
+                .unwrap(),
+            52
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log WHERE target_id='job-rollback'"
+            )
+            .fetch_one(&failed)
+            .await
+            .unwrap(),
+            2,
+            "failed migration 53 must roll back duplicate cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_53_version_schema_mismatch_fails_loudly() {
+        let pool = fresh_pool().await;
+        sqlx::query("DROP INDEX uq_audit_health_job_finalized")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = run_migrations(&pool).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("migration 53 version/schema mismatch"));
+    }
+
+    #[tokio::test]
+    async fn migration_51_failure_rolls_back_without_partial_tables() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        for statement in crate::db::health_schema::SQLITE_MIGRATION_51 {
+            sqlx::query(statement).execute(&mut *conn).await.unwrap();
+        }
+        assert!(
+            sqlx::query("INSERT INTO definitely_missing_table VALUES(1)")
+                .execute(&mut *conn)
+                .await
+                .is_err()
+        );
+        sqlx::query("ROLLBACK").execute(&mut *conn).await.unwrap();
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+             ('socks5_check_policies','socks5_check_jobs','socks5_check_job_items',
+              'socks5_check_pair_leases','socks5_health_job_idempotency')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(tables, 0);
+        let version: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(version, None);
+    }
+
+    #[tokio::test]
+    async fn migration_51_version_schema_mismatch_fails_loudly() {
+        let pool = fresh_pool().await;
+        sqlx::query("DROP INDEX idx_socks5_check_job_items_ready")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = run_migrations(&pool).await.unwrap_err();
+        assert!(error.to_string().contains("version/schema mismatch"));
+    }
+
+    #[tokio::test]
+    async fn migration_51_manifest_rejects_constraint_column_fk_and_index_drift() {
+        let mutations = [
+            (
+                "table",
+                "socks5_check_jobs",
+                "status IN ('QUEUED','RUNNING','CANCEL_REQUESTED','SUCCEEDED','FAILED','PARTIAL','CANCELLED','PARTIAL_CANCELLED')",
+                "status IN ('QUEUED','RUNNING')",
+            ),
+            (
+                "table",
+                "socks5_check_job_items",
+                "job_id TEXT NOT NULL REFERENCES socks5_check_jobs(id) ON DELETE CASCADE",
+                "job_id TEXT NOT NULL",
+            ),
+            (
+                "table",
+                "socks5_check_job_items",
+                "resource_id INTEGER REFERENCES socks5_resources(id) ON DELETE SET NULL",
+                "resource_id INTEGER REFERENCES socks5_resources(id) ON DELETE CASCADE",
+            ),
+            (
+                "table",
+                "socks5_check_jobs",
+                "total_items INTEGER NOT NULL",
+                "total_items INTEGER",
+            ),
+            (
+                "table",
+                "socks5_check_jobs",
+                "status TEXT NOT NULL DEFAULT 'QUEUED'",
+                "status TEXT NOT NULL DEFAULT 'RUNNING'",
+            ),
+            (
+                "table",
+                "socks5_check_jobs",
+                "total_items INTEGER NOT NULL",
+                "total_items TEXT NOT NULL",
+            ),
+            (
+                "table",
+                "socks5_check_job_items",
+                "UNIQUE(job_id,resource_id_snapshot,relay_node_id_snapshot)",
+                "CHECK(job_id <> '')",
+            ),
+            (
+                "index",
+                "uq_socks5_check_jobs_scheduled_slot",
+                "WHERE source='SCHEDULED'",
+                "WHERE source='MANUAL'",
+            ),
+            (
+                "index",
+                "idx_socks5_check_job_items_ready",
+                "(state,not_before_ms,id)",
+                "(not_before_ms,state,id)",
+            ),
+        ];
+        for (kind, name, from, to) in mutations {
+            let pool = fresh_pool().await;
+            sqlx::query("PRAGMA writable_schema=ON")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let changed = sqlx::query(
+                "UPDATE sqlite_master SET sql=replace(sql,?,?) WHERE type=? AND name=?",
+            )
+            .bind(from)
+            .bind(to)
+            .bind(kind)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+            sqlx::query("PRAGMA writable_schema=OFF")
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(changed, 1, "mutation did not target {kind} {name}");
+            let error = run_migrations(&pool).await.unwrap_err();
+            assert!(
+                error.to_string().contains("version/schema mismatch"),
+                "{kind} {name}: {error}"
+            );
+        }
     }
 }

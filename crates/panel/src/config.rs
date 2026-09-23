@@ -26,7 +26,7 @@ pub fn app_version() -> &'static str {
     })
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct Config {
     pub database_path: String,
     pub listen: String,
@@ -60,6 +60,64 @@ pub struct Config {
     /// blocks node status or forwarding.
     pub geoip_enabled: bool,
     pub geoip_cache_ttl: u64,
+    /// Dedicated 256-bit key for reversible SOCKS5/relay credential encryption.
+    /// Accepted encodings: 64 hexadecimal characters or standard base64.
+    /// Missing/invalid means the SOCKS5 feature fails closed; legacy features
+    /// continue to boot so an operator can repair configuration.
+    pub socks5_credential_key: Option<String>,
+    /// Internet IP-echo endpoints used by directed Relay Node checks. The node
+    /// tries them in order so one provider outage does not poison every result.
+    pub socks5_check_urls: Vec<String>,
+    /// Maximum number of in-flight checks started by one batch request.
+    pub socks5_check_concurrency: usize,
+    /// Check-history retention window. Pruning is opportunistic after writes.
+    pub socks5_check_retention_days: i64,
+    /// Maximum age of an ONLINE Resource × Node result that may be used by the
+    /// Stage 4 recommendation/create path.
+    pub relay_recommend_health_ttl_seconds: i64,
+    /// Critical load thresholds. Load remains a soft sorting factor below
+    /// these values; at or above them the candidate is marked overloaded.
+    pub relay_recommend_max_cpu_percent: f64,
+    pub relay_recommend_max_memory_percent: f64,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_path", &self.database_path)
+            .field("listen", &self.listen)
+            .field("key", &"***")
+            .field("jwt_secret", &"***")
+            .field("public_dir", &self.public_dir)
+            .field("public_panel_url", &self.public_panel_url)
+            .field("registration_enabled", &self.registration_enabled)
+            .field("cors_origins", &self.cors_origins)
+            .field("geoip_enabled", &self.geoip_enabled)
+            .field("geoip_cache_ttl", &self.geoip_cache_ttl)
+            .field(
+                "socks5_credential_key",
+                &self.socks5_credential_key.as_ref().map(|_| "***"),
+            )
+            .field("socks5_check_urls", &self.socks5_check_urls)
+            .field("socks5_check_concurrency", &self.socks5_check_concurrency)
+            .field(
+                "socks5_check_retention_days",
+                &self.socks5_check_retention_days,
+            )
+            .field(
+                "relay_recommend_health_ttl_seconds",
+                &self.relay_recommend_health_ttl_seconds,
+            )
+            .field(
+                "relay_recommend_max_cpu_percent",
+                &self.relay_recommend_max_cpu_percent,
+            )
+            .field(
+                "relay_recommend_max_memory_percent",
+                &self.relay_recommend_max_memory_percent,
+            )
+            .finish()
+    }
 }
 
 impl Config {
@@ -104,6 +162,38 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(604_800); // 7 days
+        let socks5_credential_key = std::env::var("SOCKS5_CREDENTIAL_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let socks5_check_urls = std::env::var("SOCKS5_CHECK_URLS")
+            .or_else(|_| std::env::var("SOCKS5_CHECK_URL"))
+            .unwrap_or_else(|_| "https://api.ipify.org,https://ifconfig.me/ip".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .take(4)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let socks5_check_concurrency = std::env::var("SOCKS5_CHECK_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(50)
+            .clamp(1, 500);
+        let socks5_check_retention_days = std::env::var("SOCKS5_CHECK_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(30)
+            .clamp(1, 3650);
+        let relay_recommend_health_ttl_seconds =
+            std::env::var("RELAY_RECOMMEND_HEALTH_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(600)
+                .clamp(30, 86_400);
+        let relay_recommend_max_cpu_percent =
+            parse_percent_env("RELAY_RECOMMEND_MAX_CPU_PERCENT", 95.0);
+        let relay_recommend_max_memory_percent =
+            parse_percent_env("RELAY_RECOMMEND_MAX_MEMORY_PERCENT", 95.0);
 
         let cfg = Self {
             database_path,
@@ -116,6 +206,13 @@ impl Config {
             cors_origins,
             geoip_enabled,
             geoip_cache_ttl,
+            socks5_credential_key,
+            socks5_check_urls,
+            socks5_check_concurrency,
+            socks5_check_retention_days,
+            relay_recommend_health_ttl_seconds,
+            relay_recommend_max_cpu_percent,
+            relay_recommend_max_memory_percent,
         };
         cfg.validate();
         cfg
@@ -139,6 +236,15 @@ impl Config {
     }
 }
 
+fn parse_percent_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+        .clamp(1.0, 100.0)
+}
+
 /// v0.4.16: parse `GEOIP_ENABLED` into a boolean. Extracted as a pure function
 /// so the truth table is unit-testable.
 ///
@@ -160,7 +266,35 @@ fn parse_geoip_enabled(raw: Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_geoip_enabled;
+    use super::{parse_geoip_enabled, Config};
+
+    #[test]
+    fn config_debug_redacts_all_secret_values() {
+        let config = Config {
+            database_path: "sqlite:test.db".into(),
+            listen: "127.0.0.1:18888".into(),
+            key: "panel-key-secret".into(),
+            jwt_secret: "jwt-secret-value".into(),
+            public_dir: "public".into(),
+            public_panel_url: "https://panel.example".into(),
+            registration_enabled: false,
+            cors_origins: vec![],
+            geoip_enabled: false,
+            geoip_cache_ttl: 60,
+            socks5_credential_key: Some("socks5-key-secret".into()),
+            socks5_check_urls: vec!["https://api.ipify.org".into()],
+            socks5_check_concurrency: 50,
+            socks5_check_retention_days: 30,
+            relay_recommend_health_ttl_seconds: 600,
+            relay_recommend_max_cpu_percent: 95.0,
+            relay_recommend_max_memory_percent: 95.0,
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("panel-key-secret"));
+        assert!(!rendered.contains("jwt-secret-value"));
+        assert!(!rendered.contains("socks5-key-secret"));
+        assert!(rendered.contains("***"));
+    }
 
     /// v0.4.16: pin the GEOIP_ENABLED truth table. The default flipped from
     /// false (v0.4.15, opt-in) to true (opt-out). This test guards against a

@@ -57,6 +57,15 @@ function renderDashboard() {
 }
 
 describe('Dashboard group aggregation', () => {
+  it('preserves the Alpha6 version check and manual check control', async () => {
+    mockAll([]);
+    renderDashboard();
+    await flush();
+
+    expect(mockGet).toHaveBeenCalledWith('/system/version');
+    expect(screen.getByRole('button', { name: /checkUpdate/ })).toBeInTheDocument();
+  });
+
   it('renders one row per group with online/total and aggregates the rate', async () => {
     mockAll([
       ns(1, { node_id: 'a', online: true, upload_bps: 100, download_bps: 200, connections: 3 }),

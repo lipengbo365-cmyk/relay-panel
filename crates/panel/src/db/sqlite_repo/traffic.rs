@@ -25,12 +25,33 @@ use relay_shared::protocol::TrafficEntry;
 //   - only after COMMIT succeeds do we return Ok(vec![Ok]).
 #[async_trait]
 impl TrafficRepository for SqliteRepository {
-    async fn apply_traffic_batch(
+    async fn apply_traffic_batch_once(
         &self,
         group_id: i64,
+        report_id: Option<&str>,
         entries: &[TrafficEntry],
     ) -> Result<Vec<TrafficEntryResult>, DbError> {
         let mut tx = self.pool.begin().await?;
+
+        if let Some(report_id) = report_id {
+            let inserted = sqlx::query(
+                "INSERT INTO traffic_report_receipts(group_id,report_id) VALUES(?,?)
+                 ON CONFLICT(group_id,report_id) DO NOTHING",
+            )
+            .bind(group_id)
+            .bind(report_id)
+            .execute(&mut *tx)
+            .await?;
+            if inserted.rows_affected() == 0 {
+                tx.commit().await?;
+                return Ok(vec![TrafficEntryResult::Ok]);
+            }
+            sqlx::query(
+                "DELETE FROM traffic_report_receipts WHERE created_at < datetime('now','-30 days')",
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // ── v1.0.8: read this group's billing rate once for the whole batch
         // (every entry in a batch is for the SAME group_id — the node reports

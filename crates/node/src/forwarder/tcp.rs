@@ -163,7 +163,7 @@ pub async fn serve_tcp_listener(
 /// Classify whether an `accept` error is worth retrying. Transient OS-level
 /// resource exhaustion (too many open files, out of memory) clears on its own;
 /// retrying is the right call. A bad-fd or closed-listener error is permanent.
-fn is_transient_accept_error(e: &std::io::Error) -> bool {
+pub(crate) fn is_transient_accept_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
         e.kind(),
@@ -246,6 +246,18 @@ async fn handle_tcp_connection(
         }
     };
 
+    relay_tcp_stream(inbound, outbound, client_addr, rate_limit, counter, rule_id).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relay_tcp_stream(
+    inbound: TcpStream,
+    outbound: TcpStream,
+    client_addr: SocketAddr,
+    rate_limit: RateLimit,
+    counter: Arc<TrafficCounter>,
+    rule_id: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::debug!("TCP: {} -> {}", client_addr, outbound.peer_addr()?);
 
     // v1.0.8: ZERO-COPY fast path. An UNLIMITED rule on Linux is forwarded with

@@ -1,4 +1,4 @@
-use crate::api::node::extract_node_token;
+use crate::api::node::{extract_node_token, node_identity_hash};
 use crate::api::AppState;
 use axum::{
     extract::{
@@ -54,13 +54,69 @@ impl NodeConnections {
     ) -> (u64, mpsc::UnboundedReceiver<String>) {
         let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
-        self.inner
-            .write()
-            .await
-            .entry(group_id)
-            .or_default()
-            .insert(conn_id, ConnEntry { tx, node_id });
+        let mut map = self.inner.write().await;
+        let group = map.entry(group_id).or_default();
+        // A physical node identity has exactly one authoritative WS session.
+        // Dropping the old sender makes its socket task exit and prevents a
+        // reconnect from leaving two sessions eligible for directed commands.
+        if let Some(ref identity) = node_id {
+            group.retain(|_, entry| entry.node_id.as_ref() != Some(identity));
+        }
+        group.insert(conn_id, ConnEntry { tx, node_id });
         (conn_id, rx)
+    }
+
+    /// Return the opaque generation of the current WS session for a node.
+    /// It is not an authentication secret; it binds a challenge to one exact
+    /// already-authenticated connection so old sessions cannot finish it.
+    pub async fn node_session(&self, group_id: i64, node_id: &str) -> Option<String> {
+        self.inner.read().await.get(&group_id).and_then(|conns| {
+            conns
+                .iter()
+                .find(|(_, entry)| entry.node_id.as_deref() == Some(node_id))
+                .map(|(conn_id, _)| conn_id.to_string())
+        })
+    }
+
+    pub async fn is_current_node_session(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        session_id: &str,
+    ) -> bool {
+        self.node_session(group_id, node_id).await.as_deref() == Some(session_id)
+    }
+
+    /// Race-safe directed send: if the node reconnected after the caller read
+    /// `session_id`, no command is delivered to either the old or new session.
+    pub async fn send_node_session(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        session_id: &str,
+        msg: &str,
+    ) -> usize {
+        let mut map = self.inner.write().await;
+        let Some(conns) = map.get_mut(&group_id) else {
+            return 0;
+        };
+        let expected = session_id.parse::<u64>().ok();
+        let mut sent = 0;
+        conns.retain(|conn_id, entry| {
+            if Some(*conn_id) != expected || entry.node_id.as_deref() != Some(node_id) {
+                return true;
+            }
+            if entry.tx.send(msg.to_owned()).is_ok() {
+                sent = 1;
+                true
+            } else {
+                false
+            }
+        });
+        if conns.is_empty() {
+            map.remove(&group_id);
+        }
+        sent
     }
 
     /// Remove a connection. Called when the socket task exits.
@@ -178,6 +234,21 @@ impl NodeConnections {
         let mut map = self.inner.write().await;
         map.remove(&group_id).map(|conns| conns.len()).unwrap_or(0)
     }
+
+    /// Close the current authoritative session for one physical node.
+    pub async fn close_node(&self, group_id: i64, node_id: &str) -> usize {
+        let mut map = self.inner.write().await;
+        let Some(conns) = map.get_mut(&group_id) else {
+            return 0;
+        };
+        let before = conns.len();
+        conns.retain(|_, entry| entry.node_id.as_deref() != Some(node_id));
+        let removed = before - conns.len();
+        if conns.is_empty() {
+            map.remove(&group_id);
+        }
+        removed
+    }
 }
 
 /// WebSocket endpoint for node control channel.
@@ -243,12 +314,45 @@ pub async fn node_ws_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let Some(node_id) = node_id else {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(identity_hash) = node_identity_hash(&headers) else {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    };
+
+    // TOFU registration is atomic in the repository. Once a node_key is
+    // bound, a sibling holding only the shared group token cannot claim it.
+    let seen_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let physical_relay_node_id = match state
+        .db
+        .upsert_relay_node_seen(group_id, &node_id, &identity_hash, "", &seen_at)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => return axum::http::StatusCode::FORBIDDEN.into_response(),
+        Err(error) => {
+            tracing::warn!("node websocket identity authentication failed: {}", error);
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     // Clone the Arc<dyn Repository> so the WS task can keep using it after the
     // upgrade handler returns. The pool snapshot is shared read-only.
     let db = state.db.clone();
+    let socks5_credential_key = crate::api::node::sensitive_config_allowed(&state, &headers)
+        .then(|| state.config.socks5_credential_key.clone())
+        .flatten();
 
     ws.on_upgrade(move |socket| {
-        handle_node_ws(socket, group_id, node_id, db, state.node_connections)
+        handle_node_ws(
+            socket,
+            group_id,
+            Some(node_id),
+            db,
+            state.node_connections,
+            socks5_credential_key,
+            physical_relay_node_id,
+        )
     })
 }
 
@@ -258,6 +362,8 @@ async fn handle_node_ws(
     node_id: Option<String>,
     db: std::sync::Arc<dyn crate::db::Repository>,
     node_connections: NodeConnections,
+    socks5_credential_key: Option<String>,
+    physical_relay_node_id: i64,
 ) {
     tracing::info!(
         "websocket connected: group_id={} node_id={:?}",
@@ -273,7 +379,14 @@ async fn handle_node_ws(
     // Send initial config snapshot so a freshly-connected node has its config
     // immediately, without waiting for the first HTTP poll. None (DB error) →
     // skip the push; the node will get its config on the next HTTP poll.
-    if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {
+    if let Some(config) = build_config_snapshot(
+        db.as_ref(),
+        group_id,
+        socks5_credential_key.as_deref(),
+        Some(physical_relay_node_id),
+    )
+    .await
+    {
         if let Ok(config_json) = serde_json::to_string(&config) {
             let _ = sender.send(Message::Text(config_json.into())).await;
         }
@@ -337,6 +450,8 @@ async fn handle_node_ws(
 async fn build_config_snapshot(
     db: &dyn crate::db::Repository,
     group_id: i64,
+    socks5_credential_key: Option<&str>,
+    physical_relay_node_id: Option<i64>,
 ) -> Option<NodeConfigResponse> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
@@ -348,7 +463,14 @@ async fn build_config_snapshot(
     // Returns None on DB error so the caller skips the snapshot push (rather
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
-    match crate::service::node_config::build_node_config(db, group_id).await {
+    match crate::service::node_config::build_node_config_for_node(
+        db,
+        group_id,
+        socks5_credential_key,
+        physical_relay_node_id,
+    )
+    .await
+    {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             tracing::error!(
@@ -521,5 +643,41 @@ mod tests {
         assert!(ids.contains("node-b"));
         // An empty group → empty set.
         assert!(conns.online_node_ids(42).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_replaces_session_and_rejects_old_session_send() {
+        let conns = NodeConnections::new();
+        let (_, mut old_rx) = conns.register(1, Some("node-a".into())).await;
+        let old_session = conns.node_session(1, "node-a").await.unwrap();
+        let (_, mut new_rx) = conns.register(1, Some("node-a".into())).await;
+        let new_session = conns.node_session(1, "node-a").await.unwrap();
+
+        assert_ne!(old_session, new_session);
+        assert!(old_rx.recv().await.is_none(), "old session must be closed");
+        assert_eq!(
+            conns
+                .send_node_session(1, "node-a", &old_session, "stale")
+                .await,
+            0
+        );
+        assert_eq!(
+            conns
+                .send_node_session(1, "node-a", &new_session, "fresh")
+                .await,
+            1
+        );
+        assert_eq!(new_rx.recv().await.as_deref(), Some("fresh"));
+    }
+
+    #[tokio::test]
+    async fn close_node_removes_only_the_rotated_identity_session() {
+        let conns = NodeConnections::new();
+        let (_, mut node_a) = conns.register(1, Some("node-a".into())).await;
+        let (_, mut node_b) = conns.register(1, Some("node-b".into())).await;
+        assert_eq!(conns.close_node(1, "node-a").await, 1);
+        assert!(node_a.recv().await.is_none());
+        assert_eq!(conns.send_node(1, "node-b", "still-live").await, 1);
+        assert_eq!(node_b.recv().await.as_deref(), Some("still-live"));
     }
 }

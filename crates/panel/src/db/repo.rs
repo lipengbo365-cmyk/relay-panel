@@ -31,6 +31,298 @@ use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
 use serde::Serialize;
 
 use super::error::DbError;
+use super::health_orchestration::{
+    ConditionalWriteOutcome, HealthItemClaimRequest, HealthItemDispatchRequest,
+    HealthItemTransition, HealthJobCreateOutcome, HealthJobIdempotencyOutcome,
+    HealthJobItemListQuery, HealthJobItemRecord, HealthJobListQuery, HealthJobReconcileOutcome,
+    HealthJobRecord, HealthLeaseRenewRequest, HealthPairCoordinationRequest, HealthPairLeaseRecord,
+    HealthPolicyPatch, HealthPolicyRecord, NewHealthJob, NewHealthJobIdempotency, NewHealthJobItem,
+    NewHealthPolicy, PairLeaseAcquireOutcome, PairLeaseAcquireRequest,
+};
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5ResourceRecord {
+    pub id: i64,
+    pub name: String,
+    pub host: String,
+    pub port: i32,
+    pub username: Option<String>,
+    pub password_ciphertext: Option<String>,
+    pub password_nonce: Option<String>,
+    pub password_key_version: i32,
+    pub country: String,
+    pub country_code: String,
+    pub region: String,
+    pub city: String,
+    pub isp: String,
+    pub remark: String,
+    pub tags: String,
+    pub status: String,
+    pub enabled: bool,
+    pub detected_exit_ip: Option<String>,
+    pub detected_country: Option<String>,
+    pub latency_ms: Option<i32>,
+    pub consecutive_failures: i32,
+    pub health_generation: i64,
+    pub last_check_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone)]
+pub struct BulkSocks5Resource {
+    pub name: String,
+    pub host: String,
+    pub port: i32,
+    pub username: Option<String>,
+    pub password_ciphertext: Option<String>,
+    pub password_nonce: Option<String>,
+    pub password_key_version: i32,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct BulkImportOutcome {
+    pub created: usize,
+    pub updated: usize,
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Socks5ResourceQuery {
+    pub search: Option<String>,
+    pub status: Option<String>,
+    pub country: Option<String>,
+    pub detected_country: Option<String>,
+    pub tag: Option<String>,
+    pub enabled: Option<bool>,
+    pub sort: String,
+    pub descending: bool,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct RelayNodeRecord {
+    pub id: i64,
+    pub device_group_id: i64,
+    pub node_key: String,
+    #[serde(skip_serializing)]
+    pub identity_secret_hash: String,
+    pub name: String,
+    pub country: String,
+    pub country_code: String,
+    pub region: String,
+    pub city: String,
+    pub provider: String,
+    pub public_ip: String,
+    pub advertise_host: String,
+    pub bandwidth_mbps: i32,
+    pub remark: String,
+    pub tags: String,
+    pub enabled: bool,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct Socks5HealthRecord {
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub status: String,
+    pub tcp_latency_ms: Option<i32>,
+    pub handshake_latency_ms: Option<i32>,
+    pub connect_latency_ms: Option<i32>,
+    pub total_latency_ms: Option<i32>,
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub error_stage: Option<String>,
+    pub error_code: Option<String>,
+    pub safe_error_message: Option<String>,
+    pub consecutive_failures: i32,
+    pub checked_at: String,
+    pub last_success_at: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5LatestHealthRecord {
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub relay_node_name: String,
+    pub status: String,
+    pub total_latency_ms: Option<i32>,
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub consecutive_failures: i32,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct Socks5CheckHistoryRecord {
+    pub id: i64,
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub status: String,
+    pub tcp_latency_ms: Option<i32>,
+    pub handshake_latency_ms: Option<i32>,
+    pub connect_latency_ms: Option<i32>,
+    pub total_latency_ms: Option<i32>,
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub error_stage: Option<String>,
+    pub error_code: Option<String>,
+    pub safe_error_message: Option<String>,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5RuleConfigRecord {
+    pub rule_id: i64,
+    pub socks5_resource_id: i64,
+    pub relay_node_id: Option<i64>,
+    pub selection_mode: String,
+    pub relay_node_enabled: Option<bool>,
+    pub remote_dns: bool,
+    pub relay_username: Option<String>,
+    pub relay_password_ciphertext: Option<String>,
+    pub relay_password_nonce: Option<String>,
+    pub relay_password_key_version: i32,
+    pub allow_no_auth: bool,
+    pub resource_name: String,
+    pub resource_host: String,
+    pub resource_port: i32,
+    pub resource_username: Option<String>,
+    pub resource_password_ciphertext: Option<String>,
+    pub resource_password_nonce: Option<String>,
+    pub resource_password_key_version: i32,
+    pub resource_enabled: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5RuleViewRecord {
+    pub rule_id: i64,
+    pub name: String,
+    pub listen_port: i32,
+    pub device_group_in: i64,
+    pub connect_host: String,
+    pub paused: bool,
+    pub traffic_used: i64,
+    pub socks5_resource_id: i64,
+    pub resource_name: String,
+    pub detected_exit_ip: Option<String>,
+    pub detected_country: Option<String>,
+    pub relay_node_id: Option<i64>,
+    pub relay_node_name: Option<String>,
+    pub relay_node_country_code: Option<String>,
+    pub advertise_host: Option<String>,
+    pub relay_node_public_ip: Option<String>,
+    pub relay_node_enabled: Option<bool>,
+    pub selection_mode: String,
+    pub relay_username: Option<String>,
+    pub allow_no_auth: bool,
+    pub remote_dns: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RelayNodeCapacityRecord {
+    pub relay_node_id: i64,
+    pub device_group_id: i64,
+    pub port_range: String,
+    pub port_used: i64,
+    pub group_type: String,
+    pub group_capabilities: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Socks5RecommendationHealthRecord {
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub status: String,
+    pub total_latency_ms: Option<i32>,
+    pub exit_ip: Option<String>,
+    pub country: Option<String>,
+    pub checked_at: String,
+    pub resource_revision: i64,
+    pub generation: i64,
+    pub current_generation: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SmartRelayCreateInput {
+    pub actor_id: i64,
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub name: String,
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub requested_port: Option<i32>,
+    pub expected_resource_revision: i64,
+    pub expected_health_generation: i64,
+    pub expected_health_checked_at: String,
+    pub selection_mode: String,
+    pub relay_username: String,
+    pub relay_password_ciphertext: String,
+    pub relay_password_nonce: String,
+    pub relay_password_key_version: i32,
+    pub health_ttl_seconds: i64,
+    pub required_protocol_version: u32,
+    pub max_cpu_percent: f64,
+    pub max_memory_percent: f64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct SmartRelayCreatedRecord {
+    pub rule_id: i64,
+    pub relay_node_id: i64,
+    pub resource_id: i64,
+    pub endpoint_host: String,
+    pub listen_port: i32,
+    pub relay_username: String,
+    pub exit_ip: String,
+    pub exit_country: Option<String>,
+    pub selection_mode: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SmartRelayReceiptRecord {
+    pub request_fingerprint: String,
+    pub rule_id: i64,
+    pub relay_node_id: i64,
+    pub resource_id: i64,
+    pub endpoint_host: String,
+    pub listen_port: i32,
+    pub relay_username: String,
+    pub exit_ip: String,
+    pub exit_country: Option<String>,
+    pub selection_mode: String,
+}
+
+impl SmartRelayReceiptRecord {
+    pub fn created(self) -> SmartRelayCreatedRecord {
+        SmartRelayCreatedRecord {
+            rule_id: self.rule_id,
+            relay_node_id: self.relay_node_id,
+            resource_id: self.resource_id,
+            endpoint_host: self.endpoint_host,
+            listen_port: self.listen_port,
+            relay_username: self.relay_username,
+            exit_ip: self.exit_ip,
+            exit_country: self.exit_country,
+            selection_mode: self.selection_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SmartRelayCreateOutcome {
+    Created(SmartRelayCreatedRecord),
+    Replay(SmartRelayCreatedRecord),
+    Rejected(&'static str),
+    QuotaExceeded,
+}
 
 // ── Resource scoping (v0.4.10 multi-user isolation) ──
 
@@ -431,6 +723,379 @@ pub trait RuleRepository: Send + Sync {
     async fn list_active_for_config(&self, group_id: i64) -> Result<Vec<ForwardRule>, DbError>;
 }
 
+// ── SOCKS5 resources + rule extensions ──
+
+#[async_trait]
+pub trait Socks5Repository: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_socks5_resource(
+        &self,
+        name: &str,
+        host: &str,
+        port: i32,
+        username: Option<&str>,
+        password_ciphertext: Option<&str>,
+        password_nonce: Option<&str>,
+        password_key_version: i32,
+        country: &str,
+        country_code: &str,
+        region: &str,
+        city: &str,
+        isp: &str,
+        remark: &str,
+        enabled: bool,
+    ) -> Result<i64, DbError>;
+
+    async fn list_socks5_resources(&self) -> Result<Vec<Socks5ResourceRecord>, DbError>;
+    async fn query_socks5_resources(
+        &self,
+        query: &Socks5ResourceQuery,
+    ) -> Result<(Vec<Socks5ResourceRecord>, i64), DbError>;
+    async fn list_latest_socks5_health_for_resources(
+        &self,
+        resource_ids: &[i64],
+    ) -> Result<Vec<Socks5LatestHealthRecord>, DbError>;
+    async fn find_socks5_resources_by_keys(
+        &self,
+        keys: &[(String, i32, Option<String>)],
+    ) -> Result<Vec<Socks5ResourceRecord>, DbError>;
+    async fn bulk_import_socks5_resources(
+        &self,
+        rows: &[BulkSocks5Resource],
+        update_credentials: bool,
+    ) -> Result<BulkImportOutcome, DbError>;
+    async fn find_socks5_resource(&self, id: i64) -> Result<Option<Socks5ResourceRecord>, DbError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_socks5_resource_full(
+        &self,
+        id: i64,
+        name: &str,
+        host: &str,
+        port: i32,
+        username: Option<&str>,
+        password_ciphertext: Option<&str>,
+        password_nonce: Option<&str>,
+        password_key_version: i32,
+        country: &str,
+        country_code: &str,
+        region: &str,
+        city: &str,
+        isp: &str,
+        remark: &str,
+        enabled: bool,
+    ) -> Result<u64, DbError>;
+
+    async fn set_socks5_resource_enabled(&self, id: i64, enabled: bool) -> Result<u64, DbError>;
+    async fn bulk_set_socks5_resources_enabled(
+        &self,
+        ids: &[i64],
+        enabled: bool,
+    ) -> Result<u64, DbError>;
+    async fn bulk_set_socks5_resource_tags(
+        &self,
+        ids: &[i64],
+        tags_json: &str,
+    ) -> Result<u64, DbError>;
+    /// Deletes only unreferenced resources atomically and returns
+    /// (deleted_count, resource/rule blockers).
+    async fn bulk_delete_socks5_resources_guarded(
+        &self,
+        ids: &[i64],
+    ) -> Result<(u64, Vec<(i64, i64)>), DbError>;
+    async fn delete_socks5_resource(&self, id: i64) -> Result<u64, DbError>;
+    async fn count_socks5_resource_bindings(&self, id: i64) -> Result<i64, DbError>;
+    async fn find_socks5_rule_config(
+        &self,
+        rule_id: i64,
+    ) -> Result<Option<Socks5RuleConfigRecord>, DbError>;
+    async fn list_socks5_rule_views(&self) -> Result<Vec<Socks5RuleViewRecord>, DbError>;
+    async fn list_relay_node_capacities(&self) -> Result<Vec<RelayNodeCapacityRecord>, DbError>;
+    async fn list_socks5_recommendation_health(
+        &self,
+        resource_id: i64,
+    ) -> Result<Vec<Socks5RecommendationHealthRecord>, DbError>;
+
+    async fn create_smart_relay(
+        &self,
+        input: &SmartRelayCreateInput,
+    ) -> Result<SmartRelayCreateOutcome, DbError>;
+    async fn find_smart_relay_receipt(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+    ) -> Result<Option<SmartRelayReceiptRecord>, DbError>;
+    async fn find_smart_relay_idempotency_fingerprint(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, DbError>;
+
+    /// Atomically create the forward_rules row and its SOCKS5 extension.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_socks5_rule_full(
+        &self,
+        name: &str,
+        uid: i64,
+        listen_port: i32,
+        device_group_in: i64,
+        socks5_resource_id: i64,
+        remote_dns: bool,
+        relay_username: Option<&str>,
+        relay_password_ciphertext: Option<&str>,
+        relay_password_nonce: Option<&str>,
+        relay_password_key_version: i32,
+        allow_no_auth: bool,
+        enabled: bool,
+    ) -> Result<Option<i64>, DbError>;
+
+    /// Atomically update the generic rule row and its SOCKS5 binding while
+    /// preserving the separately-managed inbound credential.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_socks5_rule_full(
+        &self,
+        rule_id: i64,
+        name: &str,
+        listen_port: i32,
+        device_group_in: i64,
+        socks5_resource_id: i64,
+        remote_dns: bool,
+        enabled: bool,
+    ) -> Result<u64, DbError>;
+
+    async fn reset_socks5_rule_credential(
+        &self,
+        rule_id: i64,
+        relay_username: &str,
+        relay_password_ciphertext: &str,
+        relay_password_nonce: &str,
+        relay_password_key_version: i32,
+    ) -> Result<u64, DbError>;
+
+    async fn upsert_relay_node_seen(
+        &self,
+        device_group_id: i64,
+        node_key: &str,
+        identity_secret_hash: &str,
+        public_ip: &str,
+        seen_at: &str,
+    ) -> Result<Option<i64>, DbError>;
+    async fn list_relay_nodes(&self) -> Result<Vec<RelayNodeRecord>, DbError>;
+    async fn find_relay_node(&self, id: i64) -> Result<Option<RelayNodeRecord>, DbError>;
+    async fn replace_relay_node_identity(
+        &self,
+        id: i64,
+        identity_secret_hash: &str,
+    ) -> Result<u64, DbError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn update_relay_node(
+        &self,
+        id: i64,
+        name: &str,
+        country: &str,
+        country_code: &str,
+        region: &str,
+        city: &str,
+        provider: &str,
+        advertise_host: &str,
+        bandwidth_mbps: i32,
+        remark: &str,
+        tags: &str,
+        enabled: bool,
+    ) -> Result<u64, DbError>;
+    /// Atomically advances the per-resource check generation. A result may
+    /// mutate health only while this generation remains current.
+    async fn begin_socks5_health_check(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+    ) -> Result<Option<(Socks5ResourceRecord, i64)>, DbError>;
+    /// Stage 5 dispatch variant: advances generation only if the resource is
+    /// still enabled and has the revision whose credential was just decrypted.
+    async fn begin_socks5_health_check_if_resource_generation(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        expected_resource_generation: i64,
+    ) -> Result<Option<(Socks5ResourceRecord, i64)>, DbError>;
+    /// Returns false when the resource was deleted or a newer check/update has
+    /// superseded this generation.
+    async fn record_socks5_health(
+        &self,
+        health: &Socks5HealthRecord,
+        resource_generation: i64,
+        generation: i64,
+    ) -> Result<bool, DbError>;
+    async fn list_socks5_health(
+        &self,
+        resource_id: i64,
+    ) -> Result<Vec<Socks5HealthRecord>, DbError>;
+    async fn list_socks5_check_history(
+        &self,
+        resource_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Socks5CheckHistoryRecord>, DbError>;
+    async fn prune_socks5_check_history(&self, cutoff: &str) -> Result<u64, DbError>;
+}
+
+// ── Stage 5 durable health orchestration persistence ──
+
+#[async_trait]
+pub trait HealthOrchestrationRepository: Send + Sync {
+    async fn create_health_policy(&self, input: &NewHealthPolicy) -> Result<i64, DbError>;
+    async fn find_health_policy(&self, id: i64) -> Result<Option<HealthPolicyRecord>, DbError>;
+    async fn update_health_policy(
+        &self,
+        id: i64,
+        expected_revision: i64,
+        patch: &HealthPolicyPatch,
+        now_ms: i64,
+    ) -> Result<HealthPolicyRecord, DbError>;
+
+    async fn create_health_job(
+        &self,
+        job: &NewHealthJob,
+        items: &[NewHealthJobItem],
+    ) -> Result<HealthJobCreateOutcome, DbError>;
+    async fn create_health_job_idempotent(
+        &self,
+        job: &NewHealthJob,
+        items: &[NewHealthJobItem],
+        key: &NewHealthJobIdempotency,
+    ) -> Result<HealthJobCreateOutcome, DbError>;
+    async fn lookup_health_job_idempotency(
+        &self,
+        actor_id: i64,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        now_ms: i64,
+    ) -> Result<HealthJobIdempotencyOutcome, DbError>;
+    async fn find_health_job(&self, id: &str) -> Result<Option<HealthJobRecord>, DbError>;
+    async fn list_health_jobs(
+        &self,
+        query: &HealthJobListQuery,
+    ) -> Result<Vec<HealthJobRecord>, DbError>;
+    async fn list_health_job_items(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn list_health_job_items_page(
+        &self,
+        query: &HealthJobItemListQuery,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn find_health_job_item(
+        &self,
+        item_id: i64,
+    ) -> Result<Option<HealthJobItemRecord>, DbError>;
+    async fn claim_health_job_items(
+        &self,
+        request: &HealthItemClaimRequest,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn begin_health_item_dispatch(
+        &self,
+        request: &HealthItemDispatchRequest,
+    ) -> Result<Option<HealthJobItemRecord>, DbError>;
+    async fn renew_health_item_and_pair_lease(
+        &self,
+        request: &HealthLeaseRenewRequest,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn list_expired_health_job_items(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn list_overdue_health_job_items(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<HealthJobItemRecord>, DbError>;
+    async fn reconcile_health_job_counters(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<HealthJobReconcileOutcome>, DbError>;
+    async fn transition_health_job_item(
+        &self,
+        transition: &HealthItemTransition,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn cancel_health_job(&self, job_id: &str, now_ms: i64) -> Result<bool, DbError>;
+    async fn finalize_health_job(&self, job_id: &str, now_ms: i64) -> Result<bool, DbError>;
+    async fn retry_failed_health_pairs(
+        &self,
+        parent_job_id: &str,
+    ) -> Result<Vec<(i64, i64)>, DbError>;
+
+    async fn acquire_health_pair_lease(
+        &self,
+        request: PairLeaseAcquireRequest<'_>,
+    ) -> Result<PairLeaseAcquireOutcome, DbError>;
+    async fn acquire_health_pair_coordination(
+        &self,
+        request: HealthPairCoordinationRequest<'_>,
+    ) -> Result<PairLeaseAcquireOutcome, DbError>;
+    async fn renew_health_pair_coordination(
+        &self,
+        request: HealthPairCoordinationRequest<'_>,
+        expected_pair_fence: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn release_health_pair_coordination(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        lease_owner: &str,
+        expected_pair_fence: i64,
+        now_ms: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn renew_health_pair_lease(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        item_id: i64,
+        lease_owner: &str,
+        expected_pair_fence: i64,
+        lease_expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn release_health_pair_lease(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+        item_id: i64,
+        lease_owner: &str,
+        expected_pair_fence: i64,
+        now_ms: i64,
+    ) -> Result<ConditionalWriteOutcome, DbError>;
+    async fn find_health_pair_lease(
+        &self,
+        resource_id: i64,
+        relay_node_id: i64,
+    ) -> Result<Option<HealthPairLeaseRecord>, DbError>;
+
+    async fn list_terminal_health_job_prune_candidates(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DbError>;
+    async fn prune_terminal_health_jobs(&self, cutoff_ms: i64, limit: i64) -> Result<u64, DbError>;
+    async fn list_released_health_pair_lease_prune_candidates(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, i64)>, DbError>;
+    async fn prune_released_health_pair_leases(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<u64, DbError>;
+    async fn prune_expired_health_job_idempotency(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<u64, DbError>;
+}
+
 // ── Group (device_groups) ──
 
 #[async_trait]
@@ -680,6 +1345,18 @@ pub trait TrafficRepository: Send + Sync {
     async fn apply_traffic_batch(
         &self,
         group_id: i64,
+        entries: &[TrafficEntry],
+    ) -> Result<Vec<TrafficEntryResult>, DbError> {
+        self.apply_traffic_batch_once(group_id, None, entries).await
+    }
+
+    /// Apply one node report exactly once. A repeated `(group_id, report_id)`
+    /// succeeds without applying the delta again. The idempotency marker and
+    /// all accounting writes share one transaction.
+    async fn apply_traffic_batch_once(
+        &self,
+        group_id: i64,
+        report_id: Option<&str>,
         entries: &[TrafficEntry],
     ) -> Result<Vec<TrafficEntryResult>, DbError>;
 
@@ -1261,6 +1938,8 @@ pub trait Repository:
     + OrderRepository
     + RedeemRepository
     + AnnouncementRepository
+    + Socks5Repository
+    + HealthOrchestrationRepository
     + Send
     + Sync
 {

@@ -10,6 +10,7 @@ mod profiles;
 mod rules;
 mod settings;
 mod shop;
+mod socks5;
 mod users;
 
 pub use groups::*;
@@ -19,6 +20,7 @@ pub use profiles::*;
 pub use rules::*;
 pub use settings::*;
 pub use shop::*;
+pub use socks5::*;
 pub use users::*;
 
 /// A user WITHOUT the password hash — for API responses. Never expose the
@@ -158,10 +160,18 @@ mod tests {
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
+                socks5_credential_key: Some("11".repeat(32)),
+                socks5_check_urls: vec!["https://api.ipify.org".into()],
+                socks5_check_concurrency: 50,
+                socks5_check_retention_days: 30,
+                relay_recommend_health_ttl_seconds: 600,
+                relay_recommend_max_cpu_percent: 95.0,
+                relay_recommend_max_memory_percent: 95.0,
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),
             diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
+            socks5_checks: crate::api::socks5_health::Socks5CheckRegistry::new(),
             geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),

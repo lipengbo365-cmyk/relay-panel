@@ -22,8 +22,14 @@
 use crate::db::error::DbError;
 use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfileRepository};
 use crate::db::Repository;
+use crate::service::credentials::CredentialCipher;
 use relay_shared::models::{DeviceGroup, ForwardRule};
-use relay_shared::protocol::NodeConfigResponse;
+use relay_shared::protocol::{
+    IngressConfig, NodeConfigResponse, SecretString, Socks5InboundAuth, UpstreamConfig,
+};
+
+const RESOURCE_PASSWORD_PURPOSE: &str = "socks5-resource-password";
+const RELAY_PASSWORD_PURPOSE: &str = "socks5-relay-password";
 
 /// Build the full [`NodeConfigResponse`] for a device group.
 ///
@@ -42,9 +48,35 @@ use relay_shared::protocol::NodeConfigResponse;
 ///
 /// Returns `Ok(empty)` only for a legitimate empty state (non-`in` group, or an
 /// `in` group with no matching rules). A DB error is `Err`.
+#[cfg(test)]
 pub async fn build_node_config(
     db: &dyn Repository,
     group_id: i64,
+) -> Result<NodeConfigResponse, DbError> {
+    build_node_config_with_key(db, group_id, None).await
+}
+
+/// Build node configuration and decrypt SOCKS5 credentials only at the final
+/// serialization boundary. A missing/invalid key skips SOCKS5 listeners while
+/// leaving legacy direct rules available.
+#[cfg(test)]
+pub async fn build_node_config_with_key(
+    db: &dyn Repository,
+    group_id: i64,
+    credential_key: Option<&str>,
+) -> Result<NodeConfigResponse, DbError> {
+    build_node_config_for_node(db, group_id, credential_key, None).await
+}
+
+/// Build configuration for one authenticated physical relay node. A Stage 4
+/// binding is filtered before either inbound or upstream credentials are
+/// decrypted. `None` exists only for legacy tests/callers and can receive only
+/// unbound alpha3-compatible rules.
+pub async fn build_node_config_for_node(
+    db: &dyn Repository,
+    group_id: i64,
+    credential_key: Option<&str>,
+    physical_relay_node_id: Option<i64>,
 ) -> Result<NodeConfigResponse, DbError> {
     // 1. Group + "in" gate. Non-`in` groups (out / monitor / chained_outbound)
     //    never receive listeners — they are egress/observation only.
@@ -73,6 +105,116 @@ pub async fn build_node_config(
     //    drift between paths.
     let mut listeners = Vec::new();
     for rule in &rules {
+        if let Some(binding) = db.find_socks5_rule_config(rule.id).await? {
+            if let Some(bound_node_id) = binding.relay_node_id {
+                if physical_relay_node_id != Some(bound_node_id)
+                    || binding.relay_node_enabled != Some(true)
+                {
+                    continue;
+                }
+            }
+            if !binding.resource_enabled {
+                tracing::warn!(
+                    rule_id = rule.id,
+                    resource_id = binding.socks5_resource_id,
+                    "SOCKS5 resource is disabled; listener omitted"
+                );
+                continue;
+            }
+            let cipher = match CredentialCipher::from_config(credential_key) {
+                Ok(cipher) => cipher,
+                Err(error) => {
+                    tracing::error!(
+                        rule_id = rule.id,
+                        error = ?error,
+                        "SOCKS5 credential key unavailable; listener omitted"
+                    );
+                    continue;
+                }
+            };
+            let upstream_password = match decrypt_optional(
+                &cipher,
+                binding.resource_password_ciphertext.as_deref(),
+                binding.resource_password_nonce.as_deref(),
+                binding.resource_password_key_version,
+                RESOURCE_PASSWORD_PURPOSE,
+            ) {
+                Ok(password) => password,
+                Err(()) => {
+                    tracing::error!(
+                        rule_id = rule.id,
+                        resource_id = binding.socks5_resource_id,
+                        "SOCKS5 upstream credential decryption failed; listener omitted"
+                    );
+                    continue;
+                }
+            };
+            if binding.resource_username.is_some() != upstream_password.is_some() {
+                tracing::error!(
+                    rule_id = rule.id,
+                    resource_id = binding.socks5_resource_id,
+                    "SOCKS5 upstream credential pair is incomplete; listener omitted"
+                );
+                continue;
+            }
+            let inbound_auth = if binding.allow_no_auth {
+                Socks5InboundAuth::NoAuth
+            } else {
+                let Some(username) = binding.relay_username else {
+                    tracing::error!(
+                        rule_id = rule.id,
+                        "relay username missing; listener omitted"
+                    );
+                    continue;
+                };
+                let password = match decrypt_optional(
+                    &cipher,
+                    binding.relay_password_ciphertext.as_deref(),
+                    binding.relay_password_nonce.as_deref(),
+                    binding.relay_password_key_version,
+                    RELAY_PASSWORD_PURPOSE,
+                ) {
+                    Ok(Some(password)) => password,
+                    _ => {
+                        tracing::error!(
+                            rule_id = rule.id,
+                            "relay credential decryption failed; listener omitted"
+                        );
+                        continue;
+                    }
+                };
+                Socks5InboundAuth::UsernamePassword {
+                    username,
+                    password: SecretString::new(password),
+                }
+            };
+            let mut built = relay_shared::protocol::build_listeners_for_rule(rule, Vec::new());
+            let Some(mut listener) = built.pop() else {
+                tracing::error!(rule_id = rule.id, "SOCKS5 listener expansion failed");
+                continue;
+            };
+            listener.ingress = IngressConfig::Socks5 { auth: inbound_auth };
+            listener.upstream = UpstreamConfig::Socks5 {
+                resource_id: binding.socks5_resource_id,
+                resource_name: binding.resource_name,
+                host: binding.resource_host,
+                port: u16::try_from(binding.resource_port).unwrap_or_default(),
+                username: binding.resource_username,
+                password: upstream_password.map(SecretString::new),
+                remote_dns: binding.remote_dns,
+            };
+            if listener.port == 0
+                || matches!(&listener.upstream, UpstreamConfig::Socks5 { port: 0, .. })
+            {
+                tracing::error!(
+                    rule_id = rule.id,
+                    "invalid SOCKS5 listener endpoint; omitted"
+                );
+                continue;
+            }
+            listeners.push(listener);
+            continue;
+        }
         // v0.4.7: if the rule is bound to a tunnel profile, the profile is the
         // source of transport config (node_transport + ws_path). We resolve it
         // here and override the rule's stored columns for this build only — the
@@ -126,6 +268,23 @@ pub async fn build_node_config(
     Ok(NodeConfigResponse { listeners })
 }
 
+fn decrypt_optional(
+    cipher: &CredentialCipher,
+    ciphertext: Option<&str>,
+    nonce: Option<&str>,
+    version: i32,
+    purpose: &str,
+) -> Result<Option<String>, ()> {
+    match (ciphertext, nonce) {
+        (None, None) => Ok(None),
+        (Some(ciphertext), Some(nonce)) => cipher
+            .decrypt(ciphertext, nonce, version, purpose)
+            .map(Some)
+            .map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
 /// Resolve a rule's target address list.
 ///
 /// - `forward_mode = "direct"` OR `device_group_out` is NULL → the rule's own
@@ -177,6 +336,7 @@ async fn resolve_targets(db: &dyn Repository, rule: &ForwardRule) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::repo::TrafficRepository;
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -419,5 +579,232 @@ mod tests {
             cfg.listeners.is_empty(),
             "a rule bound to a missing profile must be skipped, not downgraded"
         );
+    }
+
+    #[tokio::test]
+    async fn socks5_rule_is_decrypted_only_at_config_boundary_and_fails_closed_without_key() {
+        use crate::service::credentials::CredentialCipher;
+        use relay_shared::protocol::{IngressConfig, Socks5InboundAuth, UpstreamConfig};
+
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 20000).await;
+        let key = "11".repeat(32);
+        let cipher = CredentialCipher::from_config(Some(&key)).unwrap();
+        let (upstream_ciphertext, upstream_nonce, upstream_version) = cipher
+            .encrypt("upstream-secret", RESOURCE_PASSWORD_PURPOSE)
+            .unwrap();
+        let (relay_ciphertext, relay_nonce, relay_version) = cipher
+            .encrypt("relay-secret", RELAY_PASSWORD_PURPOSE)
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_resources
+             (id, name, host, port, username, password_ciphertext, password_nonce,
+              password_key_version, enabled)
+             VALUES (7, 'mock-upstream', '127.0.0.1', 1080, 'up-user', ?, ?, ?, 1)",
+        )
+        .bind(&upstream_ciphertext)
+        .bind(&upstream_nonce)
+        .bind(upstream_version)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_rule_bindings
+             (rule_id, socks5_resource_id, remote_dns, relay_username,
+              relay_password_ciphertext, relay_password_nonce,
+              relay_password_key_version, allow_no_auth)
+             VALUES (100, 7, 1, 'relay-user', ?, ?, ?, 0)",
+        )
+        .bind(&relay_ciphertext)
+        .bind(&relay_nonce)
+        .bind(relay_version)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let config = build_node_config_with_key(&repo(&pool), 10, Some(&key))
+            .await
+            .unwrap();
+        assert_eq!(config.listeners.len(), 1);
+        let listener = &config.listeners[0];
+        assert!(listener.targets.is_empty());
+        match &listener.ingress {
+            IngressConfig::Socks5 {
+                auth: Socks5InboundAuth::UsernamePassword { username, password },
+            } => {
+                assert_eq!(username, "relay-user");
+                assert_eq!(password.expose(), "relay-secret");
+            }
+            other => panic!("unexpected ingress: {other:?}"),
+        }
+        match &listener.upstream {
+            UpstreamConfig::Socks5 {
+                resource_id,
+                host,
+                port,
+                username,
+                password,
+                remote_dns,
+                ..
+            } => {
+                assert_eq!(*resource_id, 7);
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(*port, 1080);
+                assert_eq!(username.as_deref(), Some("up-user"));
+                assert_eq!(
+                    password.as_ref().map(|value| value.expose()),
+                    Some("upstream-secret")
+                );
+                assert!(*remote_dns);
+            }
+            other => panic!("unexpected upstream: {other:?}"),
+        }
+        let serialized = serde_json::to_string(listener).unwrap();
+        assert!(
+            serialized.contains("relay-secret"),
+            "wire config carries the runtime secret"
+        );
+        assert!(!serialized.contains(&relay_ciphertext));
+        assert!(!serialized.contains(&upstream_ciphertext));
+
+        let repository = repo(&pool);
+        let results = repository
+            .apply_traffic_batch(
+                10,
+                &[relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: 120,
+                    download: 80,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let rule_traffic: i64 =
+            sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id = 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let user_traffic: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rule_traffic, 200);
+        assert_eq!(user_traffic, 200);
+
+        let fail_closed = build_node_config_with_key(&repo(&pool), 10, None)
+            .await
+            .unwrap();
+        assert!(fail_closed.listeners.is_empty());
+
+        sqlx::query("UPDATE socks5_resources SET enabled = 0 WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let disabled_resource = build_node_config_with_key(&repo(&pool), 10, Some(&key))
+            .await
+            .unwrap();
+        assert!(
+            disabled_resource.listeners.is_empty(),
+            "a disabled upstream resource must remove the listener"
+        );
+
+        sqlx::query("UPDATE socks5_resources SET enabled = 1 WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE forward_rules SET paused = 1 WHERE id = 100")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let paused_rule = build_node_config_with_key(&repo(&pool), 10, Some(&key))
+            .await
+            .unwrap();
+        assert!(
+            paused_rule.listeners.is_empty(),
+            "a paused SOCKS5 rule must remove the listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage4_rule_is_visible_only_to_its_bound_physical_node() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 20000).await;
+        for (id, node_key) in [(21_i64, "node-a"), (22_i64, "node-b")] {
+            sqlx::query(
+                "INSERT INTO relay_nodes
+                 (id,device_group_id,node_key,identity_secret_hash,name,public_ip,
+                  first_seen_at,last_seen_at)
+                 VALUES(?,10,?,?,'node','192.0.2.10',datetime('now'),datetime('now'))",
+            )
+            .bind(id)
+            .bind(node_key)
+            .bind("a".repeat(64))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let key = "11".repeat(32);
+        let cipher = CredentialCipher::from_config(Some(&key)).unwrap();
+        let (upstream_ciphertext, upstream_nonce, upstream_version) = cipher
+            .encrypt("upstream-secret", RESOURCE_PASSWORD_PURPOSE)
+            .unwrap();
+        let (relay_ciphertext, relay_nonce, relay_version) = cipher
+            .encrypt("relay-secret", RELAY_PASSWORD_PURPOSE)
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_resources
+             (id,name,host,port,username,password_ciphertext,password_nonce,
+              password_key_version,enabled)
+             VALUES(7,'upstream','198.51.100.7',1080,'up-user',?,?,?,1)",
+        )
+        .bind(upstream_ciphertext)
+        .bind(upstream_nonce)
+        .bind(upstream_version)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO socks5_rule_bindings
+             (rule_id,socks5_resource_id,relay_node_id,selection_mode,remote_dns,
+              relay_username,relay_password_ciphertext,relay_password_nonce,
+              relay_password_key_version,allow_no_auth)
+             VALUES(100,7,21,'RECOMMENDED',1,'relay-user',?,?,?,0)",
+        )
+        .bind(relay_ciphertext)
+        .bind(relay_nonce)
+        .bind(relay_version)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let node_a = build_node_config_for_node(&repo(&pool), 10, Some(&key), Some(21))
+            .await
+            .unwrap();
+        assert_eq!(node_a.listeners.len(), 1);
+        let serialized_a = serde_json::to_string(&node_a).unwrap();
+        assert!(serialized_a.contains("upstream-secret"));
+
+        let node_b = build_node_config_for_node(&repo(&pool), 10, Some(&key), Some(22))
+            .await
+            .unwrap();
+        assert!(node_b.listeners.is_empty());
+        let serialized_b = serde_json::to_string(&node_b).unwrap();
+        assert!(!serialized_b.contains("upstream-secret"));
+        assert!(!serialized_b.contains("relay-secret"));
+
+        sqlx::query("UPDATE relay_nodes SET enabled=0 WHERE id=21")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let disabled = build_node_config_for_node(&repo(&pool), 10, Some(&key), Some(21))
+            .await
+            .unwrap();
+        assert!(disabled.listeners.is_empty());
     }
 }

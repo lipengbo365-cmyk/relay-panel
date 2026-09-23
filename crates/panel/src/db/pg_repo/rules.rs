@@ -10,10 +10,15 @@ use relay_shared::models::ForwardRule;
 impl RuleRepository for PgRepository {
     async fn list_rules(&self, scope: &ResourceScope) -> Result<Vec<ForwardRule>, DbError> {
         let mut rules: Vec<ForwardRule> = match scope.owner_id() {
-            None => sqlx::query_as("SELECT * FROM forward_rules ORDER BY id"),
-            Some(uid) => {
-                sqlx::query_as("SELECT * FROM forward_rules WHERE uid = $1 ORDER BY id").bind(uid)
-            }
+            None => sqlx::query_as(
+                "SELECT * FROM forward_rules f WHERE NOT EXISTS
+                 (SELECT 1 FROM socks5_rule_bindings b WHERE b.rule_id=f.id) ORDER BY id",
+            ),
+            Some(uid) => sqlx::query_as(
+                "SELECT * FROM forward_rules f WHERE uid = $1 AND NOT EXISTS
+                     (SELECT 1 FROM socks5_rule_bindings b WHERE b.rule_id=f.id) ORDER BY id",
+            )
+            .bind(uid),
         }
         .fetch_all(&self.pool)
         .await?;
@@ -321,18 +326,7 @@ impl RuleRepository for PgRepository {
 
         let mut tx = self.pool.begin().await?;
 
-        // Per-group advisory lock (released automatically at tx end).
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(device_group_in)
-            .execute(&mut *tx)
-            .await?;
-
-        // Lock the user row. If the user doesn't exist, there's nothing to lock
-        // and the INSERT's FK on uid would fail anyway — let it surface naturally.
-        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
-            .bind(uid)
-            .fetch_optional(&mut *tx)
-            .await?;
+        super::lock_rule_creation_scope(&mut tx, &[device_group_in], uid).await?;
 
         // Port-conflict pre-check: same inbound group + same port + an
         // overlapping socket type. A pure-TCP and a pure-UDP rule do NOT conflict.
@@ -460,18 +454,7 @@ impl RuleRepository for PgRepository {
         // insert_quota_guarded so no deadlock cycle can form.
         try_!(
             tx,
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(device_group_in)
-                .execute(&mut *tx)
-                .await
-        );
-
-        try_!(
-            tx,
-            sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
-                .bind(uid)
-                .fetch_optional(&mut *tx)
-                .await
+            super::lock_rule_creation_scope(&mut tx, &[device_group_in], uid).await
         );
 
         let conflict: Option<(i32,)> = try_!(

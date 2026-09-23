@@ -160,6 +160,149 @@ CREATE TABLE IF NOT EXISTS forward_rule_targets (
 CREATE INDEX IF NOT EXISTS idx_forward_rule_targets_rule_position
     ON forward_rule_targets (rule_id, position);
 
+CREATE TABLE IF NOT EXISTS socks5_resources (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+    username TEXT,
+    password_ciphertext TEXT,
+    password_nonce TEXT,
+    password_key_version INTEGER NOT NULL DEFAULT 1,
+    country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+    isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'UNKNOWN'
+        CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    health_generation BIGINT NOT NULL DEFAULT 0,
+    last_check_at TEXT, last_success_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+        OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+    UNIQUE(host, port, username)
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter
+    ON socks5_resources(enabled, status, country_code);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms, id);
+CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth
+    ON socks5_resources(host, port, COALESCE(username, ''));
+
+CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
+    rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+    socks5_resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+    relay_node_id BIGINT,
+    selection_mode TEXT NOT NULL DEFAULT 'LEGACY'
+        CHECK (selection_mode IN ('LEGACY','RECOMMENDED','MANUAL')),
+    remote_dns BOOLEAN NOT NULL DEFAULT TRUE,
+    relay_username TEXT,
+    relay_password_ciphertext TEXT,
+    relay_password_nonce TEXT,
+    relay_password_key_version INTEGER NOT NULL DEFAULT 1,
+    allow_no_auth BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    CHECK ((allow_no_auth = TRUE AND relay_username IS NULL
+             AND relay_password_ciphertext IS NULL AND relay_password_nonce IS NULL)
+        OR (allow_no_auth = FALSE AND relay_username IS NOT NULL
+             AND relay_password_ciphertext IS NOT NULL AND relay_password_nonce IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource
+    ON socks5_rule_bindings(socks5_resource_id);
+CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_node
+    ON socks5_rule_bindings(relay_node_id);
+
+CREATE TABLE IF NOT EXISTS relay_nodes (
+    id BIGSERIAL PRIMARY KEY,
+    device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+    identity_secret_hash TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
+    advertise_host TEXT NOT NULL DEFAULT '',
+    bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps >= 0), remark TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]', enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    UNIQUE(device_group_id, node_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id);
+CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code, enabled);
+
+CREATE TABLE IF NOT EXISTS socks5_check_generations (
+    resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    generation BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY(resource_id, relay_node_id)
+);
+
+CREATE TABLE IF NOT EXISTS socks5_resource_health (
+    resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+    tcp_latency_ms INTEGER, handshake_latency_ms INTEGER, connect_latency_ms INTEGER,
+    total_latency_ms INTEGER, exit_ip TEXT, country TEXT, error_stage TEXT,
+    error_code TEXT, safe_error_message TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    resource_revision BIGINT NOT NULL DEFAULT 0, generation BIGINT NOT NULL DEFAULT 0,
+    checked_at TEXT NOT NULL, last_success_at TEXT,
+    PRIMARY KEY(resource_id, relay_node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_health_node_status ON socks5_resource_health(relay_node_id, status, checked_at);
+CREATE INDEX IF NOT EXISTS idx_socks5_health_exit_ip ON socks5_resource_health(exit_ip);
+
+CREATE TABLE IF NOT EXISTS socks5_check_history (
+    id BIGSERIAL PRIMARY KEY,
+    resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+    relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')), tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
+    connect_latency_ms INTEGER, total_latency_ms INTEGER, exit_ip TEXT, country TEXT,
+    error_stage TEXT, error_code TEXT, safe_error_message TEXT, checked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node ON socks5_check_history(resource_id, relay_node_id, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at ON socks5_check_history(checked_at);
+
+CREATE TABLE IF NOT EXISTS relay_creation_receipts (
+    id BIGSERIAL PRIMARY KEY,
+    actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    rule_id BIGINT NOT NULL CONSTRAINT relay_creation_receipts_rule_fk
+        REFERENCES forward_rules(id) ON DELETE CASCADE,
+    relay_node_id BIGINT NOT NULL,
+    resource_id BIGINT NOT NULL,
+    endpoint_host TEXT NOT NULL,
+    listen_port INTEGER NOT NULL,
+    relay_username TEXT NOT NULL,
+    exit_ip TEXT NOT NULL,
+    exit_country TEXT,
+    selection_mode TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    UNIQUE(actor_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created
+    ON relay_creation_receipts(created_at);
+
+CREATE TABLE IF NOT EXISTS relay_creation_idempotency_keys (
+    actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    PRIMARY KEY(actor_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_creation_idempotency_keys_created
+    ON relay_creation_idempotency_keys(created_at);
+
 CREATE TABLE IF NOT EXISTS statistics (
     id BIGSERIAL PRIMARY KEY,
     stat_type TEXT NOT NULL,
@@ -215,6 +358,15 @@ CREATE TABLE IF NOT EXISTS traffic_history (
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts);
 CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts);
+
+CREATE TABLE IF NOT EXISTS traffic_report_receipts (
+    group_id BIGINT NOT NULL,
+    report_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    PRIMARY KEY (group_id, report_id)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_report_receipts_created
+    ON traffic_report_receipts(created_at);
 
 -- v1.2.4: hourly node metrics (mirrors the SQLite baseline — see there for why
 -- sum+samples+max instead of a running average, and why there is no FK).
@@ -379,7 +531,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 27;
+pub const PG_SCHEMA_VERSION: i32 = 37;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -504,7 +656,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
 
     // Already at (or beyond) the version this build understands — nothing to do.
     if current >= PG_SCHEMA_VERSION {
-        return Ok(());
+        return validate_pg_health_schema(pool).await;
     }
 
     if current < 2 {
@@ -1446,6 +1598,500 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         );
     }
 
+    if current < 28 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_resources (
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL,
+                port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+                username TEXT, password_ciphertext TEXT, password_nonce TEXT,
+                password_key_version INTEGER NOT NULL DEFAULT 1,
+                country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+                isp TEXT NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'UNKNOWN'
+                CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                detected_exit_ip TEXT, detected_country TEXT, latency_ms INTEGER,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_check_at TEXT, last_success_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                CHECK ((username IS NULL AND password_ciphertext IS NULL AND password_nonce IS NULL)
+                    OR (username IS NOT NULL AND password_ciphertext IS NOT NULL AND password_nonce IS NOT NULL)),
+                UNIQUE(host, port, username)
+            )",
+        ).execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_resources_filter ON socks5_resources(enabled, status, country_code)")
+            .execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_name ON socks5_resources(name)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_socks5_resources_endpoint_auth ON socks5_resources(host, port, COALESCE(username, ''))")
+            .execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_rule_bindings (
+                rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+                socks5_resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE RESTRICT,
+                remote_dns BOOLEAN NOT NULL DEFAULT TRUE,
+                relay_username TEXT, relay_password_ciphertext TEXT, relay_password_nonce TEXT,
+                relay_password_key_version INTEGER NOT NULL DEFAULT 1,
+                allow_no_auth BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                CHECK ((allow_no_auth = TRUE AND relay_username IS NULL
+                         AND relay_password_ciphertext IS NULL AND relay_password_nonce IS NULL)
+                    OR (allow_no_auth = FALSE AND relay_username IS NOT NULL
+                         AND relay_password_ciphertext IS NOT NULL AND relay_password_nonce IS NOT NULL))
+            )",
+        ).execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_resource ON socks5_rule_bindings(socks5_resource_id)")
+            .execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (28) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 28: SOCKS5 resources and rule bindings present");
+    }
+
+    if current < 29 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS traffic_report_receipts (
+                group_id BIGINT NOT NULL,
+                report_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                PRIMARY KEY (group_id, report_id)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_traffic_report_receipts_created
+             ON traffic_report_receipts(created_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (29) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 29: traffic report receipts present");
+    }
+
+    if current < 30 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE socks5_resources ADD COLUMN IF NOT EXISTS tags TEXT NOT NULL DEFAULT '[]'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_nodes (
+                id BIGSERIAL PRIMARY KEY,
+                device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+                node_key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+                identity_secret_hash TEXT NOT NULL DEFAULT '',
+                country TEXT NOT NULL DEFAULT '', country_code TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '', public_ip TEXT NOT NULL DEFAULT '',
+                bandwidth_mbps INTEGER NOT NULL DEFAULT 0, remark TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]', enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')),
+                updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')),
+                UNIQUE(device_group_id,node_key)
+            )",
+        ).execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_relay_nodes_group ON relay_nodes(device_group_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_relay_nodes_country ON relay_nodes(country_code,enabled)").execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_resource_health (
+                resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+                relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN')),
+                tcp_latency_ms INTEGER, handshake_latency_ms INTEGER, connect_latency_ms INTEGER,
+                total_latency_ms INTEGER, exit_ip TEXT, country TEXT, error_stage TEXT,
+                error_code TEXT, safe_error_message TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                checked_at TEXT NOT NULL, last_success_at TEXT,
+                PRIMARY KEY(resource_id,relay_node_id)
+            )",
+        ).execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_health_node_status ON socks5_resource_health(relay_node_id,status,checked_at)").execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_health_exit_ip ON socks5_resource_health(exit_ip)").execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_check_history (
+                id BIGSERIAL PRIMARY KEY,
+                resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+                relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+                status TEXT NOT NULL, tcp_latency_ms INTEGER, handshake_latency_ms INTEGER,
+                connect_latency_ms INTEGER, total_latency_ms INTEGER, exit_ip TEXT, country TEXT,
+                error_stage TEXT, error_code TEXT, safe_error_message TEXT, checked_at TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_resource_node ON socks5_check_history(resource_id,relay_node_id,checked_at DESC)").execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_socks5_history_checked_at ON socks5_check_history(checked_at)").execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(30) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 30: relay nodes and SOCKS5 health tables present");
+    }
+
+    if current < 31 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE socks5_resources ADD COLUMN IF NOT EXISTS health_generation BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(31) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 31: SOCKS5 health generation present");
+    }
+
+    if current < 32 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE relay_nodes ADD COLUMN IF NOT EXISTS identity_secret_hash TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS socks5_check_generations (
+                resource_id BIGINT NOT NULL REFERENCES socks5_resources(id) ON DELETE CASCADE,
+                relay_node_id BIGINT NOT NULL REFERENCES relay_nodes(id) ON DELETE CASCADE,
+                generation BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY(resource_id,relay_node_id)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE socks5_resources DROP CONSTRAINT IF EXISTS socks5_resources_status_check",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE socks5_resources ADD CONSTRAINT socks5_resources_status_check CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN'))",
+        )
+        .execute(&mut *tx)
+        .await?;
+        for statement in [
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_country ON socks5_resources(country_code,id)",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_status ON socks5_resources(status,id)",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_enabled ON socks5_resources(enabled,id)",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_latency ON socks5_resources(latency_ms,id)",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_resources_last_check ON socks5_resources(last_check_at,id)",
+            "ALTER TABLE relay_nodes DROP CONSTRAINT IF EXISTS relay_nodes_bandwidth_mbps_check",
+            "ALTER TABLE relay_nodes ADD CONSTRAINT relay_nodes_bandwidth_mbps_check CHECK (bandwidth_mbps >= 0)",
+            "ALTER TABLE socks5_check_history DROP CONSTRAINT IF EXISTS socks5_check_history_status_check",
+            "ALTER TABLE socks5_check_history ADD CONSTRAINT socks5_check_history_status_check CHECK (status IN ('ONLINE','OFFLINE','AUTH_FAILED','TIMEOUT','CONNECT_FAILED','DISABLED','UNKNOWN'))",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(32) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 32: physical relay-node identity proof present");
+    }
+
+    if current < 33 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "ALTER TABLE relay_nodes ADD COLUMN IF NOT EXISTS advertise_host TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE socks5_rule_bindings ADD COLUMN IF NOT EXISTS relay_node_id BIGINT",
+            "ALTER TABLE socks5_rule_bindings ADD COLUMN IF NOT EXISTS selection_mode TEXT NOT NULL DEFAULT 'LEGACY'",
+            "ALTER TABLE socks5_resource_health ADD COLUMN IF NOT EXISTS resource_revision BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE socks5_resource_health ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS idx_socks5_rule_bindings_node ON socks5_rule_bindings(relay_node_id)",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='socks5_rule_bindings_relay_node_fk') THEN
+                    ALTER TABLE socks5_rule_bindings ADD CONSTRAINT socks5_rule_bindings_relay_node_fk
+                    FOREIGN KEY(relay_node_id) REFERENCES relay_nodes(id) ON DELETE RESTRICT;
+                END IF;
+             END $$",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='socks5_rule_bindings_selection_mode_check') THEN
+                    ALTER TABLE socks5_rule_bindings ADD CONSTRAINT socks5_rule_bindings_selection_mode_check
+                    CHECK(selection_mode IN ('LEGACY','RECOMMENDED','MANUAL'));
+                END IF;
+             END $$",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_creation_receipts (
+                id BIGSERIAL PRIMARY KEY,
+                actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                rule_id BIGINT NOT NULL,
+                relay_node_id BIGINT NOT NULL,
+                resource_id BIGINT NOT NULL,
+                endpoint_host TEXT NOT NULL,
+                listen_port INTEGER NOT NULL,
+                relay_username TEXT NOT NULL,
+                exit_ip TEXT NOT NULL,
+                exit_country TEXT,
+                selection_mode TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')),
+                UNIQUE(actor_id,idempotency_key)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_relay_creation_receipts_created ON relay_creation_receipts(created_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(33) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 33: Stage 4 smart relay binding present");
+    }
+
+    if current < 34 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS relay_creation_idempotency_keys (
+                actor_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')),
+                PRIMARY KEY(actor_id,idempotency_key)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_relay_creation_idempotency_keys_created
+             ON relay_creation_idempotency_keys(created_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO relay_creation_idempotency_keys
+             (actor_id,idempotency_key,request_fingerprint,created_at)
+             SELECT actor_id,idempotency_key,request_fingerprint,created_at
+             FROM relay_creation_receipts
+             ON CONFLICT(actor_id,idempotency_key) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM relay_creation_receipts r
+             WHERE NOT EXISTS (SELECT 1 FROM forward_rules f WHERE f.id=r.rule_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname='relay_creation_receipts_rule_fk'
+                      AND conrelid='relay_creation_receipts'::regclass
+                ) THEN
+                    ALTER TABLE relay_creation_receipts
+                    ADD CONSTRAINT relay_creation_receipts_rule_fk
+                    FOREIGN KEY(rule_id) REFERENCES forward_rules(id) ON DELETE CASCADE;
+                END IF;
+             END $$",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version(version) VALUES(34) ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 34: smart relay receipt lifecycle integrity present");
+    }
+
+    if current < 35 {
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema=current_schema() AND table_name = ANY($1)",
+        )
+        .bind(crate::db::health_schema::HEALTH_TABLES.as_slice())
+        .fetch_one(pool)
+        .await?;
+        if existing != 0 {
+            return Err(sqlx::Error::Protocol(
+                "PostgreSQL migration 35 found unversioned Stage 5.1 schema".into(),
+            ));
+        }
+        let mut tx = pool.begin().await?;
+        for statement in crate::db::health_schema::POSTGRES_MIGRATION_35 {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query("INSERT INTO schema_version(version) VALUES(35)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 35: durable health orchestration persistence present");
+    }
+
+    if current < 36 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(crate::db::health_schema::POSTGRES_MIGRATION_36)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO schema_version(version) VALUES(36)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 36: durable orchestration retry counter present");
+    }
+
+    if current < 37 {
+        let mut tx = pool.begin().await?;
+        for statement in crate::db::health_schema::POSTGRES_MIGRATION_37 {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query("INSERT INTO schema_version(version) VALUES(37)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 37: health Job finalization audit is unique");
+    }
+
+    validate_pg_health_schema(pool).await?;
+
+    Ok(())
+}
+
+async fn validate_pg_health_schema(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    for table in crate::db::health_schema::HEALTH_TABLES {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema=current_schema() AND table_name=$1",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await?;
+        if count != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "PostgreSQL migration 36 version/schema mismatch: missing {table}"
+            )));
+        }
+    }
+    use sha2::{Digest, Sha256};
+    let manifests = [
+        (
+            "columns",
+            "SELECT string_agg(format('%s|%s|%s|%s|%s',c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),CASE WHEN a.attnotnull THEN 'N' ELSE 'Y' END)||'|'||COALESCE(pg_get_expr(d.adbin,d.adrelid),''), chr(10) ORDER BY c.relname,a.attnum) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND NOT (c.relname='socks5_check_job_items' AND a.attname='retry_count')",
+            crate::db::health_schema::POSTGRES_HEALTH_COLUMN_FINGERPRINT,
+        ),
+        (
+            "constraints",
+            "SELECT string_agg(c.relname||'|'||con.contype::text||'|'||pg_get_constraintdef(con.oid,true), chr(10) ORDER BY c.relname,con.contype::text,pg_get_constraintdef(con.oid,true)) FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND con.contype<>'n' AND pg_get_constraintdef(con.oid,true) NOT LIKE '%retry_count%'",
+            crate::db::health_schema::POSTGRES_HEALTH_CONSTRAINT_FINGERPRINT,
+        ),
+        (
+            "indexes",
+            "SELECT string_agg(tablename||'|'||indexname||'|'||indexdef, chr(10) ORDER BY tablename,indexname) FROM pg_indexes WHERE schemaname=current_schema() AND tablename=ANY($1)",
+            crate::db::health_schema::POSTGRES_HEALTH_INDEX_FINGERPRINT,
+        ),
+    ];
+    for (kind, query, expected) in manifests {
+        let canonical: Option<String> = sqlx::query_scalar(query)
+            .bind(crate::db::health_schema::HEALTH_TABLES.as_slice())
+            .fetch_one(pool)
+            .await?;
+        let actual = canonical
+            .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
+            .unwrap_or_default();
+        if actual != expected {
+            return Err(sqlx::Error::Protocol(format!(
+                "PostgreSQL migration 35 version/schema mismatch: {kind} manifest {actual}, expected {expected}"
+            )));
+        }
+    }
+    let retry_column: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT data_type,is_nullable,column_default IN ('0','0::bigint') FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='socks5_check_job_items' AND column_name='retry_count'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if retry_column != Some(("bigint".into(), "NO".into(), true)) {
+        return Err(sqlx::Error::Protocol(
+            format!(
+                "PostgreSQL migration 36 version/schema mismatch: retry_count column differs: {retry_column:?}"
+            ),
+        ));
+    }
+    let retry_check: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname='socks5_check_job_items' AND con.contype='c' AND pg_get_constraintdef(con.oid,true)='CHECK (retry_count >= 0)')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !retry_check {
+        return Err(sqlx::Error::Protocol(
+            "PostgreSQL migration 36 version/schema mismatch: retry_count constraint missing"
+                .into(),
+        ));
+    }
+    let finalized_audit_index: Option<(bool, String, String)> = sqlx::query_as(
+        "SELECT i.indisunique,pg_get_indexdef(i.indexrelid),pg_get_expr(i.indpred,i.indrelid)
+         FROM pg_index i
+         JOIN pg_class idx ON idx.oid=i.indexrelid
+         JOIN pg_class tbl ON tbl.oid=i.indrelid
+         JOIN pg_namespace n ON n.oid=tbl.relnamespace
+         WHERE n.nspname=current_schema() AND idx.relname='uq_audit_health_job_finalized'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let valid_finalized_audit_index =
+        finalized_audit_index
+            .as_ref()
+            .is_some_and(|(unique, definition, predicate)| {
+                let definition = crate::db::health_schema::normalize_schema_sql(definition);
+                let predicate = crate::db::health_schema::normalize_schema_sql(predicate);
+                *unique
+                    && definition.contains("audit_logusingbtree(target_id)")
+                    && predicate.contains("action='job_finalized'::text")
+                    && predicate.contains("target_type='socks5_health_job'::text")
+            });
+    if !valid_finalized_audit_index {
+        return Err(sqlx::Error::Protocol(
+            "PostgreSQL migration 37 version/schema mismatch: health finalization audit index differs"
+                .into(),
+        ));
+    }
     Ok(())
 }
 

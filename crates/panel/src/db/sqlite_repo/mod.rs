@@ -12,12 +12,14 @@ use sqlx::SqlitePool;
 
 mod announcements;
 mod groups;
+mod health_orchestration;
 mod kvs;
 mod orders;
 mod profiles;
 mod redeem;
 mod rules;
 mod settings;
+mod socks5;
 mod stats;
 #[cfg(test)]
 mod tests;

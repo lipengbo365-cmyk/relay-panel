@@ -30,7 +30,12 @@ use serde::{Deserialize, Serialize};
 /// wire fields from ListenerConfig. A v0.4.6 node still expects those fields,
 /// so deserialization would fail or misread — the gate forces a coordinated
 /// upgrade. Also adds node_transport to the listener fingerprint.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 4;
+/// v5 = SOCKS5 relay: ListenerConfig gains explicit ingress and upstream.
+/// v6 = Stage 3 health commands bind a WebSocket session and resource
+/// generation so reconnects and late results fail closed.
+/// descriptors, including short-lived runtime credentials. Older nodes cannot
+/// safely infer this behavior, so panel and node must upgrade together.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 6;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -142,6 +147,15 @@ pub struct ListenerConfig {
     pub rule_id: i64,
     pub port: u16,
     pub protocol: Protocol,
+    /// v2 SOCKS5 relay: the protocol accepted from the client. This is kept
+    /// separate from `protocol`/`node_transport` because a SOCKS5 listener is
+    /// not a transparent raw TCP listener: it must parse the client's CONNECT
+    /// request before choosing the outbound target.
+    pub ingress: IngressConfig,
+    /// How this listener establishes the outbound side. There is deliberately
+    /// no implicit fallback from Socks5 to Direct; a missing or invalid SOCKS5
+    /// configuration makes the listener fail closed.
+    pub upstream: UpstreamConfig,
     /// v0.4.7: the route_mode wire field was removed (the node never read it —
     /// direct/group are resolved identically by the panel). CONFIG_PROTOCOL_VERSION
     /// bumped to 4 so a v0.4.6 node (which expects the field) is gated.
@@ -244,6 +258,11 @@ pub fn build_listeners_for_rule(
             rule_id: rule.id,
             port: rule.listen_port as u16,
             protocol: proto,
+            ingress: match proto {
+                Protocol::Udp => IngressConfig::RawUdp,
+                Protocol::Tcp | Protocol::TcpUdp => IngressConfig::RawTcp,
+            },
+            upstream: UpstreamConfig::Direct,
             node_transport: transport,
             // Per-rule WS path override; None → node uses its built-in "/relay".
             ws_path: rule.ws_path.clone(),
@@ -267,6 +286,62 @@ pub fn build_listeners_for_rule(
             },
         })
         .collect()
+}
+
+/// A serializable secret whose Debug representation is always redacted. The
+/// value still travels in the authenticated node config, but accidental
+/// `{:?}` logging cannot disclose it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Socks5InboundAuth {
+    NoAuth,
+    UsernamePassword {
+        username: String,
+        password: SecretString,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IngressConfig {
+    RawTcp,
+    RawUdp,
+    Socks5 { auth: Socks5InboundAuth },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UpstreamConfig {
+    Direct,
+    Socks5 {
+        resource_id: i64,
+        resource_name: String,
+        host: String,
+        port: u16,
+        username: Option<String>,
+        password: Option<SecretString>,
+        remote_dns: bool,
+    },
 }
 
 /// Note: in NodeConfigResponse, a TcpUdp rule is expanded into TWO separate
@@ -445,8 +520,12 @@ impl NodeTransport {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficReport {
+    /// Stable identifier for one exact traffic delta. The node retries the
+    /// same id and payload until the panel acknowledges it, allowing the panel
+    /// to make ACK-loss retries idempotent.
+    pub report_id: String,
     pub reports: Vec<TrafficEntry>,
 }
 
@@ -531,6 +610,9 @@ pub struct StatusReport {
     /// panel treats a missing value as "incompatible — upgrade".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_protocol_version: Option<u32>,
+    /// Stage 3 low-priority SOCKS5 health-check tasks waiting for a permit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socks5_check_queue_depth: Option<u32>,
     /// Listeners that failed to bind on the node during the last config apply
     /// (e.g. port already in use, permission denied). Surfaced on the panel so
     /// an operator can see WHY a rule isn't forwarding, not just that it isn't.
@@ -844,6 +926,146 @@ pub struct DiagnoseResult {
     /// Per-target probe results (max 32, matching the rule target cap).
     #[serde(default)]
     pub results: Vec<DiagnoseTargetResult>,
+}
+
+// === Stage 3: directed SOCKS5 health checks ===
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Socks5HealthStatus {
+    Online,
+    Offline,
+    AuthFailed,
+    Timeout,
+    ConnectFailed,
+    Disabled,
+    Unknown,
+}
+
+impl Socks5HealthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "ONLINE",
+            Self::Offline => "OFFLINE",
+            Self::AuthFailed => "AUTH_FAILED",
+            Self::Timeout => "TIMEOUT",
+            Self::ConnectFailed => "CONNECT_FAILED",
+            Self::Disabled => "DISABLED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Socks5CheckStage {
+    TcpConnect,
+    Socks5Negotiation,
+    Authentication,
+    Socks5Connect,
+    InternetRequest,
+    ExitIpParse,
+}
+
+impl Socks5CheckStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TcpConnect => "TCP_CONNECT",
+            Self::Socks5Negotiation => "SOCKS5_NEGOTIATION",
+            Self::Authentication => "AUTHENTICATION",
+            Self::Socks5Connect => "SOCKS5_CONNECT",
+            Self::InternetRequest => "INTERNET_REQUEST",
+            Self::ExitIpParse => "EXIT_IP_PARSE",
+        }
+    }
+}
+
+/// Panel → one physical Node. Password Debug is redacted by SecretString and
+/// the command is never written to the Node's disk cache.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Socks5CheckRequest {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    pub challenge: String,
+    /// Opaque identifier for the exact authenticated WebSocket session that
+    /// received this command. Results from an older reconnected session are
+    /// rejected by the panel.
+    pub session_id: String,
+    /// Resource revision captured when the check starts. Credential, endpoint,
+    /// or enabled-state changes invalidate older results across every node.
+    pub resource_generation: i64,
+    /// Monotonic generation for this exact Resource × Node matrix cell.
+    pub generation: i64,
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub node_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<SecretString>,
+    pub check_urls: Vec<String>,
+    pub relay_public_ip: Option<String>,
+}
+
+impl std::fmt::Debug for Socks5CheckRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Socks5CheckRequest")
+            .field("request_id", &self.request_id)
+            .field("resource_id", &self.resource_id)
+            .field("relay_node_id", &self.relay_node_id)
+            .field("node_id", &self.node_id)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username.as_ref().map(|_| "***"))
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("check_urls", &self.check_urls)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Socks5CheckResult {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    pub challenge: String,
+    pub session_id: String,
+    pub resource_generation: i64,
+    pub generation: i64,
+    pub resource_id: i64,
+    pub relay_node_id: i64,
+    pub node_id: String,
+    pub status: Socks5HealthStatus,
+    pub tcp_latency_ms: Option<u64>,
+    pub handshake_latency_ms: Option<u64>,
+    pub connect_latency_ms: Option<u64>,
+    pub total_latency_ms: Option<u64>,
+    pub exit_ip: Option<String>,
+    pub detected_country: Option<String>,
+    pub error_stage: Option<Socks5CheckStage>,
+    pub error_code: Option<String>,
+    pub safe_error_message: Option<String>,
+    pub checked_at: String,
+}
+
+impl std::fmt::Debug for Socks5CheckResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Socks5CheckResult")
+            .field("request_id", &self.request_id)
+            .field("challenge", &"***")
+            .field("session_id", &"***")
+            .field("resource_generation", &self.resource_generation)
+            .field("generation", &self.generation)
+            .field("resource_id", &self.resource_id)
+            .field("relay_node_id", &self.relay_node_id)
+            .field("node_id", &self.node_id)
+            .field("status", &self.status)
+            .field("total_latency_ms", &self.total_latency_ms)
+            .field("exit_ip", &self.exit_ip)
+            .field("error_code", &self.error_code)
+            .finish()
+    }
 }
 
 /// Compare a reported node_version against "0.4.9". Returns true if the node
@@ -1237,6 +1459,51 @@ impl<T: Serialize> ApiResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_debug_is_always_redacted() {
+        let secret = SecretString::new("must-never-appear");
+        let rendered = format!("{secret:?}");
+        assert_eq!(rendered, "***");
+        assert!(!rendered.contains(secret.expose()));
+    }
+
+    #[test]
+    fn socks5_check_request_debug_redacts_credentials() {
+        let request = Socks5CheckRequest {
+            msg_type: "socks5_check".into(),
+            request_id: "request".into(),
+            challenge: "challenge".into(),
+            session_id: "session".into(),
+            resource_generation: 1,
+            generation: 1,
+            resource_id: 1,
+            relay_node_id: 2,
+            node_id: "node-a".into(),
+            host: "proxy.example".into(),
+            port: 1080,
+            username: Some("secret-user".into()),
+            password: Some(SecretString::new("secret-password")),
+            check_urls: vec!["https://api.ipify.org".into()],
+            relay_public_ip: None,
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("secret-user"));
+        assert!(!rendered.contains("secret-password"));
+        assert!(rendered.contains("***"));
+    }
+
+    #[test]
+    fn legacy_listener_without_current_ingress_and_upstream_is_rejected() {
+        let legacy = serde_json::json!({
+            "rule_id": 1,
+            "port": 10001,
+            "protocol": "tcp",
+            "node_transport": "raw",
+            "targets": ["127.0.0.1:80"]
+        });
+        assert!(serde_json::from_value::<ListenerConfig>(legacy).is_err());
+    }
 
     // ── PublicTransport / NodeTransport / RouteMode parsing ──
 

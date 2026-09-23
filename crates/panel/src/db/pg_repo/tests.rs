@@ -11,11 +11,72 @@
 // The schema name embeds the test name + process id for uniqueness.
 
 use super::PgRepository;
+use crate::config::Config;
 use crate::db::error::DbError;
+use crate::db::health_orchestration::*;
 use crate::db::pg_schema::{apply_pg_schema, run_pg_migrations};
 use crate::db::repo::*;
 use relay_shared::protocol::TrafficEntry;
 use sqlx::postgres::PgPoolOptions;
+
+#[tokio::test]
+async fn socks5_bulk_preview_lookup_is_read_only_and_matches_exact_keys() {
+    let Some(db) = repo("socks5_preview_lookup").await else {
+        return;
+    };
+    let mut keys = Vec::new();
+    for index in 0..100 {
+        let host = format!("preview-{index}.example");
+        let port = 1080 + index;
+        let username = (index % 2 == 0).then(|| format!("user:name+{index}@example"));
+        db.insert_socks5_resource(
+            &format!("existing-{index}"),
+            &host,
+            port,
+            username.as_deref(),
+            username.as_ref().map(|_| "ciphertext"),
+            username.as_ref().map(|_| "nonce"),
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        keys.push((host, port, username));
+    }
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    for size in [1, 5, 100] {
+        let found = db
+            .find_socks5_resources_by_keys(&keys[..size])
+            .await
+            .unwrap();
+        assert_eq!(found.len(), size, "lookup size {size}");
+    }
+    let mut with_missing = keys.clone();
+    with_missing.push(("missing.example".into(), 2080, None));
+    assert_eq!(
+        db.find_socks5_resources_by_keys(&with_missing)
+            .await
+            .unwrap()
+            .len(),
+        100
+    );
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM socks5_resources")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!((before, after), (100, 100), "preview lookup must not write");
+    cleanup(&db).await;
+}
 
 /// Read TEST_PG_URL. Returns None if unset → tests skip.
 fn pg_url() -> Option<String> {
@@ -49,6 +110,10 @@ fn replace_db_in_url(url: &str, new_db: &str) -> String {
 /// search_path tricks, no shared-schema collisions. The database is
 /// dropped at the start of the next run with the same suffix.
 async fn repo(suffix: &str) -> Option<PgRepository> {
+    repo_with_connections(suffix, 2).await
+}
+
+async fn repo_with_connections(suffix: &str, max_connections: u32) -> Option<PgRepository> {
     let url = pg_url()?;
 
     // Parse the admin URL to derive the "postgres" maintenance database
@@ -83,7 +148,7 @@ async fn repo(suffix: &str) -> Option<PgRepository> {
     // Connect to the fresh test database and apply the schema.
     let test_url = replace_db_in_url(&url, &db_name);
     let pool = PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(max_connections)
         .connect(&test_url)
         .await
         .expect("connect test db");
@@ -138,6 +203,379 @@ async fn pg_user_find_by_username_distinguishes_banned() {
         .unwrap()
         .is_none());
     assert!(db.find_by_username("alice").await.unwrap().is_some());
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_health_job_finalized_audit_is_atomic_and_exactly_once() {
+    let Some(db) = repo_with_connections("health_finalized_audit", 32).await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('finalized','in','finalized-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('finalized-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'finalized-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+
+    let new_job = |id: &str| NewHealthJob {
+        id: id.into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let items = [NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: Some(10_000),
+    }];
+
+    let job = new_job("pg-finalized-cancel-storm");
+    db.create_health_job(&job, &items).await.unwrap();
+    let db = std::sync::Arc::new(db);
+    let results = futures_util::future::join_all((0..100).map(|_| {
+        let db = db.clone();
+        let job_id = job.id.clone();
+        async move { db.cancel_health_job(&job_id, 2_000).await.unwrap() }
+    }))
+    .await;
+    assert!(results.into_iter().all(|result| result));
+    let stored = db.find_health_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, "CANCELLED");
+    let finished_at = stored.finished_at_ms;
+    for now in 3_000..3_100 {
+        db.reconcile_health_job_counters(now, 500).await.unwrap();
+    }
+    assert_eq!(
+        db.find_health_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .finished_at_ms,
+        finished_at
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1")
+            .bind(&job.id).fetch_one(&db.pool).await.unwrap(),
+        1
+    );
+
+    let rollback_job = new_job("pg-finalized-rollback");
+    db.create_health_job(&rollback_job, &items).await.unwrap();
+    sqlx::query(
+        "CREATE FUNCTION fail_health_finalized() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.action='JOB_FINALIZED' AND NEW.target_id='pg-finalized-rollback' THEN
+             RAISE EXCEPTION 'forced finalized audit failure';
+           END IF;
+           RETURN NEW;
+         END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_health_finalized BEFORE INSERT ON audit_log
+         FOR EACH ROW EXECUTE FUNCTION fail_health_finalized()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(db.cancel_health_job(&rollback_job.id, 4_000).await.is_err());
+    let rolled_back = db.find_health_job(&rollback_job.id).await.unwrap().unwrap();
+    assert_eq!(rolled_back.status, "QUEUED");
+    assert_eq!(rolled_back.finished_at_ms, None);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE target_id=$1")
+            .bind(&rollback_job.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    sqlx::query("DROP TRIGGER fail_health_finalized ON audit_log")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION fail_health_finalized()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db.cancel_health_job(&rollback_job.id, 4_100).await.unwrap());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1")
+            .bind(&rollback_job.id).fetch_one(&db.pool).await.unwrap(),
+        1
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_reconciliation_repairs_missing_finalized_audit_without_rewriting_health_truth() {
+    let Some(db) = repo_with_connections("health_missing_finalized_repair", 32).await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid)
+         VALUES('missing-finalized','in','missing-finalized-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port)
+         VALUES('missing-finalized-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar(
+        "INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at)
+         VALUES($1,'missing-finalized-n','2026-01-01','2026-01-01') RETURNING id",
+    )
+    .bind(group)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let new_job = |id: &str| NewHealthJob {
+        id: id.into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let items = [NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: Some(10_000),
+    }];
+
+    let normal_job = new_job("z-pg-finalized-normal");
+    db.create_health_job(&normal_job, &items).await.unwrap();
+    assert!(db.cancel_health_job(&normal_job.id, 2_000).await.unwrap());
+    let normal_payload: (Option<i64>, String, String) = sqlx::query_as(
+        "SELECT actor_id,actor_name,detail FROM audit_log
+         WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1",
+    )
+    .bind(&normal_job.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let missing_job = new_job("b-pg-finalized-missing");
+    db.create_health_job(&missing_job, &items).await.unwrap();
+    assert!(db.cancel_health_job(&missing_job.id, 2_000).await.unwrap());
+    let before = db.find_health_job(&missing_job.id).await.unwrap().unwrap();
+    sqlx::query(
+        "DELETE FROM audit_log
+         WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1",
+    )
+    .bind(&missing_job.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let drift_job = new_job("a-pg-counter-drift");
+    db.create_health_job(&drift_job, &items).await.unwrap();
+    sqlx::query(
+        "UPDATE socks5_check_jobs
+         SET status='RUNNING',queued_count=0,running_count=1,started_at_ms=1500 WHERE id=$1",
+    )
+    .bind(&drift_job.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let audited_job = new_job("c-pg-finalized-audited");
+    db.create_health_job(&audited_job, &items).await.unwrap();
+    assert!(db.cancel_health_job(&audited_job.id, 2_000).await.unwrap());
+    let live_job = new_job("d-pg-live-correct");
+    db.create_health_job(&live_job, &items).await.unwrap();
+
+    let db = std::sync::Arc::new(db);
+    let outcomes = futures_util::future::join_all((0..32).map(|round| {
+        let db = db.clone();
+        async move {
+            db.reconcile_health_job_counters(3_000 + round, 500)
+                .await
+                .unwrap()
+        }
+    }))
+    .await;
+    let repaired_ids: Vec<String> = outcomes
+        .into_iter()
+        .flatten()
+        .map(|outcome| outcome.job_id)
+        .collect();
+    assert!(repaired_ids.contains(&drift_job.id));
+    assert!(repaired_ids.contains(&missing_job.id));
+    assert!(!repaired_ids.contains(&audited_job.id));
+    assert!(!repaired_ids.contains(&live_job.id));
+
+    let repaired = db.find_health_job(&missing_job.id).await.unwrap().unwrap();
+    assert_eq!(repaired.status, before.status);
+    assert_eq!(repaired.total_items, before.total_items);
+    assert_eq!(repaired.queued_count, before.queued_count);
+    assert_eq!(repaired.running_count, before.running_count);
+    assert_eq!(repaired.succeeded_count, before.succeeded_count);
+    assert_eq!(repaired.failed_count, before.failed_count);
+    assert_eq!(repaired.cancelled_count, before.cancelled_count);
+    assert_eq!(repaired.finished_at_ms, before.finished_at_ms);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1"
+        )
+        .bind(&missing_job.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let repaired_payload: (Option<i64>, String, String) = sqlx::query_as(
+        "SELECT actor_id,actor_name,detail FROM audit_log
+         WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1",
+    )
+    .bind(&missing_job.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(repaired_payload, normal_payload);
+
+    let drift_repaired = db.find_health_job(&drift_job.id).await.unwrap().unwrap();
+    assert_eq!(drift_repaired.status, "RUNNING");
+    assert_eq!(
+        (drift_repaired.queued_count, drift_repaired.running_count),
+        (1, 0)
+    );
+    assert!(db
+        .reconcile_health_job_counters(4_000, 500)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let cancel_replays = futures_util::future::join_all((0..32).map(|_| {
+        let db = db.clone();
+        let job_id = missing_job.id.clone();
+        async move { db.cancel_health_job(&job_id, 5_000).await.unwrap() }
+    }))
+    .await;
+    assert!(cancel_replays.into_iter().all(|result| result));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job' AND target_id=$1"
+        )
+        .bind(&missing_job.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let after_replay = db.find_health_job(&missing_job.id).await.unwrap().unwrap();
+    assert_eq!(after_replay.finished_at_ms, before.finished_at_ms);
+    assert_eq!(after_replay.cancelled_count, before.cancelled_count);
+
+    sqlx::query(
+        "INSERT INTO socks5_check_jobs
+         (id,source,status,request_fingerprint,snapshot_hash,resource_selector_json,
+          node_selector_json,matrix_mode,retry_policy_version,cancel_requested,total_items,
+          queued_count,running_count,succeeded_count,failed_count,cancelled_count,
+          created_at_ms,finished_at_ms)
+         SELECT 'pg-missing-audit-'||lpad(g::text,4,'0'),'MANUAL','CANCELLED',
+                repeat('a',64),repeat('b',64),'{}','{}','CARTESIAN','v1',TRUE,
+                1,0,0,0,0,1,10000+g,2000
+         FROM generate_series(0,999) g",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_check_job_items
+         (job_id,resource_id,relay_node_id,resource_id_snapshot,relay_node_id_snapshot,
+          state,attempt_count,item_fence_token,not_before_ms,completed_after_cancel,
+          created_at_ms,updated_at_ms,finished_at_ms)
+         SELECT id,$1,$2,$1,$2,'CANCELLED',0,0,1000,FALSE,1000,2000,2000
+         FROM socks5_check_jobs WHERE id LIKE 'pg-missing-audit-%'",
+    )
+    .bind(resource)
+    .bind(node)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.reconcile_health_job_counters(6_000, 10_000)
+            .await
+            .unwrap()
+            .len(),
+        500
+    );
+    assert_eq!(
+        db.reconcile_health_job_counters(6_001, 10_000)
+            .await
+            .unwrap()
+            .len(),
+        500
+    );
+    assert!(db
+        .reconcile_health_job_counters(6_002, 10_000)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'
+               AND target_id LIKE 'pg-missing-audit-%'"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1_000
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM (
+               SELECT target_id FROM audit_log
+               WHERE action='JOB_FINALIZED' AND target_type='socks5_health_job'
+                 AND target_id LIKE 'pg-missing-audit-%'
+               GROUP BY target_id HAVING COUNT(*)<>1) duplicates"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        0
+    );
+    let integrity: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*),SUM(cancelled_count)::BIGINT,MIN(finished_at_ms),MAX(finished_at_ms)
+         FROM socks5_check_jobs WHERE id LIKE 'pg-missing-audit-%'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(integrity, (1_000, 1_000, 2_000, 2_000));
     cleanup(&db).await;
 }
 
@@ -5139,6 +5577,141 @@ async fn pg_traffic_history_splits_by_line() {
     cleanup(&db).await;
 }
 
+#[tokio::test]
+async fn pg_traffic_report_receipt_makes_ack_loss_retry_idempotent() {
+    let Some(db) = repo("traffic_idempotent").await else {
+        return;
+    };
+    let alice = pg_seed_history_fixture(&db, "idempotent", 170, 1300, 1.0).await;
+    let entries = [relay_shared::protocol::TrafficEntry {
+        rule_id: 1300,
+        upload: 123,
+        download: 456,
+    }];
+    for _ in 0..2 {
+        db.apply_traffic_batch_once(170, Some("same-report-id"), &entries)
+            .await
+            .unwrap();
+    }
+    let rule_used: i64 = sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id=1300")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_used: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=$1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_used, 579);
+    assert_eq!(user_used, 579);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_socks5_rule_lifecycle_is_atomic_and_preserves_credentials() {
+    let Some(db) = repo("socks5_lifecycle").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id,name,group_type,token,uid,connect_host)
+         VALUES (50,'relay-in','in','socks-token',1,'127.0.0.1')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let first = db
+        .insert_socks5_resource(
+            "first",
+            "127.0.0.1",
+            1080,
+            Some("upstream"),
+            Some("cipher-one"),
+            Some("nonce-one"),
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let second = db
+        .insert_socks5_resource(
+            "second",
+            "127.0.0.1",
+            1081,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let rule_id = db
+        .create_socks5_rule_full(
+            "before",
+            1,
+            18080,
+            50,
+            first,
+            true,
+            Some("relay-user"),
+            Some("relay-cipher"),
+            Some("relay-nonce"),
+            1,
+            false,
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        db.delete_socks5_resource(first).await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+    let (deleted, blockers) = db
+        .bulk_delete_socks5_resources_guarded(&[first])
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(blockers, vec![(first, rule_id)]);
+
+    assert_eq!(
+        db.update_socks5_rule_full(rule_id, "after", 18081, 50, second, false, false)
+            .await
+            .unwrap(),
+        1
+    );
+    let binding = db.find_socks5_rule_config(rule_id).await.unwrap().unwrap();
+    assert_eq!(binding.socks5_resource_id, second);
+    assert_eq!(binding.relay_username.as_deref(), Some("relay-user"));
+    assert_eq!(
+        binding.relay_password_ciphertext.as_deref(),
+        Some("relay-cipher")
+    );
+    let view = db.list_socks5_rule_views().await.unwrap().remove(0);
+    assert_eq!(view.name, "after");
+    assert_eq!(view.listen_port, 18081);
+    assert!(view.paused);
+    assert_eq!(db.delete_socks5_resource(first).await.unwrap(), 1);
+    assert_eq!(
+        db.delete_rule(rule_id, &ResourceScope::All).await.unwrap(),
+        1
+    );
+    assert_eq!(db.delete_socks5_resource(second).await.unwrap(), 1);
+    cleanup(&db).await;
+}
+
 /// PG twin: a deleted line keeps its history (LEFT JOIN must not gate the row).
 #[tokio::test]
 async fn pg_traffic_history_survives_group_and_rule_deletion() {
@@ -5737,4 +6310,3724 @@ async fn pg_admin_order_list_pages_without_overlap() {
         3,
         "the two pages must cover all three rows exactly once"
     );
+}
+
+#[tokio::test]
+async fn pg_stage3_bulk_pagination_and_health_contract() {
+    let Some(db) = repo("stage3_socks5").await else {
+        return;
+    };
+    db.insert_group("stage3", "in", "stage3-token", 1, "", "", 1.0, false)
+        .await
+        .unwrap();
+    let group_id = db.find_by_token("stage3-token").await.unwrap().unwrap().id;
+    let rows = (0..1_000)
+        .map(|index| BulkSocks5Resource {
+            name: format!("proxy-{index:04}"),
+            host: format!("proxy-{index:04}.example"),
+            port: 1080,
+            username: None,
+            password_ciphertext: None,
+            password_nonce: None,
+            password_key_version: 1,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        db.bulk_import_socks5_resources(&rows, false)
+            .await
+            .unwrap()
+            .created,
+        1_000
+    );
+    let (page, total) = db
+        .query_socks5_resources(&Socks5ResourceQuery {
+            search: Some("proxy-0999".into()),
+            sort: "id".into(),
+            descending: true,
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(page[0].host, "proxy-0999.example");
+
+    let node_id = db
+        .upsert_relay_node_seen(
+            group_id,
+            "node-a",
+            "hash-a",
+            "192.0.2.10",
+            "2026-01-01 00:00:00",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .upsert_relay_node_seen(
+            group_id,
+            "node-a",
+            "wrong-hash",
+            "192.0.2.99",
+            "2026-01-02 00:00:00",
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let bound = db.find_relay_node(node_id).await.unwrap().unwrap();
+    assert_eq!(bound.identity_secret_hash, "hash-a");
+    assert_eq!(bound.public_ip, "192.0.2.10");
+    let resource_id = page[0].id;
+    let (resource, generation) = db
+        .begin_socks5_health_check(resource_id, node_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .record_socks5_health(
+            &Socks5HealthRecord {
+                resource_id,
+                relay_node_id: node_id,
+                status: "ONLINE".into(),
+                tcp_latency_ms: Some(10),
+                handshake_latency_ms: Some(20),
+                connect_latency_ms: Some(30),
+                total_latency_ms: Some(60),
+                exit_ip: Some("198.51.100.8".into()),
+                country: Some("US".into()),
+                error_stage: None,
+                error_code: None,
+                safe_error_message: None,
+                consecutive_failures: 0,
+                checked_at: "2026-01-01 00:00:00".into(),
+                last_success_at: None,
+            },
+            resource.health_generation,
+            generation,
+        )
+        .await
+        .unwrap());
+    assert_eq!(db.list_socks5_health(resource_id).await.unwrap().len(), 1);
+    assert_eq!(
+        db.list_socks5_check_history(resource_id, 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let projection = db
+        .list_latest_socks5_health_for_resources(&[resource_id])
+        .await
+        .unwrap();
+    assert_eq!(projection.len(), 1);
+    assert_eq!(projection[0].relay_node_id, node_id);
+    assert_eq!(projection[0].status, "ONLINE");
+}
+
+#[tokio::test]
+async fn pg_stage3_ten_concurrent_identical_imports_are_unique_and_conserved() {
+    use std::sync::Arc;
+    let Some(db) = repo("stage3_import_race").await else {
+        return;
+    };
+    let db = Arc::new(db);
+    let rows = Arc::new(
+        (0..1_000)
+            .map(|index| BulkSocks5Resource {
+                name: format!("race-{index:04}"),
+                host: format!("race-{index:04}.example"),
+                port: 1080,
+                username: Some("same-user".into()),
+                password_ciphertext: Some("cipher".into()),
+                password_nonce: Some("nonce".into()),
+                password_key_version: 1,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(11));
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let db = db.clone();
+        let rows = rows.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&rows, false).await.unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let mut created = 0;
+    let mut skipped = 0;
+    for task in tasks {
+        let outcome = task.await.unwrap();
+        created += outcome.created;
+        skipped += outcome.skipped;
+    }
+    assert_eq!(created, 1_000);
+    assert_eq!(skipped, 9_000);
+    assert_eq!(created + skipped, 10_000);
+    assert_eq!(db.list_socks5_resources().await.unwrap().len(), 1_000);
+}
+
+#[tokio::test]
+async fn pg_stage3_update_credentials_wins_a_concurrent_skip() {
+    use std::sync::Arc;
+
+    let Some(db) = repo("stage3_credential_import_race").await else {
+        return;
+    };
+    let db = Arc::new(db);
+    let row = |cipher: &str, nonce: &str| BulkSocks5Resource {
+        name: "credential-race".into(),
+        host: "credential-race.example".into(),
+        port: 1080,
+        username: Some("same-user".into()),
+        password_ciphertext: Some(cipher.into()),
+        password_nonce: Some(nonce.into()),
+        password_key_version: 1,
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let skip = {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&[row("old-cipher", "old-nonce")], false)
+                .await
+                .unwrap()
+        })
+    };
+    let update = {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            db.bulk_import_socks5_resources(&[row("new-cipher", "new-nonce")], true)
+                .await
+                .unwrap()
+        })
+    };
+    barrier.wait().await;
+    let skip = skip.await.unwrap();
+    let update = update.await.unwrap();
+    assert_eq!(skip.created + skip.skipped, 1);
+    assert_eq!(update.created + update.updated, 1);
+    let resource = db.list_socks5_resources().await.unwrap().pop().unwrap();
+    assert_eq!(resource.password_ciphertext.as_deref(), Some("new-cipher"));
+    assert_eq!(resource.password_nonce.as_deref(), Some("new-nonce"));
+}
+
+#[tokio::test]
+async fn pg_stage3_health_generation_is_atomic_per_resource_node_cell() {
+    use std::sync::Arc;
+    let Some(db) = repo("stage3_health_generation").await else {
+        return;
+    };
+    db.insert_group("health", "in", "health-token", 1, "", "", 1.0, false)
+        .await
+        .unwrap();
+    let group_id = db.find_by_token("health-token").await.unwrap().unwrap().id;
+    let mut nodes = Vec::new();
+    for suffix in ["a", "b", "c"] {
+        nodes.push(
+            db.upsert_relay_node_seen(
+                group_id,
+                &format!("node-{suffix}"),
+                &format!("hash-{suffix}"),
+                "192.0.2.1",
+                "2026-01-01 00:00:00",
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+    }
+    let resource_id = db
+        .insert_socks5_resource(
+            "generation",
+            "generation.example",
+            1080,
+            None,
+            None,
+            None,
+            1,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+    let db = Arc::new(db);
+    let node_a = nodes[0];
+
+    let starts = futures_util::future::join_all((0..100).map(|_| {
+        let db = db.clone();
+        async move {
+            db.begin_socks5_health_check(resource_id, node_a)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    }))
+    .await;
+    let resource_revision = starts[0].0.health_generation;
+    let latest_generation = starts
+        .iter()
+        .map(|(_, generation)| *generation)
+        .max()
+        .unwrap();
+    assert_eq!(latest_generation, 100);
+    let health = Socks5HealthRecord {
+        resource_id,
+        relay_node_id: node_a,
+        status: "ONLINE".into(),
+        tcp_latency_ms: Some(1),
+        handshake_latency_ms: Some(1),
+        connect_latency_ms: Some(1),
+        total_latency_ms: Some(3),
+        exit_ip: Some("198.51.100.8".into()),
+        country: None,
+        error_stage: None,
+        error_code: None,
+        safe_error_message: None,
+        consecutive_failures: 0,
+        checked_at: "2026-01-01 00:00:00".into(),
+        last_success_at: None,
+    };
+    assert!(db
+        .record_socks5_health(&health, resource_revision, latest_generation)
+        .await
+        .unwrap());
+    for (_, stale_generation) in starts {
+        if stale_generation != latest_generation {
+            assert!(!db
+                .record_socks5_health(&health, resource_revision, stale_generation)
+                .await
+                .unwrap());
+        }
+    }
+
+    let checks = futures_util::future::join_all(nodes[1..].iter().map(|node| {
+        let db = db.clone();
+        async move {
+            db.begin_socks5_health_check(resource_id, *node)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    }))
+    .await;
+    for ((resource, generation), (node, status)) in checks
+        .into_iter()
+        .zip([(nodes[1], "AUTH_FAILED"), (nodes[2], "TIMEOUT")])
+    {
+        let mut per_node = health.clone();
+        per_node.relay_node_id = node;
+        per_node.status = status.into();
+        per_node.exit_ip = None;
+        assert!(db
+            .record_socks5_health(&per_node, resource.health_generation, generation)
+            .await
+            .unwrap());
+    }
+    let matrix = db.list_socks5_health(resource_id).await.unwrap();
+    assert_eq!(matrix.len(), 3);
+    assert_eq!(
+        db.list_socks5_check_history(resource_id, 200, 0)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "stale generations are discarded rather than saved as history"
+    );
+}
+
+#[tokio::test]
+async fn pg_concurrent_relay_node_first_claim_accepts_exactly_one_identity() {
+    use std::sync::Arc;
+
+    let Some(db) = repo("stage3_identity_claim_race").await else {
+        return;
+    };
+    db.insert_group("identity", "in", "identity-token", 1, "", "", 1.0, false)
+        .await
+        .unwrap();
+    let group_id = db
+        .find_by_token("identity-token")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let db = Arc::new(db);
+    let claims = futures_util::future::join_all(["hash-a", "hash-b"].map(|hash| {
+        let db = db.clone();
+        async move {
+            db.upsert_relay_node_seen(
+                group_id,
+                "shared-node-id",
+                hash,
+                "192.0.2.10",
+                "2026-01-01 00:00:00",
+            )
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+
+    let node = db.list_relay_nodes().await.unwrap().pop().unwrap();
+    assert!(["hash-a", "hash-b"].contains(&node.identity_secret_hash.as_str()));
+    let rejected_hash = if node.identity_secret_hash == "hash-a" {
+        "hash-b"
+    } else {
+        "hash-a"
+    };
+    assert!(db
+        .upsert_relay_node_seen(
+            group_id,
+            "shared-node-id",
+            rejected_hash,
+            "192.0.2.99",
+            "2026-01-02 00:00:00",
+        )
+        .await
+        .unwrap()
+        .is_none());
+}
+
+async fn pg_seed_stage4_create(db: &PgRepository, port_range: &str) -> (i64, i64, String) {
+    sqlx::query("UPDATE users SET max_rules=0 WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid,port_range)
+         VALUES(940,'stage4-group','in','stage4-token',1,$1)",
+    )
+    .bind(port_range)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let checked_at = chrono::Utc::now().to_rfc3339();
+    let node_id = db
+        .upsert_relay_node_seen(
+            940,
+            "stage4-node",
+            &"a".repeat(64),
+            "192.0.2.44",
+            &checked_at,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE relay_nodes SET name='US-A',country_code='US' WHERE id=$1")
+        .bind(node_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let status = serde_json::json!({
+        "last_seen": checked_at,
+        "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+        "socks5_check_queue_depth": 0,
+        "cpu": 10.0,
+        "mem": 20.0,
+        "connections": 3
+    });
+    sqlx::query("INSERT INTO kvs(key,value) VALUES($1,$2)")
+        .bind("node_status:940:stage4-node")
+        .bind(status.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let resource_id: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources
+         (name,host,port,country_code,detected_country,detected_exit_ip,status,enabled,health_generation)
+         VALUES('stage4-upstream','198.51.100.7',1080,'JP','US','198.51.100.8','ONLINE',TRUE,1)
+         RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation) VALUES($1,$2,1)",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_resource_health
+         (resource_id,relay_node_id,status,total_latency_ms,exit_ip,country,checked_at,
+          resource_revision,generation)
+         VALUES($1,$2,'ONLINE',120,'198.51.100.8','US',$3,1,1)",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .bind(&checked_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    (resource_id, node_id, checked_at)
+}
+
+async fn pg_add_stage4_node(
+    db: &PgRepository,
+    group_id: i64,
+    node_key: &str,
+    resource_id: i64,
+    checked_at: &str,
+    port_range: &str,
+) -> i64 {
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid,port_range)
+         VALUES($1,$2,'in',$3,1,$4)",
+    )
+    .bind(group_id)
+    .bind(format!("stage4-group-{group_id}"))
+    .bind(format!("stage4-token-{group_id}"))
+    .bind(port_range)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let node_id = db
+        .upsert_relay_node_seen(
+            group_id,
+            node_key,
+            &format!("{group_id:064}"),
+            "192.0.2.45",
+            checked_at,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE relay_nodes SET name=$1,country_code='US' WHERE id=$2")
+        .bind(format!("US-{group_id}"))
+        .bind(node_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let status = serde_json::json!({
+        "last_seen": checked_at,
+        "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+        "socks5_check_queue_depth": 0,
+        "cpu": 10.0,
+        "mem": 20.0,
+        "connections": 0
+    });
+    sqlx::query("INSERT INTO kvs(key,value) VALUES($1,$2)")
+        .bind(format!("node_status:{group_id}:{node_key}"))
+        .bind(status.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation)
+         VALUES($1,$2,1)",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_resource_health
+         (resource_id,relay_node_id,status,total_latency_ms,exit_ip,country,checked_at,
+          resource_revision,generation)
+         VALUES($1,$2,'ONLINE',120,'198.51.100.8','US',$3,1,1)",
+    )
+    .bind(resource_id)
+    .bind(node_id)
+    .bind(checked_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    node_id
+}
+
+fn pg_stage4_input(
+    sequence: usize,
+    resource_id: i64,
+    node_id: i64,
+    checked_at: &str,
+) -> SmartRelayCreateInput {
+    SmartRelayCreateInput {
+        actor_id: 1,
+        idempotency_key: format!("10000000-0000-4000-8000-{sequence:012}"),
+        request_fingerprint: format!("fingerprint-{sequence}"),
+        name: format!("stage4-{sequence}"),
+        resource_id,
+        relay_node_id: node_id,
+        requested_port: None,
+        expected_resource_revision: 1,
+        expected_health_generation: 1,
+        expected_health_checked_at: checked_at.to_owned(),
+        selection_mode: "RECOMMENDED".into(),
+        relay_username: format!("r_{sequence}"),
+        relay_password_ciphertext: format!("cipher-{sequence}"),
+        relay_password_nonce: format!("nonce-{sequence}"),
+        relay_password_key_version: 1,
+        health_ttl_seconds: 600,
+        required_protocol_version: relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+        max_cpu_percent: 95.0,
+        max_memory_percent: 95.0,
+    }
+}
+
+async fn pg_seed_stage4_expired_ledger_backlog(
+    db: &PgRepository,
+    input: &SmartRelayCreateInput,
+    total_rows: i64,
+    target_fingerprint: &str,
+    target_created_at: &str,
+) {
+    assert!(total_rows > 0);
+    sqlx::query(
+        "INSERT INTO relay_creation_idempotency_keys
+         (actor_id,idempotency_key,request_fingerprint,created_at)
+         SELECT $1,'ttl-filler-' || n,'expired-filler','2000-01-01 00:00:00'
+         FROM generate_series(1,$2) n",
+    )
+    .bind(input.actor_id)
+    .bind(total_rows - 1)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_idempotency_keys
+         (actor_id,idempotency_key,request_fingerprint,created_at) VALUES($1,$2,$3,$4)",
+    )
+    .bind(input.actor_id)
+    .bind(&input.idempotency_key)
+    .bind(target_fingerprint)
+    .bind(target_created_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_idempotency_keys")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, total_rows);
+}
+
+#[tokio::test]
+async fn pg_stage4_one_hundred_concurrent_creates_are_atomic_and_port_safe() {
+    let Some(db) = repo("stage4_100_create").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "20000-20099").await;
+    let attempts = (0..100).map(|sequence| {
+        let worker = PgRepository::new(db.pool.clone());
+        let input = pg_stage4_input(sequence, resource_id, node_id, &checked_at);
+        async move { worker.create_smart_relay(&input).await.unwrap() }
+    });
+    let outcomes = futures_util::future::join_all(attempts).await;
+    assert!(outcomes
+        .iter()
+        .all(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_))));
+    let ports: Vec<i32> = sqlx::query_scalar(
+        "SELECT listen_port FROM forward_rules WHERE device_group_in=940 ORDER BY listen_port",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ports, (20000..=20099).collect::<Vec<_>>());
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM socks5_rule_bindings),
+                (SELECT COUNT(*) FROM relay_creation_receipts)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (100, 100));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_one_hundred_idempotent_requests_create_one_rule() {
+    let Some(db) = repo("stage4_100_idempotent").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "21000-21009").await;
+    let attempts = (0..100).map(|_| {
+        let worker = PgRepository::new(db.pool.clone());
+        let input = pg_stage4_input(7, resource_id, node_id, &checked_at);
+        async move { worker.create_smart_relay(&input).await.unwrap() }
+    });
+    let outcomes = futures_util::future::join_all(attempts).await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Replay(_)))
+            .count(),
+        99
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE name='stage4-7'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_expired_ledger_backlog_never_decides_idempotency() {
+    for (total_rows, sequence, port_range) in [
+        (10_001_i64, 701_usize, "28000-28009"),
+        (20_001_i64, 702_usize, "28100-28109"),
+    ] {
+        let name = format!("stage4_ttl_backlog_{total_rows}");
+        let Some(db) = repo(&name).await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, port_range).await;
+        let input = pg_stage4_input(sequence, resource_id, node_id, &checked_at);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &input,
+            total_rows,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        let mut third_intent = input.clone();
+        third_intent.request_fingerprint = "third-intent".into();
+        assert!(matches!(
+            db.create_smart_relay(&third_intent).await.unwrap(),
+            SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+        ));
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Replay(_)
+        ));
+        cleanup(&db).await;
+    }
+}
+
+#[tokio::test]
+async fn pg_stage4_valid_ledger_survives_expired_backlog() {
+    let Some(db) = repo("stage4_valid_ledger_backlog").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28200-28209").await;
+    let input = pg_stage4_input(703, resource_id, node_id, &checked_at);
+    pg_seed_stage4_expired_ledger_backlog(
+        &db,
+        &input,
+        10_001,
+        "valid-intent",
+        "2999-01-01 00:00:00",
+    )
+    .await;
+    assert!(matches!(
+        db.create_smart_relay(&input).await.unwrap(),
+        SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+    ));
+
+    let mut matching = input;
+    matching.request_fingerprint = "valid-intent".into();
+    assert!(matches!(
+        db.create_smart_relay(&matching).await.unwrap(),
+        SmartRelayCreateOutcome::Created(_)
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_ttl_boundary_is_inclusive() {
+    let Some(db) = repo("stage4_ttl_boundary").await else {
+        return;
+    };
+    let cutoff = "2026-01-08 00:00:00";
+    for (key, modifier) in [
+        ("boundary-before", "-1 second"),
+        ("boundary-exact", "+0 seconds"),
+        ("boundary-after", "+1 second"),
+    ] {
+        sqlx::query(
+            "INSERT INTO relay_creation_idempotency_keys
+             (actor_id,idempotency_key,request_fingerprint,created_at)
+             VALUES(1,$1,'boundary',to_char(to_timestamp($2,'YYYY-MM-DD HH24:MI:SS') + $3::interval,
+                                             'YYYY-MM-DD HH24:MI:SS'))",
+        )
+        .bind(key)
+        .bind(cutoff)
+        .bind(modifier)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let active: Vec<String> = sqlx::query_scalar(
+        "SELECT idempotency_key FROM relay_creation_idempotency_keys
+         WHERE created_at >= $1 ORDER BY idempotency_key",
+    )
+    .bind(cutoff)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(active, vec!["boundary-after", "boundary-exact"]);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_expired_receipt_backlog_cannot_force_a_conflict() {
+    let Some(db) = repo("stage4_expired_receipt_backlog").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28300-28309").await;
+    let input = pg_stage4_input(709, resource_id, node_id, &checked_at);
+    sqlx::query(
+        "INSERT INTO forward_rules
+         (name,uid,listen_port,protocol,device_group_in,target_addr,target_port)
+         SELECT 'ttl-receipt-filler-' || n,1,n,'tcp',940,'',0
+         FROM generate_series(1,10000) n",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_receipts
+         (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+          endpoint_host,listen_port,relay_username,exit_ip,selection_mode,created_at)
+         SELECT 1,'receipt-filler-' || f.id,'expired-receipt',f.id,$1,$2,
+                '192.0.2.44',f.listen_port,'relay','198.51.100.8','RECOMMENDED',
+                '2000-01-01 00:00:00'
+         FROM forward_rules f WHERE f.name LIKE 'ttl-receipt-filler-%'",
+    )
+    .bind(node_id)
+    .bind(resource_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let old_rule: i64 = sqlx::query_scalar(
+        "INSERT INTO forward_rules
+         (name,uid,listen_port,protocol,device_group_in,target_addr,target_port)
+         VALUES('expired-receipt-target',1,28300,'tcp',940,'',0) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_receipts
+         (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+          endpoint_host,listen_port,relay_username,exit_ip,selection_mode,created_at)
+         VALUES(1,$1,'expired-intent',$2,$3,$4,'192.0.2.44',28300,'relay',
+                '198.51.100.8','RECOMMENDED','2000-01-02 00:00:00')",
+    )
+    .bind(&input.idempotency_key)
+    .bind(old_rule)
+    .bind(node_id)
+    .bind(resource_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_idempotency_keys
+         (actor_id,idempotency_key,request_fingerprint,created_at)
+         VALUES(1,$1,'expired-intent','2000-01-02 00:00:00')",
+    )
+    .bind(&input.idempotency_key)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let new_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("expected create after expired receipt, got {other:?}"),
+    };
+    assert_ne!(new_rule, old_rule);
+    let receipt_rule: i64 = sqlx::query_scalar(
+        "SELECT rule_id FROM relay_creation_receipts
+         WHERE actor_id=1 AND idempotency_key=$1",
+    )
+    .bind(&input.idempotency_key)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(receipt_rule, new_rule);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_cleanup_rollback_is_not_part_of_ttl_correctness() {
+    {
+        let Some(db) = repo("stage4_ttl_quota_rollback").await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28400-28409").await;
+        let input = pg_stage4_input(704, resource_id, node_id, &checked_at);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &input,
+            10_001,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+        sqlx::query("UPDATE users SET max_rules=1 WHERE id=1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO forward_rules(name,uid,listen_port,device_group_in,target_addr,target_port) VALUES('quota-blocker',1,28409,940,'',0)")
+            .execute(&db.pool).await.unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::QuotaExceeded
+        ));
+        sqlx::query("DELETE FROM forward_rules WHERE name='quota-blocker'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        cleanup(&db).await;
+    }
+
+    {
+        let Some(db) = repo("stage4_ttl_port_rollback").await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28500-28509").await;
+        let mut input = pg_stage4_input(705, resource_id, node_id, &checked_at);
+        input.requested_port = Some(28505);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &input,
+            10_001,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+        sqlx::query("INSERT INTO forward_rules(name,uid,listen_port,device_group_in,target_addr,target_port) VALUES('port-blocker',1,28505,940,'',0)")
+            .execute(&db.pool).await.unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Rejected("PORT_CONFLICT")
+        ));
+        sqlx::query("DELETE FROM forward_rules WHERE name='port-blocker'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        cleanup(&db).await;
+    }
+
+    {
+        let Some(db) = repo("stage4_ttl_conflict_rollback").await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28600-28609").await;
+        let expired = pg_stage4_input(706, resource_id, node_id, &checked_at);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &expired,
+            10_001,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+        let valid = pg_stage4_input(707, resource_id, node_id, &checked_at);
+        sqlx::query("INSERT INTO relay_creation_idempotency_keys(actor_id,idempotency_key,request_fingerprint,created_at) VALUES($1,$2,$3,'2999-01-01 00:00:00')")
+            .bind(valid.actor_id)
+            .bind(&valid.idempotency_key)
+            .bind("valid-intent")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&valid).await.unwrap(),
+            SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+        ));
+        assert!(matches!(
+            db.create_smart_relay(&expired).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        cleanup(&db).await;
+    }
+
+    {
+        let Some(db) = repo("stage4_ttl_forced_rollback").await else {
+            return;
+        };
+        let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "28700-28709").await;
+        let input = pg_stage4_input(708, resource_id, node_id, &checked_at);
+        pg_seed_stage4_expired_ledger_backlog(
+            &db,
+            &input,
+            10_001,
+            "expired-intent",
+            "2000-01-02 00:00:00",
+        )
+        .await;
+        sqlx::query(
+            "CREATE FUNCTION fail_ttl_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'forced ttl receipt failure'; END $$",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_ttl_receipt BEFORE INSERT ON relay_creation_receipts
+             FOR EACH ROW EXECUTE FUNCTION fail_ttl_receipt()",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(db.create_smart_relay(&input).await.is_err());
+        sqlx::query("DROP TRIGGER fail_ttl_receipt ON relay_creation_receipts")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION fail_ttl_receipt()")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.create_smart_relay(&input).await.unwrap(),
+            SmartRelayCreateOutcome::Created(_)
+        ));
+        cleanup(&db).await;
+    }
+}
+#[tokio::test]
+async fn pg_stage4_cross_group_quota_is_user_serialized() {
+    let Some(db) = repo("stage4_cross_group_quota").await else {
+        return;
+    };
+    let (resource_id, node_a, checked_at) = pg_seed_stage4_create(&db, "22000-22099").await;
+    let node_b = pg_add_stage4_node(
+        &db,
+        941,
+        "stage4-node-b",
+        resource_id,
+        &checked_at,
+        "22000-22099",
+    )
+    .await;
+    sqlx::query("UPDATE users SET max_rules=1 WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let left = PgRepository::new(db.pool.clone());
+    let right = PgRepository::new(db.pool.clone());
+    let input_a = pg_stage4_input(21, resource_id, node_a, &checked_at);
+    let input_b = pg_stage4_input(22, resource_id, node_b, &checked_at);
+    let (outcome_a, outcome_b) = tokio::join!(
+        left.create_smart_relay(&input_a),
+        right.create_smart_relay(&input_b)
+    );
+    let outcomes = [outcome_a.unwrap(), outcome_b.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::QuotaExceeded))
+            .count(),
+        1
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_n_plus_one_across_groups_never_exceeds_quota() {
+    let Some(db) = repo("stage4_n_plus_one_quota").await else {
+        return;
+    };
+    let (resource_id, node_a, checked_at) = pg_seed_stage4_create(&db, "23000-23100").await;
+    let node_b = pg_add_stage4_node(
+        &db,
+        941,
+        "stage4-node-b",
+        resource_id,
+        &checked_at,
+        "23000-23100",
+    )
+    .await;
+    sqlx::query("UPDATE users SET max_rules=8 WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let attempts = (0..9).map(|sequence| {
+        let worker = PgRepository::new(db.pool.clone());
+        let node_id = if sequence % 2 == 0 { node_a } else { node_b };
+        let input = pg_stage4_input(100 + sequence, resource_id, node_id, &checked_at);
+        async move { worker.create_smart_relay(&input).await.unwrap() }
+    });
+    let outcomes = futures_util::future::join_all(attempts).await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_)))
+            .count(),
+        8
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::QuotaExceeded))
+            .count(),
+        1
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 8);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_smart_and_normal_socks5_share_quota_lock_order() {
+    let Some(db) = repo("stage4_mixed_create_quota").await else {
+        return;
+    };
+    let (resource_id, _node_a, checked_at) = pg_seed_stage4_create(&db, "24000-24099").await;
+    let node_b = pg_add_stage4_node(
+        &db,
+        941,
+        "stage4-node-b",
+        resource_id,
+        &checked_at,
+        "24000-24099",
+    )
+    .await;
+    sqlx::query("UPDATE users SET max_rules=1 WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let smart_repo = PgRepository::new(db.pool.clone());
+    let normal_repo = PgRepository::new(db.pool.clone());
+    let smart = pg_stage4_input(301, resource_id, node_b, &checked_at);
+    let (smart_outcome, normal_outcome) = tokio::join!(
+        smart_repo.create_smart_relay(&smart),
+        normal_repo.create_socks5_rule_full(
+            "normal",
+            1,
+            24001,
+            940,
+            resource_id,
+            true,
+            None,
+            None,
+            None,
+            1,
+            true,
+            true,
+        )
+    );
+    let smart_created = matches!(smart_outcome.unwrap(), SmartRelayCreateOutcome::Created(_));
+    let normal_created = normal_outcome.unwrap().is_some();
+    assert_ne!(smart_created, normal_created);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_multi_user_multi_group_stress_has_no_deadlock_or_quota_escape() {
+    let Some(db) = repo("stage4_multi_user_stress").await else {
+        return;
+    };
+    let (resource_id, node_a, checked_at) = pg_seed_stage4_create(&db, "25000-25199").await;
+    let node_b = pg_add_stage4_node(
+        &db,
+        941,
+        "stage4-node-b",
+        resource_id,
+        &checked_at,
+        "25000-25199",
+    )
+    .await;
+    for user_id in 10_i64..20_i64 {
+        sqlx::query("INSERT INTO users(id,username,password,max_rules) VALUES($1,$2,'x',5)")
+            .bind(user_id)
+            .bind(format!("stage4-user-{user_id}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let attempts = (0..100).map(|sequence| {
+        let worker = PgRepository::new(db.pool.clone());
+        let actor_id = 10 + (sequence / 10) as i64;
+        let node_id = if sequence % 2 == 0 { node_a } else { node_b };
+        let mut input = pg_stage4_input(1000 + sequence, resource_id, node_id, &checked_at);
+        input.actor_id = actor_id;
+        input.name = format!("stress-{actor_id}-{sequence}");
+        async move { worker.create_smart_relay(&input).await.unwrap() }
+    });
+    let outcomes = futures_util::future::join_all(attempts).await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SmartRelayCreateOutcome::Created(_)))
+            .count(),
+        50
+    );
+    for user_id in 10_i64..20_i64 {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=$1")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 5, "user {user_id} exceeded or lost quota slots");
+    }
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_deleted_rule_recreates_only_for_the_original_fingerprint() {
+    let Some(db) = repo("stage4_deleted_recreate").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "26000-26009").await;
+    let input = pg_stage4_input(401, resource_id, node_id, &checked_at);
+    let first_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("unexpected first outcome: {other:?}"),
+    };
+    db.delete_rule(first_rule, &ResourceScope::All)
+        .await
+        .unwrap();
+    assert!(db
+        .find_smart_relay_receipt(1, &input.idempotency_key)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.find_smart_relay_idempotency_fingerprint(1, &input.idempotency_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(input.request_fingerprint.as_str())
+    );
+    let replacement_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("unexpected replacement outcome: {other:?}"),
+    };
+    assert_ne!(first_rule, replacement_rule);
+    db.delete_rule(replacement_rule, &ResourceScope::All)
+        .await
+        .unwrap();
+    let mut changed = input.clone();
+    changed.request_fingerprint = "changed-after-delete".into();
+    assert!(matches!(
+        db.create_smart_relay(&changed).await.unwrap(),
+        SmartRelayCreateOutcome::Rejected("IDEMPOTENCY_KEY_REUSED")
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_delete_in_progress_cannot_produce_a_stale_replay() {
+    let Some(db) = repo("stage4_delete_replay_race").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "26500-26509").await;
+    let input = pg_stage4_input(451, resource_id, node_id, &checked_at);
+    let rule_id = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("unexpected create outcome: {other:?}"),
+    };
+    let mut delete_tx = db.pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM forward_rules WHERE id=$1")
+        .bind(rule_id)
+        .execute(&mut *delete_tx)
+        .await
+        .unwrap();
+    let worker = PgRepository::new(db.pool.clone());
+    let create = tokio::spawn(async move { worker.create_smart_relay(&input).await.unwrap() });
+    tokio::task::yield_now().await;
+    delete_tx.commit().await.unwrap();
+    assert!(matches!(
+        create.await.unwrap(),
+        SmartRelayCreateOutcome::Created(_)
+    ));
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_migration_34_cleans_orphans_preserves_fingerprints_and_adds_cascade() {
+    let Some(db) = repo("migration_34_receipts").await else {
+        return;
+    };
+    let (resource_id, node_id, checked_at) = pg_seed_stage4_create(&db, "27000-27009").await;
+    let input = pg_stage4_input(501, resource_id, node_id, &checked_at);
+    let live_rule = match db.create_smart_relay(&input).await.unwrap() {
+        SmartRelayCreateOutcome::Created(created) => created.rule_id,
+        other => panic!("unexpected create outcome: {other:?}"),
+    };
+    let fresh_fk_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_constraint
+         WHERE conname='relay_creation_receipts_rule_fk'
+           AND conrelid='relay_creation_receipts'::regclass
+           AND confdeltype='c'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        fresh_fk_count, 1,
+        "fresh PostgreSQL schema must carry the cascade FK"
+    );
+    sqlx::query(
+        "ALTER TABLE relay_creation_receipts
+         DROP CONSTRAINT relay_creation_receipts_rule_fk",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TABLE relay_creation_idempotency_keys")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Recreate an actual pre-34 database. Once later versions exist, deleting
+    // only row 34 leaves MAX(version) at 35 and correctly skips migration 34.
+    for table in crate::db::health_schema::HEALTH_TABLES.iter().rev() {
+        sqlx::query(&format!("DROP TABLE {table}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DROP INDEX uq_audit_health_job_finalized")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version>=34")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO relay_creation_receipts
+         (actor_id,idempotency_key,request_fingerprint,rule_id,relay_node_id,resource_id,
+          endpoint_host,listen_port,relay_username,exit_ip,selection_mode)
+         VALUES(1,'orphan-key','orphan-fingerprint',999999,$1,$2,
+                'node.example',27001,'relay','192.0.2.1','RECOMMENDED')",
+    )
+    .bind(node_id)
+    .bind(resource_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    run_pg_migrations(&db.pool).await.unwrap();
+    let orphan_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM relay_creation_receipts r
+         WHERE NOT EXISTS(SELECT 1 FROM forward_rules f WHERE f.id=r.rule_id)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_count, 0);
+    let ledger_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_idempotency_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger_count, 2);
+    let fk_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_constraint
+         WHERE conname='relay_creation_receipts_rule_fk'
+           AND conrelid='relay_creation_receipts'::regclass
+           AND confdeltype='c'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(fk_count, 1);
+    sqlx::query("DELETE FROM forward_rules WHERE id=$1")
+        .bind(live_rule)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let live_receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM relay_creation_receipts WHERE idempotency_key=$1")
+            .bind(&input.idempotency_key)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(live_receipts, 0);
+    run_pg_migrations(&db.pool).await.unwrap();
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_stage4_recommendation_one_thousand_nodes_is_bounded_and_explained() {
+    let Some(db) = repo("stage4_recommend_1000").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid,port_range)
+         VALUES(601,'perf-group','in','perf-token',1,'30000-39999')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO relay_nodes
+             (device_group_id,node_key,identity_secret_hash,name,country_code,public_ip,
+              first_seen_at,last_seen_at)
+         SELECT 601,'perf-' || value,lpad(value::text,64,'0'),'Node ' || value,'US',
+                '192.0.2.1',$1,$1
+         FROM generate_series(1,1000) value",
+    )
+    .bind(&now)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let resource_id: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources
+         (name,host,port,country_code,detected_country,detected_exit_ip,status,enabled,
+          health_generation)
+         VALUES('perf-resource','198.51.100.7',1080,'US','US','198.51.100.8','ONLINE',TRUE,1)
+         RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_check_generations(resource_id,relay_node_id,generation)
+         SELECT $1,id,1 FROM relay_nodes WHERE device_group_id=601",
+    )
+    .bind(resource_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO socks5_resource_health
+             (resource_id,relay_node_id,status,total_latency_ms,exit_ip,country,checked_at,
+              resource_revision,generation)
+         SELECT $1,id,'ONLINE',100 + (id % 100)::INTEGER,'198.51.100.8','US',$2,1,1
+         FROM relay_nodes WHERE device_group_id=601",
+    )
+    .bind(resource_id)
+    .bind(&now)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let status = serde_json::json!({
+        "last_seen": now,
+        "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+        "socks5_check_queue_depth": 0,
+        "cpu": 15.0,
+        "mem": 20.0,
+        "connections": 5
+    });
+    sqlx::query(
+        "INSERT INTO kvs(key,value)
+         SELECT 'node_status:601:' || node_key,$1 FROM relay_nodes WHERE device_group_id=601",
+    )
+    .bind(status.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let config = Config {
+        database_path: String::new(),
+        listen: "127.0.0.1:0".into(),
+        key: "test".into(),
+        jwt_secret: "test".into(),
+        public_dir: "public".into(),
+        public_panel_url: String::new(),
+        registration_enabled: false,
+        cors_origins: vec![],
+        geoip_enabled: false,
+        geoip_cache_ttl: 60,
+        socks5_credential_key: Some("11".repeat(32)),
+        socks5_check_urls: vec![],
+        socks5_check_concurrency: 10,
+        socks5_check_retention_days: 30,
+        relay_recommend_health_ttl_seconds: 600,
+        relay_recommend_max_cpu_percent: 95.0,
+        relay_recommend_max_memory_percent: 95.0,
+    };
+
+    let started = std::time::Instant::now();
+    let recommendation = crate::service::relay_recommendation::recommend(&db, &config, resource_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    println!("stage4 postgresql recommendation 1000 nodes: {elapsed:?}");
+    assert_eq!(recommendation.candidates.len(), 1000);
+    assert!(recommendation
+        .candidates
+        .iter()
+        .all(|candidate| candidate.eligible));
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "elapsed={elapsed:?}"
+    );
+
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+         SELECT h.resource_id,h.relay_node_id,h.status,h.total_latency_ms,h.exit_ip,h.country,
+                h.checked_at,h.resource_revision,h.generation,COALESCE(g.generation,0)
+         FROM socks5_resource_health h
+         LEFT JOIN socks5_check_generations g
+           ON g.resource_id=h.resource_id AND g.relay_node_id=h.relay_node_id
+         WHERE h.resource_id=$1 ORDER BY h.relay_node_id",
+    )
+    .bind(resource_id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(plan.iter().any(|line| line.contains("actual time=")));
+    assert!(plan.iter().any(|line| line.contains("rows=1000")));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_health_orchestration_persistence_contract() {
+    let Some(db) = repo("health_orchestration").await else {
+        return;
+    };
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 37);
+    run_pg_migrations(&db.pool).await.unwrap();
+    for index in crate::db::health_schema::HEALTH_INDEXES {
+        let present: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1",
+        )
+        .bind(index)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(present, 1, "missing {index}");
+    }
+    let mut plan_connection = db.pool.acquire().await.unwrap();
+    sqlx::query("SET enable_seqscan=off")
+        .execute(&mut *plan_connection)
+        .await
+        .unwrap();
+    let ready_plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN SELECT id FROM socks5_check_job_items
+         WHERE state='QUEUED' AND not_before_ms <= 1000 LIMIT 100",
+    )
+    .fetch_all(&mut *plan_connection)
+    .await
+    .unwrap();
+    assert!(ready_plan
+        .iter()
+        .any(|line| line.contains("idx_socks5_check_job_items_ready")));
+    sqlx::query("RESET enable_seqscan")
+        .execute(&mut *plan_connection)
+        .await
+        .unwrap();
+    drop(plan_connection);
+
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('health','in','health-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('health-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'health-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+
+    let policy = db
+        .create_health_policy(&NewHealthPolicy {
+            name: "health-policy".into(),
+            enabled: true,
+            resource_selector_json: "{}".into(),
+            node_selector_json: "{}".into(),
+            interval_seconds: 3600,
+            jitter_seconds: 60,
+            max_items: 100,
+            next_run_at_ms: 1_000,
+            created_by: Some(1),
+            now_ms: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        db.update_health_policy(
+            policy,
+            1,
+            &HealthPolicyPatch {
+                name: Some("health-policy-2".into()),
+                ..Default::default()
+            },
+            2
+        )
+        .await
+        .unwrap()
+        .revision,
+        2
+    );
+    assert!(matches!(
+        db.update_health_policy(policy, 1, &HealthPolicyPatch::default(), 3)
+            .await,
+        Err(DbError::RevisionConflict)
+    ));
+
+    let job = NewHealthJob {
+        id: "pg-health-job".into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: Some(1),
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let items = [NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: Some(10_000),
+    }];
+    let key = NewHealthJobIdempotency {
+        actor_id: 1,
+        idempotency_key: "pg-health-key".into(),
+        request_fingerprint: job.request_fingerprint.clone(),
+        created_at_ms: 1_000,
+        expires_at_ms: 1_000 + IDEMPOTENCY_TTL_MS,
+    };
+    assert!(matches!(
+        db.create_health_job_idempotent(&job, &items, &key)
+            .await
+            .unwrap(),
+        HealthJobCreateOutcome::Created { .. }
+    ));
+    assert!(matches!(
+        db.create_health_job_idempotent(&job, &items, &key)
+            .await
+            .unwrap(),
+        HealthJobCreateOutcome::Replay { .. }
+    ));
+    let item = db.list_health_job_items(&job.id).await.unwrap().remove(0);
+    let leased = HealthItemTransition {
+        item_id: item.id,
+        expected_state: HealthJobItemState::Queued,
+        expected_fence: 0,
+        new_state: HealthJobItemState::Leased,
+        lease_owner: Some("pg-worker".into()),
+        lease_expires_at_ms: Some(3_000),
+        pair_fence_token: Some(1),
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: None,
+        health_status: None,
+        safe_error_code: None,
+        safe_error_message: None,
+        completed_after_cancel: false,
+        now_ms: 2_000,
+    };
+    assert_eq!(
+        db.transition_health_job_item(&leased).await.unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    let active = db.find_health_job(&job.id).await.unwrap().unwrap();
+    assert_eq!((active.queued_count, active.running_count), (0, 1));
+    let lease = db
+        .acquire_health_pair_lease(PairLeaseAcquireRequest {
+            resource_id: resource,
+            relay_node_id: node,
+            item_id: item.id,
+            lease_owner: "pg-worker",
+            lease_expires_at_ms: 3_000,
+            now_ms: 2_000,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        lease,
+        PairLeaseAcquireOutcome::Acquired {
+            pair_fence_token: 1
+        }
+    );
+    assert_eq!(
+        db.release_health_pair_lease(resource, node, item.id, "pg-worker", 1, 2_500)
+            .await
+            .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert_eq!(
+        db.list_released_health_pair_lease_prune_candidates(2_501, 1000)
+            .await
+            .unwrap(),
+        Vec::<(i64, i64)>::new()
+    );
+
+    let mut dispatching = leased.clone();
+    dispatching.expected_state = HealthJobItemState::Leased;
+    dispatching.expected_fence = 1;
+    dispatching.new_state = HealthJobItemState::Dispatching;
+    dispatching.dispatch_attempt_id = Some("pg-dispatch".into());
+    dispatching.now_ms = 2_600;
+    assert_eq!(
+        db.transition_health_job_item(&dispatching).await.unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    let mut in_flight = dispatching.clone();
+    in_flight.expected_state = HealthJobItemState::Dispatching;
+    in_flight.expected_fence = 2;
+    in_flight.new_state = HealthJobItemState::InFlight;
+    in_flight.request_id = Some("pg-request".into());
+    in_flight.now_ms = 2_700;
+    assert_eq!(
+        db.transition_health_job_item(&in_flight).await.unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    let mut succeeded = in_flight;
+    succeeded.expected_state = HealthJobItemState::InFlight;
+    succeeded.expected_fence = 3;
+    succeeded.new_state = HealthJobItemState::Succeeded;
+    succeeded.lease_owner = None;
+    succeeded.lease_expires_at_ms = None;
+    succeeded.pair_fence_token = None;
+    succeeded.dispatch_attempt_id = None;
+    succeeded.request_id = None;
+    succeeded.now_ms = 3_000;
+    assert_eq!(
+        db.transition_health_job_item(&succeeded).await.unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert!(db.finalize_health_job(&job.id, 3_001).await.unwrap());
+    let done = db.find_health_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(done.status, HealthJobStatus::Succeeded.as_str());
+    assert_eq!((done.running_count, done.succeeded_count), (0, 1));
+    assert_eq!(
+        db.list_terminal_health_job_prune_candidates(3_002, 1000)
+            .await
+            .unwrap(),
+        vec![job.id.clone()]
+    );
+
+    assert_eq!(
+        db.lookup_health_job_idempotency(1, &key.idempotency_key, &"b".repeat(64), 2_000)
+            .await
+            .unwrap(),
+        HealthJobIdempotencyOutcome::Conflict
+    );
+    assert_eq!(
+        db.lookup_health_job_idempotency(2, &key.idempotency_key, &job.request_fingerprint, 2_000)
+            .await
+            .unwrap(),
+        HealthJobIdempotencyOutcome::Available
+    );
+    sqlx::query(
+        "INSERT INTO socks5_health_job_idempotency
+         (actor_id,idempotency_key,request_fingerprint,job_id,created_at_ms,expires_at_ms)
+         SELECT 1,'expired-' || lpad(g::text,5,'0'),repeat('e',64),NULL,0,999
+         FROM generate_series(0,10000) AS g",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.lookup_health_job_idempotency(1, "expired-10000", &"e".repeat(64), 1_000)
+            .await
+            .unwrap(),
+        HealthJobIdempotencyOutcome::Available
+    );
+
+    let scheduled_item = [NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 4_000,
+        deadline_at_ms: None,
+    }];
+    for id in ["pg-slot-a", "pg-slot-b"] {
+        let scheduled = NewHealthJob {
+            id: id.into(),
+            source: HealthJobSource::Scheduled,
+            policy_id: Some(policy),
+            parent_job_id: None,
+            actor_id: None,
+            request_fingerprint: "c".repeat(64),
+            snapshot_hash: snapshot_hash(&[(resource, node)]),
+            resource_selector_json: "{}".into(),
+            node_selector_json: "{}".into(),
+            scheduled_for_ms: Some(50_000),
+            created_at_ms: 4_000,
+        };
+        let result = db.create_health_job(&scheduled, &scheduled_item).await;
+        if id == "pg-slot-a" {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(DbError::UniqueViolation)));
+        }
+    }
+    assert!(matches!(
+        sqlx::query("UPDATE socks5_check_job_items SET state='BOGUS' WHERE job_id='pg-slot-a'")
+            .execute(&db.pool)
+            .await
+            .map_err(DbError::from),
+        Err(DbError::ConstraintViolation)
+    ));
+    sqlx::query("UPDATE socks5_check_policies SET deleted_at_ms=60000 WHERE id=$1")
+        .bind(policy)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db.find_health_policy(policy).await.unwrap().is_none());
+    assert!(matches!(
+        db.update_health_policy(policy, 2, &HealthPolicyPatch::default(), 60_001)
+            .await,
+        Err(DbError::NotFound)
+    ));
+    let deleted_policy_job = NewHealthJob {
+        id: "pg-deleted-policy-run".into(),
+        source: HealthJobSource::PolicyRunNow,
+        policy_id: Some(policy),
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "f".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 60_001,
+    };
+    assert!(matches!(
+        db.create_health_job(&deleted_policy_job, &scheduled_item)
+            .await,
+        Err(DbError::NotFound)
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_health_orchestration_cancel_retry_constraints_and_retention_parity() {
+    let Some(db) = repo("health_orchestration_parity").await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('health-parity','in','health-parity-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('health-parity-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'health-parity-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+
+    let new_job = |id: &str| NewHealthJob {
+        id: id.into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "d".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let item = NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: None,
+    };
+
+    assert!(matches!(
+        db.create_health_job(&new_job("pg-empty"), &[]).await,
+        Err(DbError::ConstraintViolation)
+    ));
+    assert!(matches!(
+        db.create_health_job(&new_job("pg-duplicate"), &[item.clone(), item.clone()])
+            .await,
+        Err(DbError::UniqueViolation)
+    ));
+    assert!(db.find_health_job("pg-duplicate").await.unwrap().is_none());
+
+    let cancel = new_job("pg-cancel");
+    db.create_health_job(&cancel, std::slice::from_ref(&item))
+        .await
+        .unwrap();
+    assert!(db.cancel_health_job(&cancel.id, 2_000).await.unwrap());
+    let cancelled = db.find_health_job(&cancel.id).await.unwrap().unwrap();
+    assert_eq!(cancelled.status, HealthJobStatus::Cancelled.as_str());
+    assert_eq!((cancelled.queued_count, cancelled.cancelled_count), (0, 1));
+
+    let failed = new_job("pg-failed");
+    db.create_health_job(&failed, std::slice::from_ref(&item))
+        .await
+        .unwrap();
+    let failed_item = db
+        .list_health_job_items(&failed.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let transition = |expected_state, expected_fence, new_state, now_ms| HealthItemTransition {
+        item_id: failed_item.id,
+        expected_state,
+        expected_fence,
+        new_state,
+        lease_owner: (new_state == HealthJobItemState::Leased).then(|| "worker".into()),
+        lease_expires_at_ms: (new_state == HealthJobItemState::Leased).then_some(now_ms + 1_000),
+        pair_fence_token: (new_state == HealthJobItemState::Leased).then_some(1),
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: None,
+        health_status: None,
+        safe_error_code: None,
+        safe_error_message: None,
+        completed_after_cancel: false,
+        now_ms,
+    };
+    assert_eq!(
+        db.transition_health_job_item(&transition(
+            HealthJobItemState::Queued,
+            99,
+            HealthJobItemState::Leased,
+            2_100,
+        ))
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::ConditionFailed
+    );
+    assert_eq!(
+        db.transition_health_job_item(&transition(
+            HealthJobItemState::Queued,
+            0,
+            HealthJobItemState::Leased,
+            2_100,
+        ))
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert_eq!(
+        db.transition_health_job_item(&transition(
+            HealthJobItemState::Leased,
+            1,
+            HealthJobItemState::Failed,
+            2_200,
+        ))
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert!(db.finalize_health_job(&failed.id, 2_201).await.unwrap());
+    assert_eq!(
+        db.retry_failed_health_pairs(&failed.id).await.unwrap(),
+        vec![(resource, node)]
+    );
+
+    assert!(matches!(
+        sqlx::query("UPDATE socks5_check_jobs SET queued_count=1 WHERE id=$1")
+            .bind(&failed.id)
+            .execute(&db.pool)
+            .await
+            .map_err(DbError::from),
+        Err(DbError::ConstraintViolation)
+    ));
+    assert!(matches!(
+        sqlx::query("UPDATE socks5_check_jobs SET status='RUNNING' WHERE id=$1")
+            .bind(&failed.id)
+            .execute(&db.pool)
+            .await
+            .map_err(DbError::from),
+        Err(DbError::ConstraintViolation)
+    ));
+
+    let active = new_job("pg-active-retention");
+    db.create_health_job(&active, std::slice::from_ref(&item))
+        .await
+        .unwrap();
+    let candidates = db
+        .list_terminal_health_job_prune_candidates(10_000, 1000)
+        .await
+        .unwrap();
+    assert!(candidates.contains(&cancel.id));
+    assert!(candidates.contains(&failed.id));
+    assert!(!candidates.contains(&active.id));
+    assert_eq!(
+        db.prune_terminal_health_jobs(10_000, 1000).await.unwrap(),
+        2
+    );
+    assert!(db.find_health_job(&active.id).await.unwrap().is_some());
+
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_health_pair_prune_preserves_fence_epoch_and_validates_item_pair() {
+    let Some(db) = repo("health_pair_epoch").await else {
+        return;
+    };
+    let mut first_lock = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1,hashtext('1:2'))")
+        .bind(super::health_orchestration::HEALTH_IDEMPOTENCY_LOCK_CLASS)
+        .execute(&mut *first_lock)
+        .await
+        .unwrap();
+    let mut second_lock = db.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout='500ms'")
+        .execute(&mut *second_lock)
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1,hashtext('1:2'))")
+        .bind(super::health_orchestration::HEALTH_PAIR_LEASE_LOCK_CLASS)
+        .execute(&mut *second_lock)
+        .await
+        .expect("different lock domains must not collide");
+    second_lock.rollback().await.unwrap();
+    first_lock.rollback().await.unwrap();
+    let group: i64 = sqlx::query_scalar("INSERT INTO device_groups(name,group_type,token,uid) VALUES('health-epoch','in','health-epoch-token',1) RETURNING id")
+        .fetch_one(&db.pool).await.unwrap();
+    let resource: i64 = sqlx::query_scalar("INSERT INTO socks5_resources(name,host,port) VALUES('health-epoch-r','127.0.0.1',1080) RETURNING id")
+        .fetch_one(&db.pool).await.unwrap();
+    let wrong_resource: i64 = sqlx::query_scalar("INSERT INTO socks5_resources(name,host,port) VALUES('health-epoch-wrong','127.0.0.2',1081) RETURNING id")
+        .fetch_one(&db.pool).await.unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'health-epoch-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+    let new_job = |id: &str| NewHealthJob {
+        id: id.into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let item_spec = NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: None,
+    };
+    let first = new_job("pg-pair-epoch-first");
+    db.create_health_job(&first, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let first_item = db.list_health_job_items(&first.id).await.unwrap().remove(0);
+    assert_eq!(
+        db.acquire_health_pair_lease(PairLeaseAcquireRequest {
+            resource_id: resource,
+            relay_node_id: node,
+            item_id: first_item.id,
+            lease_owner: "old",
+            lease_expires_at_ms: 2_000,
+            now_ms: 1_000
+        })
+        .await
+        .unwrap(),
+        PairLeaseAcquireOutcome::Acquired {
+            pair_fence_token: 1
+        }
+    );
+    assert_eq!(
+        db.release_health_pair_lease(resource, node, first_item.id, "old", 1, 1_500)
+            .await
+            .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert!(db
+        .list_released_health_pair_lease_prune_candidates(1_600, 100)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.prune_released_health_pair_leases(1_600, 100)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(db.cancel_health_job(&first.id, 1_550).await.unwrap());
+    assert_eq!(
+        db.list_released_health_pair_lease_prune_candidates(1_600, 100)
+            .await
+            .unwrap(),
+        vec![(resource, node)]
+    );
+    assert_eq!(
+        db.prune_released_health_pair_leases(1_600, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    let tombstone = db
+        .find_health_pair_lease(resource, node)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tombstone.pair_fence_token, 1);
+    assert_eq!(tombstone.updated_at_ms, PAIR_LEASE_TOMBSTONE_UPDATED_AT_MS);
+
+    let second = new_job("pg-pair-epoch-second");
+    db.create_health_job(&second, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let second_item = db
+        .list_health_job_items(&second.id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        db.acquire_health_pair_lease(PairLeaseAcquireRequest {
+            resource_id: resource,
+            relay_node_id: node,
+            item_id: second_item.id,
+            lease_owner: "new",
+            lease_expires_at_ms: 4_000,
+            now_ms: 3_000
+        })
+        .await
+        .unwrap(),
+        PairLeaseAcquireOutcome::Acquired {
+            pair_fence_token: 2
+        }
+    );
+    assert_eq!(
+        db.release_health_pair_lease(resource, node, first_item.id, "old", 1, 3_100)
+            .await
+            .unwrap(),
+        ConditionalWriteOutcome::ConditionFailed
+    );
+    assert!(matches!(
+        db.acquire_health_pair_lease(PairLeaseAcquireRequest {
+            resource_id: wrong_resource,
+            relay_node_id: node,
+            item_id: second_item.id,
+            lease_owner: "wrong",
+            lease_expires_at_ms: 5_000,
+            now_ms: 4_000
+        })
+        .await,
+        Err(DbError::InvalidTransition)
+    ));
+    assert_eq!(
+        db.release_health_pair_lease(resource, node, second_item.id, "new", 2, 3_100)
+            .await
+            .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    let terminalize = HealthItemTransition {
+        item_id: second_item.id,
+        expected_state: HealthJobItemState::Queued,
+        expected_fence: 0,
+        new_state: HealthJobItemState::Cancelled,
+        lease_owner: None,
+        lease_expires_at_ms: None,
+        pair_fence_token: None,
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: None,
+        health_status: None,
+        safe_error_code: None,
+        safe_error_message: None,
+        completed_after_cancel: false,
+        now_ms: 3_200,
+    };
+    let (transition_result, prune_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                db.transition_health_job_item(&terminalize),
+                db.prune_released_health_pair_leases(3_300, 100)
+            )
+        })
+        .await
+        .expect("item transition/prune must not deadlock");
+    assert!(transition_result.is_ok());
+    assert!(prune_result.is_ok());
+
+    let third = new_job("pg-pair-epoch-third");
+    db.create_health_job(&third, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let third_item = db.list_health_job_items(&third.id).await.unwrap().remove(0);
+    let acquire_third = PairLeaseAcquireRequest {
+        resource_id: resource,
+        relay_node_id: node,
+        item_id: third_item.id,
+        lease_owner: "third",
+        lease_expires_at_ms: 5_000,
+        now_ms: 4_000,
+    };
+    let (prune_result, acquire_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                db.prune_released_health_pair_leases(4_100, 100),
+                db.acquire_health_pair_lease(acquire_third)
+            )
+        })
+        .await
+        .expect("prune/acquire must not deadlock");
+    assert_eq!(prune_result.unwrap(), 0);
+    assert_eq!(
+        acquire_result.unwrap(),
+        PairLeaseAcquireOutcome::Acquired {
+            pair_fence_token: 3
+        }
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_health_job_item_lock_order_prevents_deadlock_and_stale_aggregates() {
+    let Some(db) = repo("health_lock_order").await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar("INSERT INTO device_groups(name,group_type,token,uid) VALUES('health-lock','in','health-lock-token',1) RETURNING id")
+        .fetch_one(&db.pool).await.unwrap();
+    let resource: i64 = sqlx::query_scalar("INSERT INTO socks5_resources(name,host,port) VALUES('health-lock-r','127.0.0.1',1080) RETURNING id")
+        .fetch_one(&db.pool).await.unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'health-lock-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+    let make_job = |id: &str| NewHealthJob {
+        id: id.into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "b".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    let item_spec = NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: None,
+    };
+
+    let cancel_job = make_job("pg-lock-transition-cancel");
+    db.create_health_job(&cancel_job, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let cancel_item = db
+        .list_health_job_items(&cancel_job.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let leased = HealthItemTransition {
+        item_id: cancel_item.id,
+        expected_state: HealthJobItemState::Queued,
+        expected_fence: 0,
+        new_state: HealthJobItemState::Leased,
+        lease_owner: Some("worker".into()),
+        lease_expires_at_ms: Some(5_000),
+        pair_fence_token: Some(1),
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: None,
+        health_status: None,
+        safe_error_code: None,
+        safe_error_message: None,
+        completed_after_cancel: false,
+        now_ms: 2_000,
+    };
+    let transition_future = db.transition_health_job_item(&leased);
+    let cancel_future = db.cancel_health_job(&cancel_job.id, 2_001);
+    let (transition_result, cancel_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(transition_future, cancel_future)
+        })
+        .await
+        .expect("transition/cancel must not deadlock");
+    assert!(transition_result.is_ok());
+    assert!(cancel_result.unwrap());
+    db.finalize_health_job(&cancel_job.id, 2_002).await.unwrap();
+    let counters: (i64,i64,i64,i64,i64) = sqlx::query_as("SELECT COUNT(*) FILTER(WHERE state IN ('QUEUED','RETRY_WAIT')),COUNT(*) FILTER(WHERE state IN ('LEASED','DISPATCHING','IN_FLIGHT')),COUNT(*) FILTER(WHERE state='SUCCEEDED'),COUNT(*) FILTER(WHERE state='FAILED'),COUNT(*) FILTER(WHERE state='CANCELLED') FROM socks5_check_job_items WHERE job_id=$1").bind(&cancel_job.id).fetch_one(&db.pool).await.unwrap();
+    let persisted = db.find_health_job(&cancel_job.id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            persisted.queued_count,
+            persisted.running_count,
+            persisted.succeeded_count,
+            persisted.failed_count,
+            persisted.cancelled_count
+        ),
+        counters
+    );
+
+    let final_job = make_job("pg-lock-transition-finalize");
+    db.create_health_job(&final_job, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let final_item = db
+        .list_health_job_items(&final_job.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let cancelled = HealthItemTransition {
+        item_id: final_item.id,
+        expected_state: HealthJobItemState::Queued,
+        expected_fence: 0,
+        new_state: HealthJobItemState::Cancelled,
+        lease_owner: None,
+        lease_expires_at_ms: None,
+        pair_fence_token: None,
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: None,
+        health_status: None,
+        safe_error_code: None,
+        safe_error_message: None,
+        completed_after_cancel: false,
+        now_ms: 3_000,
+    };
+    let (transition_result, finalize_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                db.transition_health_job_item(&cancelled),
+                db.finalize_health_job(&final_job.id, 3_001)
+            )
+        })
+        .await
+        .expect("transition/finalize must not deadlock");
+    assert!(transition_result.is_ok());
+    assert!(finalize_result.is_ok());
+    let done = db.find_health_job(&final_job.id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            done.status.as_str(),
+            done.queued_count,
+            done.cancelled_count
+        ),
+        ("CANCELLED", 0, 1)
+    );
+
+    let cancel_final_job = make_job("pg-lock-cancel-finalize");
+    db.create_health_job(&cancel_final_job, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let (cancel_result, finalize_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                db.cancel_health_job(&cancel_final_job.id, 4_000),
+                db.finalize_health_job(&cancel_final_job.id, 4_001)
+            )
+        })
+        .await
+        .expect("cancel/finalize must not deadlock");
+    assert!(cancel_result.is_ok());
+    assert!(finalize_result.is_ok());
+    let done = db
+        .find_health_job(&cancel_final_job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            done.status.as_str(),
+            done.queued_count,
+            done.cancelled_count
+        ),
+        ("CANCELLED", 0, 1)
+    );
+
+    let retry_race_job = make_job("pg-cancel-retry-race");
+    db.create_health_job(&retry_race_job, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let retry_leased = db
+        .claim_health_job_items(&HealthItemClaimRequest {
+            lease_owner: "pg-race-worker".into(),
+            now_ms: 5_000,
+            lease_expires_at_ms: 65_000,
+            limit: 1,
+            global_limit: 16,
+            per_node_limit: 10,
+            per_job_limit: 20,
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.job_id == retry_race_job.id)
+        .unwrap();
+    assert!(db
+        .cancel_health_job(&retry_race_job.id, 5_100)
+        .await
+        .unwrap());
+    let rejected_retry = HealthItemTransition {
+        item_id: retry_leased.id,
+        expected_state: HealthJobItemState::Leased,
+        expected_fence: retry_leased.item_fence_token,
+        new_state: HealthJobItemState::RetryWait,
+        lease_owner: None,
+        lease_expires_at_ms: None,
+        pair_fence_token: None,
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: Some(5_200),
+        health_status: None,
+        safe_error_code: Some("UPSTREAM_UNAVAILABLE".into()),
+        safe_error_message: Some("Upstream service unavailable".into()),
+        completed_after_cancel: false,
+        now_ms: 5_200,
+    };
+    assert_eq!(
+        db.transition_health_job_item(&rejected_retry)
+            .await
+            .unwrap(),
+        ConditionalWriteOutcome::ConditionFailed
+    );
+    let mut cancel_retry_item = rejected_retry;
+    cancel_retry_item.new_state = HealthJobItemState::Cancelled;
+    cancel_retry_item.safe_error_code = None;
+    cancel_retry_item.safe_error_message = None;
+    cancel_retry_item.not_before_ms = None;
+    cancel_retry_item.now_ms = 5_300;
+    assert_eq!(
+        db.transition_health_job_item(&cancel_retry_item)
+            .await
+            .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert_eq!(
+        db.release_health_pair_lease(
+            resource,
+            node,
+            retry_leased.id,
+            "pg-race-worker",
+            retry_leased.pair_fence_token.unwrap(),
+            5_400,
+        )
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+
+    let result_race_job = make_job("pg-cancel-result-race");
+    db.create_health_job(&result_race_job, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let result_leased = db
+        .claim_health_job_items(&HealthItemClaimRequest {
+            lease_owner: "pg-result-worker".into(),
+            now_ms: 6_000,
+            lease_expires_at_ms: 66_000,
+            limit: 1,
+            global_limit: 16,
+            per_node_limit: 10,
+            per_job_limit: 20,
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.job_id == result_race_job.id)
+        .unwrap();
+    let result_dispatching = db
+        .begin_health_item_dispatch(&HealthItemDispatchRequest {
+            item_id: result_leased.id,
+            lease_owner: "pg-result-worker".into(),
+            expected_item_fence: result_leased.item_fence_token,
+            expected_pair_fence: result_leased.pair_fence_token.unwrap(),
+            dispatch_attempt_id: "pg-result-attempt".into(),
+            now_ms: 6_100,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.transition_health_job_item(&HealthItemTransition {
+            item_id: result_dispatching.id,
+            expected_state: HealthJobItemState::Dispatching,
+            expected_fence: result_dispatching.item_fence_token,
+            new_state: HealthJobItemState::InFlight,
+            lease_owner: Some("pg-result-worker".into()),
+            lease_expires_at_ms: result_dispatching.lease_expires_at_ms,
+            pair_fence_token: result_dispatching.pair_fence_token,
+            dispatch_attempt_id: Some("pg-result-attempt".into()),
+            request_id: Some("pg-result-request".into()),
+            not_before_ms: None,
+            health_status: None,
+            safe_error_code: None,
+            safe_error_message: None,
+            completed_after_cancel: false,
+            now_ms: 6_200,
+        })
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert!(db
+        .cancel_health_job(&result_race_job.id, 6_300)
+        .await
+        .unwrap());
+    let result_current = db
+        .find_health_job_item(result_dispatching.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.transition_health_job_item(&HealthItemTransition {
+            item_id: result_current.id,
+            expected_state: HealthJobItemState::InFlight,
+            expected_fence: result_current.item_fence_token,
+            new_state: HealthJobItemState::Succeeded,
+            lease_owner: None,
+            lease_expires_at_ms: None,
+            pair_fence_token: None,
+            dispatch_attempt_id: None,
+            request_id: None,
+            not_before_ms: None,
+            health_status: Some("ONLINE".into()),
+            safe_error_code: None,
+            safe_error_message: None,
+            completed_after_cancel: false,
+            now_ms: 6_400,
+        })
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert!(
+        db.find_health_job_item(result_current.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .completed_after_cancel
+    );
+
+    let state_job = make_job("pg-state-field-matrix");
+    db.create_health_job(&state_job, std::slice::from_ref(&item_spec))
+        .await
+        .unwrap();
+    let state_item = db
+        .list_health_job_items(&state_job.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let mut invalid_lease = HealthItemTransition {
+        item_id: state_item.id,
+        expected_state: HealthJobItemState::Queued,
+        expected_fence: 0,
+        new_state: HealthJobItemState::Leased,
+        lease_owner: Some("worker".into()),
+        lease_expires_at_ms: Some(6_000),
+        pair_fence_token: Some(1),
+        dispatch_attempt_id: None,
+        request_id: None,
+        not_before_ms: None,
+        health_status: None,
+        safe_error_code: None,
+        safe_error_message: None,
+        completed_after_cancel: false,
+        now_ms: 5_000,
+    };
+    invalid_lease.lease_owner = None;
+    assert!(matches!(
+        db.transition_health_job_item(&invalid_lease).await,
+        Err(DbError::InvalidTransition)
+    ));
+    invalid_lease.lease_owner = Some("worker".into());
+    invalid_lease.safe_error_code = Some("RAW_UPSTREAM_ERROR".into());
+    invalid_lease.safe_error_message = Some("socks5://user:password@proxy:1080".into());
+    assert!(matches!(
+        db.transition_health_job_item(&invalid_lease).await,
+        Err(DbError::ConstraintViolation)
+    ));
+    assert!(sqlx::query(
+        "UPDATE socks5_check_job_items SET state='LEASED',updated_at_ms=5000 WHERE id=$1"
+    )
+    .bind(state_item.id)
+    .execute(&db.pool)
+    .await
+    .is_err());
+    assert!(sqlx::query("UPDATE socks5_check_job_items SET state='SUCCEEDED',lease_owner='stale',lease_expires_at_ms=6000,finished_at_ms=5000,updated_at_ms=5000 WHERE id=$1").bind(state_item.id).execute(&db.pool).await.is_err());
+    assert!(sqlx::query("UPDATE socks5_check_job_items SET state='FAILED',finished_at_ms=5000,updated_at_ms=5000,safe_error_code='PROXY_CONNECT_TIMEOUT',safe_error_message='socks5://user:password@proxy:1080' WHERE id=$1").bind(state_item.id).execute(&db.pool).await.is_err());
+    sqlx::query("UPDATE socks5_check_job_items SET state='FAILED',finished_at_ms=5000,updated_at_ms=5000,safe_error_code='PROXY_CONNECT_TIMEOUT',safe_error_message='Proxy connection timed out' WHERE id=$1").bind(state_item.id).execute(&db.pool).await.unwrap();
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_manual_health_runtime_claim_dispatch_renew_and_reconcile() {
+    let Some(db) = repo("manual_health_runtime").await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('manual-runtime','in','manual-runtime-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('manual-runtime-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'manual-runtime-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+    let job = NewHealthJob {
+        id: "pg-manual-runtime".into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: Some(1),
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    db.create_health_job(
+        &job,
+        &[NewHealthJobItem {
+            resource_id: resource,
+            relay_node_id: node,
+            not_before_ms: 1_000,
+            deadline_at_ms: Some(100_000),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let claim = HealthItemClaimRequest {
+        lease_owner: "pg-worker-a".into(),
+        now_ms: 2_000,
+        lease_expires_at_ms: 62_000,
+        limit: 8,
+        global_limit: 16,
+        per_node_limit: 10,
+        per_job_limit: 20,
+    };
+    let claimed = db.claim_health_job_items(&claim).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    let leased = &claimed[0];
+    assert_eq!(leased.state, "LEASED");
+    assert_eq!(leased.attempt_count, 0);
+    assert_eq!(leased.item_fence_token, 1);
+    assert_eq!(leased.pair_fence_token, Some(1));
+    assert!(db
+        .claim_health_job_items(&HealthItemClaimRequest {
+            lease_owner: "pg-worker-b".into(),
+            ..claim.clone()
+        })
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert!(db
+        .begin_health_item_dispatch(&HealthItemDispatchRequest {
+            item_id: leased.id,
+            lease_owner: "pg-worker-b".into(),
+            expected_item_fence: 1,
+            expected_pair_fence: 1,
+            dispatch_attempt_id: "wrong-owner".into(),
+            now_ms: 2_100,
+        })
+        .await
+        .unwrap()
+        .is_none());
+    let dispatching = db
+        .begin_health_item_dispatch(&HealthItemDispatchRequest {
+            item_id: leased.id,
+            lease_owner: "pg-worker-a".into(),
+            expected_item_fence: 1,
+            expected_pair_fence: 1,
+            dispatch_attempt_id: "attempt-a".into(),
+            now_ms: 2_100,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dispatching.state, "DISPATCHING");
+    assert_eq!(
+        dispatching.attempt_count, 0,
+        "DISPATCHING is not yet a network attempt"
+    );
+    assert_eq!(dispatching.item_fence_token, 2);
+    assert_eq!(
+        db.renew_health_item_and_pair_lease(&HealthLeaseRenewRequest {
+            item_id: dispatching.id,
+            lease_owner: "pg-worker-a".into(),
+            expected_item_fence: 2,
+            expected_pair_fence: 1,
+            lease_expires_at_ms: 70_000,
+            now_ms: 3_000,
+        })
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert_eq!(
+        db.renew_health_item_and_pair_lease(&HealthLeaseRenewRequest {
+            item_id: dispatching.id,
+            lease_owner: "pg-worker-b".into(),
+            expected_item_fence: 2,
+            expected_pair_fence: 1,
+            lease_expires_at_ms: 80_000,
+            now_ms: 3_100,
+        })
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::ConditionFailed
+    );
+
+    let item_page = db
+        .list_health_job_items_page(&HealthJobItemListQuery {
+            job_id: job.id.clone(),
+            state: Some("DISPATCHING".into()),
+            safe_error_code: None,
+            after_id: None,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(item_page.len(), 1);
+    assert!(db
+        .list_health_job_items_page(&HealthJobItemListQuery {
+            job_id: job.id.clone(),
+            state: None,
+            safe_error_code: None,
+            after_id: Some(item_page[0].id),
+            limit: 1,
+        })
+        .await
+        .unwrap()
+        .is_empty());
+
+    sqlx::query("UPDATE socks5_check_jobs SET queued_count=1,running_count=0 WHERE id=$1")
+        .bind(&job.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.reconcile_health_job_counters(3_200, 10).await.unwrap(),
+        vec![HealthJobReconcileOutcome {
+            job_id: job.id.clone(),
+            finalized: false,
+        }]
+    );
+    let repaired = db.find_health_job(&job.id).await.unwrap().unwrap();
+    assert_eq!((repaired.queued_count, repaired.running_count), (0, 1));
+    assert_eq!(
+        db.list_expired_health_job_items(70_000, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.list_health_jobs(&HealthJobListQuery {
+            status: Some("RUNNING".into()),
+            source: Some("MANUAL".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_retry_wait_with_safe_error_is_reclaimable_and_fenced() {
+    let Some(db) = repo("retry_reclaim_fence").await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('retry-reclaim','in','retry-reclaim-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('retry-reclaim-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'retry-reclaim-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+    let job = NewHealthJob {
+        id: "pg-retry-reclaim".into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: Some(1),
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    db.create_health_job(
+        &job,
+        &[NewHealthJobItem {
+            resource_id: resource,
+            relay_node_id: node,
+            not_before_ms: 1_000,
+            deadline_at_ms: Some(100_000),
+        }],
+    )
+    .await
+    .unwrap();
+    let old = db
+        .claim_health_job_items(&HealthItemClaimRequest {
+            lease_owner: "old-worker".into(),
+            now_ms: 2_000,
+            lease_expires_at_ms: 3_000,
+            limit: 1,
+            global_limit: 16,
+            per_node_limit: 10,
+            per_job_limit: 20,
+        })
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        db.transition_health_job_item(&HealthItemTransition {
+            item_id: old.id,
+            expected_state: HealthJobItemState::Leased,
+            expected_fence: old.item_fence_token,
+            new_state: HealthJobItemState::RetryWait,
+            lease_owner: None,
+            lease_expires_at_ms: None,
+            pair_fence_token: None,
+            dispatch_attempt_id: None,
+            request_id: None,
+            not_before_ms: Some(3_001),
+            health_status: None,
+            safe_error_code: Some("UPSTREAM_UNAVAILABLE".into()),
+            safe_error_message: Some("Upstream service unavailable".into()),
+            completed_after_cancel: false,
+            now_ms: 3_000,
+        })
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    let new = db
+        .claim_health_job_items(&HealthItemClaimRequest {
+            lease_owner: "new-worker".into(),
+            now_ms: 3_001,
+            lease_expires_at_ms: 63_001,
+            limit: 1,
+            global_limit: 16,
+            per_node_limit: 10,
+            per_job_limit: 20,
+        })
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(new.state, "LEASED");
+    assert_eq!(new.safe_error_code, None);
+    assert_eq!(new.safe_error_message, None);
+    assert_eq!(new.item_fence_token, old.item_fence_token + 2);
+    assert_eq!(new.pair_fence_token, Some(2));
+    assert_eq!(
+        db.release_health_pair_lease(resource, node, old.id, "old-worker", 1, 3_002)
+            .await
+            .unwrap(),
+        ConditionalWriteOutcome::ConditionFailed
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_one_hundred_health_claimers_respect_global_budget() {
+    let Some(db) = repo_with_connections("health_claim_budget", 50).await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('claim-budget','in','claim-budget-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let mut pairs = Vec::new();
+    let mut items = Vec::new();
+    for index in 0..32_i64 {
+        let resource: i64 = sqlx::query_scalar(
+            "INSERT INTO socks5_resources(name,host,port) VALUES($1,$2,$3) RETURNING id",
+        )
+        .bind(format!("claim-budget-r-{index}"))
+        .bind(format!("127.0.0.{}", index + 1))
+        .bind(10_000 + index)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,$2,'2026-01-01','2026-01-01') RETURNING id")
+            .bind(group)
+            .bind(format!("claim-budget-n-{index}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        pairs.push((resource, node));
+        items.push(NewHealthJobItem {
+            resource_id: resource,
+            relay_node_id: node,
+            not_before_ms: 1_000,
+            deadline_at_ms: Some(100_000),
+        });
+    }
+    let job = NewHealthJob {
+        id: "pg-claim-budget".into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: Some(1),
+        request_fingerprint: "b".repeat(64),
+        snapshot_hash: snapshot_hash(&pairs),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    db.create_health_job(&job, &items).await.unwrap();
+
+    let db = std::sync::Arc::new(db);
+    let claims = futures_util::future::join_all((0..100).map(|index| {
+        let db = db.clone();
+        async move {
+            db.claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: format!("claim-worker-{index}"),
+                now_ms: 2_000,
+                lease_expires_at_ms: 62_000,
+                limit: 1,
+                global_limit: 16,
+                per_node_limit: 10,
+                per_job_limit: 20,
+            })
+            .await
+            .unwrap()
+            .len()
+        }
+    }))
+    .await;
+    assert_eq!(claims.into_iter().sum::<usize>(), 16);
+    let stored = db.list_health_job_items(&job.id).await.unwrap();
+    assert_eq!(
+        stored.iter().filter(|item| item.state == "LEASED").count(),
+        16
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM socks5_check_pair_leases WHERE item_id IS NOT NULL",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        16
+    );
+    cleanup(db.as_ref()).await;
+}
+
+#[tokio::test]
+async fn pg_one_hundred_same_key_health_creates_are_atomic_and_mixed_conflict() {
+    let Some(db) = repo_with_connections("health_idempotency_race", 50).await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('idem-race','in','idem-race-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('idem-race-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'idem-race-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+    let item = NewHealthJobItem {
+        resource_id: resource,
+        relay_node_id: node,
+        not_before_ms: 1_000,
+        deadline_at_ms: Some(100_000),
+    };
+    let db = std::sync::Arc::new(db);
+
+    let same = futures_util::future::join_all((0..100).map(|index| {
+        let db = db.clone();
+        let item = item.clone();
+        async move {
+            let fingerprint = "a".repeat(64);
+            let job = NewHealthJob {
+                id: format!("same-key-job-{index}"),
+                source: HealthJobSource::Manual,
+                policy_id: None,
+                parent_job_id: None,
+                actor_id: Some(1),
+                request_fingerprint: fingerprint.clone(),
+                snapshot_hash: snapshot_hash(&[(resource, node)]),
+                resource_selector_json: "{}".into(),
+                node_selector_json: "{}".into(),
+                scheduled_for_ms: None,
+                created_at_ms: 1_000,
+            };
+            db.create_health_job_idempotent(
+                &job,
+                &[item],
+                &NewHealthJobIdempotency {
+                    actor_id: 1,
+                    idempotency_key: "same-health-key".into(),
+                    request_fingerprint: fingerprint,
+                    created_at_ms: 1_000,
+                    expires_at_ms: 1_000 + IDEMPOTENCY_TTL_MS,
+                },
+            )
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    let created = same
+        .iter()
+        .filter(|outcome| matches!(outcome, HealthJobCreateOutcome::Created { .. }))
+        .count();
+    let replayed = same
+        .iter()
+        .filter(|outcome| matches!(outcome, HealthJobCreateOutcome::Replay { .. }))
+        .count();
+    let job_ids = same
+        .iter()
+        .filter_map(|outcome| match outcome {
+            HealthJobCreateOutcome::Created { job_id }
+            | HealthJobCreateOutcome::Replay { job_id } => Some(job_id.as_str()),
+            HealthJobCreateOutcome::Conflict => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!((created, replayed, job_ids.len()), (1, 99, 1));
+
+    let mixed = futures_util::future::join_all((0..100).map(|index| {
+        let db = db.clone();
+        let item = item.clone();
+        async move {
+            let fingerprint = if index % 2 == 0 {
+                "b".repeat(64)
+            } else {
+                "c".repeat(64)
+            };
+            let job = NewHealthJob {
+                id: format!("mixed-key-job-{index}"),
+                source: HealthJobSource::Manual,
+                policy_id: None,
+                parent_job_id: None,
+                actor_id: Some(1),
+                request_fingerprint: fingerprint.clone(),
+                snapshot_hash: snapshot_hash(&[(resource, node)]),
+                resource_selector_json: "{}".into(),
+                node_selector_json: "{}".into(),
+                scheduled_for_ms: None,
+                created_at_ms: 2_000,
+            };
+            db.create_health_job_idempotent(
+                &job,
+                &[item],
+                &NewHealthJobIdempotency {
+                    actor_id: 1,
+                    idempotency_key: "mixed-health-key".into(),
+                    request_fingerprint: fingerprint,
+                    created_at_ms: 2_000,
+                    expires_at_ms: 2_000 + IDEMPOTENCY_TTL_MS,
+                },
+            )
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    assert_eq!(
+        mixed
+            .iter()
+            .filter(|outcome| matches!(outcome, HealthJobCreateOutcome::Created { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        mixed
+            .iter()
+            .filter(|outcome| matches!(outcome, HealthJobCreateOutcome::Replay { .. }))
+            .count(),
+        49
+    );
+    assert_eq!(
+        mixed
+            .iter()
+            .filter(|outcome| matches!(outcome, HealthJobCreateOutcome::Conflict))
+            .count(),
+        50
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM socks5_check_jobs")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        2
+    );
+    cleanup(db.as_ref()).await;
+}
+
+#[tokio::test]
+async fn pg_one_hundred_jobs_with_same_pair_have_one_active_owner() {
+    let Some(db) = repo_with_connections("health_same_pair", 50).await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('same-pair','in','same-pair-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('same-pair-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'same-pair-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+    for index in 0..100 {
+        db.create_health_job(
+            &NewHealthJob {
+                id: format!("same-pair-job-{index:03}"),
+                source: HealthJobSource::Manual,
+                policy_id: None,
+                parent_job_id: None,
+                actor_id: None,
+                request_fingerprint: "d".repeat(64),
+                snapshot_hash: snapshot_hash(&[(resource, node)]),
+                resource_selector_json: "{}".into(),
+                node_selector_json: "{}".into(),
+                scheduled_for_ms: None,
+                created_at_ms: 1_000 + index,
+            },
+            &[NewHealthJobItem {
+                resource_id: resource,
+                relay_node_id: node,
+                not_before_ms: 1_000,
+                deadline_at_ms: Some(100_000),
+            }],
+        )
+        .await
+        .unwrap();
+    }
+    let db = std::sync::Arc::new(db);
+    let claims = futures_util::future::join_all((0..100).map(|index| {
+        let db = db.clone();
+        async move {
+            db.claim_health_job_items(&HealthItemClaimRequest {
+                lease_owner: format!("same-pair-worker-{index}"),
+                now_ms: 2_000,
+                lease_expires_at_ms: 62_000,
+                limit: 1,
+                global_limit: 50,
+                per_node_limit: 10,
+                per_job_limit: 20,
+            })
+            .await
+            .unwrap()
+            .len()
+        }
+    }))
+    .await;
+    assert_eq!(claims.into_iter().sum::<usize>(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM socks5_check_job_items WHERE state='LEASED'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM socks5_check_pair_leases WHERE lease_owner IS NOT NULL",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    cleanup(db.as_ref()).await;
+}
+
+#[tokio::test]
+async fn pg_conditional_health_generation_rejects_resource_revision_change() {
+    let Some(db) = repo("conditional_health_generation").await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('generation','in','generation-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('generation-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'generation-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+    let initial = db.find_socks5_resource(resource).await.unwrap().unwrap();
+    sqlx::query("UPDATE socks5_resources SET health_generation=health_generation+1 WHERE id=$1")
+        .bind(resource)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        db.begin_socks5_health_check_if_resource_generation(
+            resource,
+            node,
+            initial.health_generation,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM socks5_check_generations")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    let current = db.find_socks5_resource(resource).await.unwrap().unwrap();
+    let (_, generation) = db
+        .begin_socks5_health_check_if_resource_generation(resource, node, current.health_generation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(generation, 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_retry_snapshot_survives_deleted_live_resource_and_node() {
+    let Some(db) = repo("retry_deleted_snapshot").await else {
+        return;
+    };
+    let group: i64 = sqlx::query_scalar(
+        "INSERT INTO device_groups(name,group_type,token,uid) VALUES('retry-deleted','in','retry-deleted-token',1) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let resource: i64 = sqlx::query_scalar(
+        "INSERT INTO socks5_resources(name,host,port) VALUES('retry-deleted-r','127.0.0.1',1080) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let node: i64 = sqlx::query_scalar("INSERT INTO relay_nodes(device_group_id,node_key,first_seen_at,last_seen_at) VALUES($1,'retry-deleted-n','2026-01-01','2026-01-01') RETURNING id")
+        .bind(group).fetch_one(&db.pool).await.unwrap();
+    let parent = NewHealthJob {
+        id: "pg-retry-deleted-parent".into(),
+        source: HealthJobSource::Manual,
+        policy_id: None,
+        parent_job_id: None,
+        actor_id: None,
+        request_fingerprint: "a".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 1_000,
+    };
+    db.create_health_job(
+        &parent,
+        &[NewHealthJobItem {
+            resource_id: resource,
+            relay_node_id: node,
+            not_before_ms: 1_000,
+            deadline_at_ms: Some(10_000),
+        }],
+    )
+    .await
+    .unwrap();
+    let parent_item = db
+        .list_health_job_items(&parent.id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        db.transition_health_job_item(&HealthItemTransition {
+            item_id: parent_item.id,
+            expected_state: HealthJobItemState::Queued,
+            expected_fence: 0,
+            new_state: HealthJobItemState::Leased,
+            lease_owner: Some("worker".into()),
+            lease_expires_at_ms: Some(3_000),
+            pair_fence_token: Some(1),
+            dispatch_attempt_id: None,
+            request_id: None,
+            not_before_ms: None,
+            health_status: None,
+            safe_error_code: None,
+            safe_error_message: None,
+            completed_after_cancel: false,
+            now_ms: 2_000,
+        })
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert_eq!(
+        db.transition_health_job_item(&HealthItemTransition {
+            item_id: parent_item.id,
+            expected_state: HealthJobItemState::Leased,
+            expected_fence: 1,
+            new_state: HealthJobItemState::Failed,
+            lease_owner: None,
+            lease_expires_at_ms: None,
+            pair_fence_token: None,
+            dispatch_attempt_id: None,
+            request_id: None,
+            not_before_ms: None,
+            health_status: None,
+            safe_error_code: None,
+            safe_error_message: None,
+            completed_after_cancel: false,
+            now_ms: 2_100,
+        })
+        .await
+        .unwrap(),
+        ConditionalWriteOutcome::Applied
+    );
+    assert!(db.finalize_health_job(&parent.id, 2_101).await.unwrap());
+    sqlx::query("DELETE FROM socks5_resources WHERE id=$1")
+        .bind(resource)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM relay_nodes WHERE id=$1")
+        .bind(node)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let child = NewHealthJob {
+        id: "pg-retry-deleted-child".into(),
+        source: HealthJobSource::RetryFailed,
+        policy_id: None,
+        parent_job_id: Some(parent.id.clone()),
+        actor_id: None,
+        request_fingerprint: "b".repeat(64),
+        snapshot_hash: snapshot_hash(&[(resource, node)]),
+        resource_selector_json: "{}".into(),
+        node_selector_json: "{}".into(),
+        scheduled_for_ms: None,
+        created_at_ms: 3_000,
+    };
+    db.create_health_job(
+        &child,
+        &[NewHealthJobItem {
+            resource_id: resource,
+            relay_node_id: node,
+            not_before_ms: 3_000,
+            deadline_at_ms: Some(10_000),
+        }],
+    )
+    .await
+    .unwrap();
+    let child_item = db.list_health_job_items(&child.id).await.unwrap().remove(0);
+    assert_eq!(child_item.resource_id, None);
+    assert_eq!(child_item.relay_node_id, None);
+    assert_eq!(child_item.resource_id_snapshot, resource);
+    assert_eq!(child_item.relay_node_id_snapshot, node);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_migration_35_37_upgrade_rollback_rerun_and_mismatch_detection() {
+    let Some(db) = repo("migration_35_health").await else {
+        return;
+    };
+    sqlx::query(
+        "DROP TABLE socks5_health_job_idempotency,socks5_check_pair_leases,
+         socks5_check_job_items,socks5_check_jobs,socks5_check_policies",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version>=35")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX IF EXISTS uq_audit_health_job_finalized")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let mut tx = db.pool.begin().await.unwrap();
+    for statement in crate::db::health_schema::POSTGRES_MIGRATION_35 {
+        sqlx::query(statement).execute(&mut *tx).await.unwrap();
+    }
+    assert!(
+        sqlx::query("INSERT INTO definitely_missing_table VALUES(1)")
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    let partial_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema=current_schema() AND table_name=ANY($1)",
+    )
+    .bind(crate::db::health_schema::HEALTH_TABLES.as_slice())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(partial_tables, 0);
+
+    run_pg_migrations(&db.pool).await.unwrap();
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 37);
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    sqlx::query("DELETE FROM schema_version WHERE version=37")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX uq_audit_health_job_finalized")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO audit_log(ts,actor_name,action,target_type,target_id,detail) VALUES('2026-01-01 00:00:00','system','JOB_FINALIZED','socks5_health_job','pg-migration-37-rollback','status=FAILED; succeeded=0; failed=1; cancelled=0')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let mut finalized_audit_tx = db.pool.begin().await.unwrap();
+    for statement in crate::db::health_schema::POSTGRES_MIGRATION_37 {
+        sqlx::query(statement)
+            .execute(&mut *finalized_audit_tx)
+            .await
+            .unwrap();
+    }
+    assert!(
+        sqlx::query("INSERT INTO definitely_missing_table VALUES(1)")
+            .execute(&mut *finalized_audit_tx)
+            .await
+            .is_err()
+    );
+    finalized_audit_tx.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE target_id='pg-migration-37-rollback'"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        2,
+        "failed migration 37 must roll back duplicate cleanup"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        36
+    );
+    sqlx::query(
+        "INSERT INTO socks5_check_jobs
+         (id,source,status,request_fingerprint,snapshot_hash,resource_selector_json,
+          node_selector_json,matrix_mode,retry_policy_version,cancel_requested,total_items,
+          queued_count,running_count,succeeded_count,failed_count,cancelled_count,
+          created_at_ms,finished_at_ms)
+         VALUES('pg-migration-37-missing','MANUAL','FAILED',$1,$2,'{}','{}','CARTESIAN','v1',
+                FALSE,1,0,0,0,1,0,1000,2000)",
+    )
+    .bind("a".repeat(64))
+    .bind("b".repeat(64))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE target_id='pg-migration-37-rollback'"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE target_id='pg-migration-37-missing'"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1,
+        "migration 37 must repair a pre-existing terminal Job missing its audit"
+    );
+
+    sqlx::query("DELETE FROM schema_version WHERE version>=36")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX uq_audit_health_job_finalized")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE socks5_check_job_items DROP COLUMN retry_count")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut retry_tx = db.pool.begin().await.unwrap();
+    sqlx::query(crate::db::health_schema::POSTGRES_MIGRATION_36)
+        .execute(&mut *retry_tx)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("INSERT INTO definitely_missing_table VALUES(1)")
+            .execute(&mut *retry_tx)
+            .await
+            .is_err()
+    );
+    retry_tx.rollback().await.unwrap();
+    let retry_column_after_rollback: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema=current_schema() AND table_name='socks5_check_job_items'
+           AND column_name='retry_count'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(retry_column_after_rollback, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        35
+    );
+    run_pg_migrations(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    let retry_check: String = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint
+         WHERE conrelid='socks5_check_job_items'::regclass
+           AND contype='c' AND pg_get_constraintdef(oid,true) LIKE '%retry_count%'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "ALTER TABLE socks5_check_job_items DROP CONSTRAINT {retry_check}"
+    ))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query(&format!(
+        "ALTER TABLE socks5_check_job_items ADD CONSTRAINT {retry_check} CHECK(retry_count >= 0)"
+    ))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    sqlx::query("DROP INDEX idx_socks5_check_job_items_ready")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let error = run_pg_migrations(&db.pool).await.unwrap_err();
+    assert!(error.to_string().contains("version/schema mismatch"));
+    sqlx::query("CREATE INDEX idx_socks5_check_job_items_ready ON socks5_check_job_items(state,not_before_ms,id)")
+        .execute(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    let status_check: String = sqlx::query_scalar("SELECT conname FROM pg_constraint WHERE conrelid='socks5_check_jobs'::regclass AND contype='c' AND pg_get_constraintdef(oid,true) LIKE '%status = ANY%' AND pg_get_constraintdef(oid,true) NOT LIKE '%finished_at_ms%'")
+        .fetch_one(&db.pool).await.unwrap();
+    sqlx::query(&format!(
+        "ALTER TABLE socks5_check_jobs DROP CONSTRAINT {status_check}"
+    ))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query(&format!("ALTER TABLE socks5_check_jobs ADD CONSTRAINT {status_check} CHECK(status IN ('QUEUED','RUNNING','CANCEL_REQUESTED','SUCCEEDED','FAILED','PARTIAL','CANCELLED','PARTIAL_CANCELLED'))"))
+        .execute(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    let resource_fk: String = sqlx::query_scalar("SELECT conname FROM pg_constraint WHERE conrelid='socks5_check_job_items'::regclass AND contype='f' AND pg_get_constraintdef(oid,true) LIKE 'FOREIGN KEY (resource_id)%'")
+        .fetch_one(&db.pool).await.unwrap();
+    sqlx::query(&format!(
+        "ALTER TABLE socks5_check_job_items DROP CONSTRAINT {resource_fk}"
+    ))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query(&format!("ALTER TABLE socks5_check_job_items ADD CONSTRAINT {resource_fk} FOREIGN KEY(resource_id) REFERENCES socks5_resources(id) ON DELETE SET NULL"))
+        .execute(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    sqlx::query("ALTER TABLE socks5_check_jobs ALTER COLUMN total_items DROP NOT NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query("ALTER TABLE socks5_check_jobs ALTER COLUMN total_items SET NOT NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    sqlx::query("ALTER TABLE socks5_check_jobs ALTER COLUMN status SET DEFAULT 'RUNNING'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query("ALTER TABLE socks5_check_jobs ALTER COLUMN status SET DEFAULT 'QUEUED'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    sqlx::query("ALTER TABLE socks5_check_jobs ALTER COLUMN total_items TYPE INTEGER")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query("ALTER TABLE socks5_check_jobs ALTER COLUMN total_items TYPE BIGINT")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    let pair_unique: String = sqlx::query_scalar("SELECT conname FROM pg_constraint WHERE conrelid='socks5_check_job_items'::regclass AND contype='u'")
+        .fetch_one(&db.pool).await.unwrap();
+    sqlx::query(&format!(
+        "ALTER TABLE socks5_check_job_items DROP CONSTRAINT {pair_unique}"
+    ))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query(&format!("ALTER TABLE socks5_check_job_items ADD CONSTRAINT {pair_unique} UNIQUE(job_id,resource_id_snapshot,relay_node_id_snapshot)"))
+        .execute(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    sqlx::query("DROP INDEX uq_socks5_check_jobs_scheduled_slot")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX uq_socks5_check_jobs_scheduled_slot ON socks5_check_jobs(policy_id,scheduled_for_ms) WHERE source='MANUAL'")
+        .execute(&db.pool).await.unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    sqlx::query("DROP INDEX uq_socks5_check_jobs_scheduled_slot")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX uq_socks5_check_jobs_scheduled_slot ON socks5_check_jobs(policy_id,scheduled_for_ms) WHERE source='SCHEDULED'")
+        .execute(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    sqlx::query("DROP INDEX idx_socks5_check_job_items_ready")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE INDEX idx_socks5_check_job_items_ready ON socks5_check_job_items(not_before_ms,state,id)")
+        .execute(&db.pool).await.unwrap();
+    assert!(run_pg_migrations(&db.pool)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("version/schema mismatch"));
+    cleanup(&db).await;
 }

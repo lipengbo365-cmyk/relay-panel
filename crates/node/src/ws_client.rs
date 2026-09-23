@@ -45,6 +45,8 @@ pub async fn run_ws_loop(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     node_id: &str,
+    node_identity_secret: &str,
+    socks5_checks: Arc<crate::socks5_check::Socks5CheckRuntime>,
 ) {
     let ws_url = derive_ws_url(&config.panel_url);
     let mut backoff = 1u64;
@@ -56,7 +58,16 @@ pub async fn run_ws_loop(
     loop {
         tracing::info!("websocket connecting to {} ...", ws_url);
 
-        let exit = connect_and_run(&ws_url, &config.token, config, manager, node_id).await;
+        let exit = connect_and_run(
+            &ws_url,
+            &config.token,
+            config,
+            manager,
+            node_id,
+            node_identity_secret,
+            socks5_checks.clone(),
+        )
+        .await;
         match exit {
             WsExit::ConfigChanged => {
                 tracing::info!("websocket: config_changed received, reconnecting immediately");
@@ -71,6 +82,24 @@ pub async fn run_ws_loop(
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
                 last_permanent_msg = None;
+            }
+            WsExit::ProtocolMismatch(msg) => {
+                {
+                    let mut mgr = manager.lock().await;
+                    mgr.apply_config(&relay_shared::protocol::NodeConfigResponse {
+                        listeners: Vec::new(),
+                    })
+                    .await;
+                }
+                if last_permanent_msg.as_deref() != Some(msg.as_str()) {
+                    tracing::warn!(
+                        "websocket protocol mismatch: {} — all listeners stopped; backing off {}s",
+                        msg,
+                        PERMANENT_BACKOFF_SECS
+                    );
+                    last_permanent_msg = Some(msg);
+                }
+                tokio::time::sleep(Duration::from_secs(PERMANENT_BACKOFF_SECS)).await;
             }
             WsExit::PermanentError(msg) => {
                 // 426 / 401 / 403: configuration or version problem that won't
@@ -104,6 +133,9 @@ pub async fn run_ws_loop(
 enum WsExit {
     ConfigChanged,
     Disconnected,
+    /// A config protocol mismatch invalidates every active listener. Keeping a
+    /// SOCKS listener after a panel downgrade would bypass the gate.
+    ProtocolMismatch(String),
     /// A permanent error (426 protocol mismatch, 401/403 auth). The node backs
     /// off 5 minutes — the only fix is an upgrade or reconfiguration.
     PermanentError(String),
@@ -132,7 +164,7 @@ fn classify_ws_connect_error(e: tokio_tungstenite::tungstenite::Error) -> WsExit
                     .as_ref()
                     .and_then(|d| d.get("required"))
                     .and_then(|v| v.as_u64());
-                WsExit::PermanentError(format!(
+                WsExit::ProtocolMismatch(format!(
                     "config protocol mismatch (panel requires v{:?}, node has v{}) — upgrade relay-node",
                     required,
                     relay_shared::protocol::CONFIG_PROTOCOL_VERSION
@@ -155,6 +187,8 @@ async fn connect_and_run(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     node_id: &str,
+    node_identity_secret: &str,
+    socks5_checks: Arc<crate::socks5_check::Socks5CheckRuntime>,
 ) -> WsExit {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
@@ -188,6 +222,14 @@ async fn connect_and_run(
     {
         request.headers_mut().insert("X-Config-Protocol-Version", v);
     }
+    request.headers_mut().insert(
+        "X-Accept-Sensitive-Config",
+        if crate::poller::secure_control_channel_allowed(&config.panel_url) {
+            "1".parse().unwrap()
+        } else {
+            "0".parse().unwrap()
+        },
+    );
     if let Ok(v) = "relay-node-ws".parse() {
         request.headers_mut().insert("User-Agent", v);
     }
@@ -200,6 +242,9 @@ async fn connect_and_run(
         if let Ok(v) = node_id.parse() {
             request.headers_mut().insert("X-Node-ID", v);
         }
+    }
+    if let Ok(v) = node_identity_secret.parse() {
+        request.headers_mut().insert("X-Node-Identity", v);
     }
 
     let ws_result = connect_async(request).await;
@@ -243,6 +288,7 @@ async fn connect_and_run(
                         if let Ok(resp) =
                             serde_json::from_str::<relay_shared::protocol::NodeConfigResponse>(&text)
                         {
+                            let resp = poller::enforce_secure_transport(resp, &config.panel_url);
                             tracing::info!(
                                 "websocket: received config ({} listeners), applying",
                                 resp.listeners.len()
@@ -252,20 +298,38 @@ async fn connect_and_run(
                             tracing::info!("websocket: config applied");
                         } else if text.contains("config_changed") {
                             tracing::info!("websocket: config_changed received, re-fetching");
-                            match poller::fetch_config(config).await {
+                            match poller::fetch_config(config, node_id, node_identity_secret).await {
                                 poller::FetchResult::Ok(resp) => {
                                     let mut mgr = manager.lock().await;
                                     mgr.apply_config(&resp).await;
                                     tracing::info!("websocket: config applied after config_changed");
                                 }
                                 poller::FetchResult::ProtocolMismatch => {
-                                    tracing::warn!("websocket: config fetch returned protocol mismatch; keeping cached config");
+                                    let mut mgr = manager.lock().await;
+                                    mgr.apply_config(&relay_shared::protocol::NodeConfigResponse {
+                                        listeners: Vec::new(),
+                                    })
+                                    .await;
+                                    tracing::warn!("websocket: config protocol mismatch; all listeners stopped");
                                 }
                                 poller::FetchResult::Transient => {
                                     tracing::warn!("websocket: config fetch failed transiently; keeping cached config");
                                 }
                             }
                             return WsExit::ConfigChanged;
+                        } else if let Some(check) =
+                            serde_json::from_str::<relay_shared::protocol::Socks5CheckRequest>(&text)
+                                .ok()
+                                .filter(|request| request.msg_type == "socks5_check")
+                        {
+                            // Credentials live only inside this in-memory task.
+                            // The bounded runtime protects forwarding capacity.
+                            socks5_checks.submit(
+                                check,
+                                config.clone(),
+                                node_id.to_string(),
+                                node_identity_secret.to_string(),
+                            ).await;
                         } else if let Some(rm) =
                             serde_json::from_str::<relay_shared::protocol::RestartRuleMessage>(&text)
                                 .ok()
