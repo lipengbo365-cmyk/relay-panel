@@ -8,6 +8,50 @@ independent `v*` / `node-v*` tracks since this release).
 
 ---
 
+## [1.2.11] - 2026-09-24
+
+Major coordinated Panel release for Node 2.0.0. This release advances the
+configuration protocol from version 4 to version 6 and must be deployed with
+the matching Node release.
+
+> **Coordinated deployment required.** Panel 1.2.11 requires Node 2.0.0. Panel
+> 1.2.11 is not compatible with Node 1.2.4, and Panel 1.2.10 is not compatible
+> with Node 2.0.0. The intended release pair is **Panel 1.2.11 + Node 2.0.0**.
+> Publish both artifacts before the maintenance window; do not upgrade either
+> side alone in production.
+
+### Added
+
+- **Durable SOCKS5 health orchestration.** Operators can create manual health
+  jobs, observe progress and finalization, retry failed work, cancel eligible
+  jobs, and repair recoverable state. Fencing and finalization audit records
+  prevent stale workers from mutating newer work, while resource health and
+  history provide an operational record of each check.
+- **Health Center operations UI.** The Panel exposes health-job creation,
+  progress, detail, resource health/history, cancel, retry, and repair actions
+  from a dedicated workflow-oriented interface.
+- **SOCKS5 resource operations.** Resource import, secret-aware credential
+  handling, health history, fail-closed validation, smart relay
+  recommendations, and one-click creation are available through the reviewed
+  resource workflow.
+- **Simplified Chinese UI.** English and `zh-CN` can be selected across the
+  Dashboard, Node Status, Health Center, SOCKS5 resource views, and Create
+  Health Job workflow. Form placeholders follow the selected language.
+
+### Fixed
+
+- **Bulk-import Preview now uses exact-key lookup consistently on PostgreSQL
+  and SQLite.** Preview remains read-only, deduplicates candidates, redacts
+  credentials, and preserves Preview/Confirm accounting parity without
+  creating resources during inspection.
+
+### Compatibility
+
+- `CONFIG_PROTOCOL_VERSION` is now `6` (from `4`). Panel and Node enforce an
+  exact-match, fail-closed contract for configuration and health commands.
+- Deploy **Panel 1.2.11 + Node 2.0.0** as one coordinated release pair. Mixed
+  combinations with Panel 1.2.10 or Node 1.2.4 are unsupported and rejected.
+
 ## [1.2.10] - 2026-09-24
 
 Panel only, and a license release rather than a feature one: no code behaviour
