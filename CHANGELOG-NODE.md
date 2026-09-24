@@ -11,6 +11,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [2.0.0] - 2026-09-23
+
+Major Node release for the coordinated RelayPanel 1.2.11 rollout.
+
+> **Coordinated upgrade required. Do not upgrade the Node alone in
+> production.** Configuration protocol version 6 is an exact-match contract:
+> Node 2.0.0 is not compatible with Panel 1.2.9, and Node 1.2.4 is not
+> compatible with Panel 1.2.11. The intended release pair is **Panel 1.2.11 +
+> Node 2.0.0**. Publish both artifacts before beginning a coordinated
+> maintenance-window deployment.
+
+### Breaking compatibility
+
+- **Configuration protocol version increases from 4 to 6.** Listener
+  configuration now carries explicit ingress and upstream descriptors, and
+  health commands bind their WebSocket session and resource generation. The
+  Panel and Node reject mismatched protocol versions with a fail-closed
+  `426 Upgrade Required` path; the Node stops listeners rather than retaining
+  forwarding behavior whose semantics can no longer be trusted.
+
+### Added
+
+- **SOCKS5 inbound forwarding**, with no-auth or username/password client
+  authentication.
+- **Explicit direct and SOCKS5 upstreams**, including remote-DNS support and
+  fail-closed routing when credentials or endpoints are invalid.
+- **Directed SOCKS5 health checks** with bounded concurrency and queue limits,
+  plus queue-depth reporting for operational visibility.
+- **Session- and generation-bound health commands** so reconnects and late
+  results cannot mutate a newer resource state.
+- **Stable traffic report identifiers** so retries after acknowledgement loss
+  remain idempotent.
+
+### Changed
+
+- HTTP polling and reporting now use native TLS roots, matching the WSS control
+  channel and supporting administrator-installed private certificate
+  authorities consistently.
+- A configuration-protocol mismatch stops active listeners and enters the
+  permanent-error backoff path instead of continuing with stale forwarding
+  semantics.
+
 ## [1.2.4] - 2026-09-08
 
 Node only. Nothing on the wire changed (still protocol version 4), so this node
