@@ -34,7 +34,7 @@ ARG OCI_VERSION=dev
 ARG OCI_REVISION=unknown
 LABEL org.opencontainers.image.version=$OCI_VERSION \
       org.opencontainers.image.revision=$OCI_REVISION \
-      org.opencontainers.image.source="https://github.com/MoeShinX/relay-panel"
+      org.opencontainers.image.source="https://github.com/lipengbo365-cmyk/relay-panel"
 RUN apt-get -o Acquire::Retries=5 update && \
     apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
@@ -56,7 +56,7 @@ ARG OCI_VERSION=dev
 ARG OCI_REVISION=unknown
 LABEL org.opencontainers.image.version=$OCI_VERSION \
       org.opencontainers.image.revision=$OCI_REVISION \
-      org.opencontainers.image.source="https://github.com/MoeShinX/relay-panel"
+      org.opencontainers.image.source="https://github.com/lipengbo365-cmyk/relay-panel"
 # v1.0.5: iproute2 provides the `ip` command used to resolve an interface's
 # IPv4 address when OUTBOUND_INTERFACE is set. Without it, multi-NIC egress
 # selection by interface name would fail. ca-certificates is for HTTPS to the

@@ -11,6 +11,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [2.0.1] - 2026-09-25
+
+Repository-ownership migration patch for the reviewed Node 2.0.0 product line.
+
+### Changed
+
+- Moved Node release downloads and self-update discovery to
+  `lipengbo365-cmyk/relay-panel`.
+- Moved the Node container destination to
+  `ghcr.io/lipengbo365-cmyk/relay-panel-node`.
+- Updated installer examples, release verification, and operator documentation
+  to use the fork-owned repository and package namespace.
+
+### Compatibility
+
+- `CONFIG_PROTOCOL_VERSION` remains `6`; forwarding and control-plane wire
+  behavior are unchanged.
+- The intended coordinated publication pair is **Panel 1.2.12 + Node 2.0.1**.
+- The untagged `node-v2.0.0` candidate is not reused after changing publication
+  ownership.
+
 ## [2.0.0] - 2026-09-23
 
 Major Node release for the coordinated RelayPanel 1.2.11 rollout.

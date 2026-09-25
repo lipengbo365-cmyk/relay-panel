@@ -8,6 +8,30 @@ independent `v*` / `node-v*` tracks since this release).
 
 ---
 
+## [1.2.12] - 2026-09-25
+
+Repository-ownership migration release for the reviewed 1.2.11 product line.
+The Panel now publishes from `lipengbo365-cmyk/relay-panel` and uses that
+repository for release discovery, deployment links, installation assets, and
+GHCR images.
+
+### Changed
+
+- Moved the Panel image destination to
+  `ghcr.io/lipengbo365-cmyk/relay-panel-panel`.
+- Moved GitHub Release discovery, installer links, source labels, badges, and
+  operator documentation to `lipengbo365-cmyk/relay-panel`.
+- Updated release validation so the fork-owned image namespace is part of the
+  pre-publication contract.
+
+### Compatibility
+
+- `CONFIG_PROTOCOL_VERSION` remains `6`; no wire-contract or database-schema
+  change is introduced by this migration.
+- The intended coordinated publication pair is **Panel 1.2.12 + Node 2.0.1**.
+- The untagged `v1.2.11` candidate is not reused after changing publication
+  ownership.
+
 ## [1.2.11] - 2026-09-24
 
 Major coordinated Panel release for Node 2.0.0. This release advances the
